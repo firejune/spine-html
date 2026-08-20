@@ -12,7 +12,11 @@ import { DomTexture, type RegionImage, unpackRegions } from './DomTexture';
 import { SpineHtmlRenderer } from './SpineHtmlRenderer';
 
 const ASSET_BASE = '/spineboy';
-const SKELETON_JSON = 'spineboy-ess.json'; // essential = region attachments only
+const SKELETONS = {
+  pro: 'spineboy-pro.json', // meshes (deform tier → per-part canvases)
+  ess: 'spineboy-ess.json', // region attachments only (rigid tier → pure DOM)
+} as const;
+type SkeletonVariant = keyof typeof SKELETONS;
 const STAGE_SCALE = 0.4;
 
 interface Instance {
@@ -31,10 +35,14 @@ async function loadImage(url: string): Promise<HTMLImageElement> {
   });
 }
 
-async function load(): Promise<{ data: SkeletonData; regionImages: Map<string, RegionImage> }> {
-  const [atlasText, jsonText] = await Promise.all([
+async function load(): Promise<{
+  data: Record<SkeletonVariant, SkeletonData>;
+  regionImages: Map<string, RegionImage>;
+}> {
+  const [atlasText, proText, essText] = await Promise.all([
     fetch(`${ASSET_BASE}/spineboy.atlas`).then((r) => r.text()),
-    fetch(`${ASSET_BASE}/${SKELETON_JSON}`).then((r) => r.text()),
+    fetch(`${ASSET_BASE}/${SKELETONS.pro}`).then((r) => r.text()),
+    fetch(`${ASSET_BASE}/${SKELETONS.ess}`).then((r) => r.text()),
   ]);
 
   const atlas = new TextureAtlas(atlasText);
@@ -46,31 +54,41 @@ async function load(): Promise<{ data: SkeletonData; regionImages: Map<string, R
   }
 
   const regionImages = await unpackRegions(atlas, pageImages);
-  const json = new SkeletonJson(new AtlasAttachmentLoader(atlas));
-  return { data: json.readSkeletonData(jsonText), regionImages };
+  const loader = new AtlasAttachmentLoader(atlas);
+  return {
+    data: {
+      pro: new SkeletonJson(loader).readSkeletonData(proText),
+      ess: new SkeletonJson(loader).readSkeletonData(essText),
+    },
+    regionImages,
+  };
 }
 
-function main(data: SkeletonData, regionImages: Map<string, RegionImage>): void {
+function main(
+  data: Record<SkeletonVariant, SkeletonData>,
+  regionImages: Map<string, RegionImage>,
+): void {
   const stage = document.getElementById('stage') as HTMLDivElement;
+  const skelSelect = document.getElementById('skel') as HTMLSelectElement;
   const animSelect = document.getElementById('anim') as HTMLSelectElement;
   const countInput = document.getElementById('count') as HTMLInputElement;
   const stats = document.getElementById('stats') as HTMLDivElement;
 
-  for (const anim of data.animations) {
-    const option = document.createElement('option');
-    option.value = anim.name;
-    option.textContent = anim.name;
-    animSelect.appendChild(option);
-  }
-  const defaultAnim = data.animations.some((a) => a.name === 'walk')
-    ? 'walk'
-    : data.animations[0].name;
-  animSelect.value = defaultAnim;
-
-  const stateData = new AnimationStateData(data);
-  stateData.defaultMix = 0.2;
-
+  let variant: SkeletonVariant = 'pro';
+  let stateData = new AnimationStateData(data[variant]);
   let instances: Instance[] = [];
+
+  function fillAnimations(): void {
+    animSelect.innerHTML = '';
+    for (const anim of data[variant].animations) {
+      const option = document.createElement('option');
+      option.value = anim.name;
+      option.textContent = anim.name;
+      animSelect.appendChild(option);
+    }
+    const names = data[variant].animations.map((a) => a.name);
+    animSelect.value = names.includes('walk') ? 'walk' : names[0];
+  }
 
   function rebuild(count: number): void {
     for (const inst of instances) {
@@ -88,7 +106,7 @@ function main(data: SkeletonData, regionImages: Map<string, RegionImage>): void 
       container.style.transform = `scale(${STAGE_SCALE})`;
       stage.appendChild(container);
 
-      const skeleton = new Skeleton(data);
+      const skeleton = new Skeleton(data[variant]);
       const state = new AnimationState(stateData);
       state.setAnimation(0, animSelect.value, true);
       // Desync walk cycles so N instances don't look like one stamped sprite.
@@ -103,6 +121,13 @@ function main(data: SkeletonData, regionImages: Map<string, RegionImage>): void 
     }
   }
 
+  skelSelect.addEventListener('change', () => {
+    variant = skelSelect.value as SkeletonVariant;
+    stateData = new AnimationStateData(data[variant]);
+    stateData.defaultMix = 0.2;
+    fillAnimations();
+    rebuild(instances.length || 1);
+  });
   animSelect.addEventListener('change', () => {
     for (const inst of instances) inst.state.setAnimation(0, animSelect.value, true);
   });
@@ -112,6 +137,8 @@ function main(data: SkeletonData, regionImages: Map<string, RegionImage>): void 
     rebuild(count);
   });
 
+  stateData.defaultMix = 0.2;
+  fillAnimations();
   rebuild(1);
 
   // --- frame loop with split timings (skeleton math vs DOM writes) ---
@@ -141,13 +168,20 @@ function main(data: SkeletonData, regionImages: Map<string, RegionImage>): void 
     frames++;
 
     if (now - statsAt >= 500 && frames > 0) {
-      const meshNote = instances[0]?.renderer.meshSkipCount
-        ? ` · meshes skipped: ${instances[0].renderer.meshSkipCount}`
-        : '';
+      let meshes = 0;
+      let triangles = 0;
+      let clips = 0;
+      for (const inst of instances) {
+        meshes += inst.renderer.meshCount;
+        triangles += inst.renderer.triangleCount;
+        clips += inst.renderer.clipSkipCount;
+      }
+      const meshNote = meshes ? ` · ${meshes} mesh canvases (${triangles} tris)` : '';
+      const clipNote = clips ? ` · ${clips} clips skipped` : '';
       stats.textContent =
         `${instances.length} skeleton(s) · ` +
         `skeleton ${(updateMs / frames).toFixed(2)}ms · ` +
-        `DOM ${(renderMs / frames).toFixed(2)}ms / frame${meshNote}`;
+        `render ${(renderMs / frames).toFixed(2)}ms / frame${meshNote}${clipNote}`;
       updateMs = renderMs = 0;
       frames = 0;
       statsAt = now;

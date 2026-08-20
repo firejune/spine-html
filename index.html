@@ -84,6 +84,12 @@
   <body>
     <header>
       <h1>spine-html <span>— skeletons as plain DOM, one CSS matrix per slot</span></h1>
+      <label>skeleton
+        <select id="skel">
+          <option value="pro">spineboy-pro (meshes)</option>
+          <option value="ess">spineboy-ess (rigid only)</option>
+        </select>
+      </label>
       <label>animation <select id="anim"></select></label>
       <label>skeletons <input id="count" type="number" min="1" max="50" value="1" /></label>
       <div id="stats">loading…</div>
