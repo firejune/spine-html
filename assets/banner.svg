@@ -1,0 +1,105 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 240" width="100%" height="100%">
+  <defs>
+    <!-- Background subtle gradient -->
+    <linearGradient id="banner-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="50%" stop-color="#090d16"/>
+      <stop offset="100%" stop-color="#05070c"/>
+    </linearGradient>
+
+    <!-- Vibrant Gradient: Orange -> Magenta -> Cyan -->
+    <linearGradient id="banner-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="45%" stop-color="#EC4899"/>
+      <stop offset="85%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#00F0FF"/>
+    </linearGradient>
+
+    <!-- Bone Gradient -->
+    <linearGradient id="banner-bone" x1="50%" y1="0%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FF5733"/>
+      <stop offset="35%" stop-color="#D946EF"/>
+      <stop offset="75%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+
+    <!-- Text Gradient -->
+    <linearGradient id="text-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="60%" stop-color="#F1F5F9"/>
+      <stop offset="100%" stop-color="#94A3B8"/>
+    </linearGradient>
+
+    <linearGradient id="html-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#EC4899"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+
+    <!-- Glow Filter -->
+    <filter id="banner-glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background border container -->
+  <rect width="880" height="240" rx="20" fill="url(#banner-bg)" stroke="#1e293b" stroke-width="1.5" />
+
+  <!-- Left Symbol Icon -->
+  <g transform="translate(45, 20) scale(0.39)" filter="url(#banner-glow)">
+    <!-- Top Joint Pivot Ring -->
+    <circle cx="256" cy="148" r="42" fill="none" stroke="url(#banner-grad)" stroke-width="26" stroke-linecap="round" />
+
+    <!-- Outer Left Bracket (<) -->
+    <path d="M 218 178 L 132 256 L 222 334" 
+          fill="none" 
+          stroke="url(#banner-grad)" 
+          stroke-width="26" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+
+    <!-- Outer Right Bracket (>) -->
+    <path d="M 294 178 L 380 256 L 290 334" 
+          fill="none" 
+          stroke="url(#banner-grad)" 
+          stroke-width="26" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+
+    <!-- Center Bone Pin -->
+    <path d="M 206 230 L 256 386 L 306 230 L 278 226 L 256 312 L 234 226 Z" 
+          fill="url(#banner-bone)" 
+          stroke="url(#banner-bone)"
+          stroke-width="4"
+          stroke-linejoin="round"
+          stroke-linecap="round" />
+  </g>
+
+  <!-- Typography -->
+  <g transform="translate(280, 0)">
+    <!-- Main Title -->
+    <text x="0" y="110" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="54" font-weight="800" letter-spacing="-1.5">
+      <tspan fill="url(#text-grad)">spine</tspan><tspan fill="#64748B">-</tspan><tspan fill="url(#html-grad)">html</tspan>
+    </text>
+
+    <!-- Subtitle / Tagline -->
+    <text x="2" y="150" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif" font-size="16.5" font-weight="500" fill="#94A3B8" letter-spacing="-0.2">
+      DOM-first Spine 2D skeletal animations via CSS transforms
+    </text>
+
+    <!-- Badges / Accurate Feature Pills -->
+    <g transform="translate(2, 172)">
+      <!-- Badge 1: DOM First -->
+      <rect x="0" y="0" width="98" height="24" rx="6" fill="#1e293b" />
+      <text x="49" y="16" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#38BDF8" text-anchor="middle">⚡ DOM-FIRST</text>
+
+      <!-- Badge 2: CSS Matrix -->
+      <rect x="106" y="0" width="102" height="24" rx="6" fill="#1e293b" />
+      <text x="157" y="16" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#EC4899" text-anchor="middle">🎨 CSS MATRIX</text>
+
+      <!-- Badge 3: Inspectable & Stylable -->
+      <rect x="216" y="0" width="124" height="24" rx="6" fill="#1e293b" />
+      <text x="278" y="16" font-family="system-ui, sans-serif" font-size="11" font-weight="600" fill="#FF6B4A" text-anchor="middle">🔍 DEVTOOLS READY</text>
+    </g>
+  </g>
+</svg>

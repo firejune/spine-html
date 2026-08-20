@@ -1,4 +1,12 @@
-# spine-html
+<p align="center">
+  <img src="assets/banner.svg" alt="spine-html - DOM-first Spine 2D runtime" width="100%" />
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/spine-html"><img src="https://img.shields.io/npm/v/spine-html.svg?style=flat-square&color=FF6B4A" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/spine-html"><img src="https://img.shields.io/npm/dm/spine-html.svg?style=flat-square&color=EC4899" alt="npm downloads" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-38BDF8.svg?style=flat-square" alt="license" /></a>
+</p>
 
 Render [Spine](https://esotericsoftware.com/) skeletal animations as **plain DOM** — one
 absolutely-positioned `<img>` per slot, posed with a single CSS `matrix()` write per frame.

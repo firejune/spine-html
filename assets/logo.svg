@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <!-- Background subtle radial glow -->
+    <radialGradient id="bg-glow" cx="50%" cy="45%" r="60%">
+      <stop offset="0%" stop-color="#1e1b4b" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#09090b" stop-opacity="1"/>
+    </radialGradient>
+
+    <!-- Vibrant Gradient: Orange -> Magenta -> Cyan -->
+    <linearGradient id="spine-grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FF6B4A"/>
+      <stop offset="45%" stop-color="#EC4899"/>
+      <stop offset="85%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#00F0FF"/>
+    </linearGradient>
+
+    <!-- Center Bone Gradient -->
+    <linearGradient id="bone-grad" x1="50%" y1="10%" x2="50%" y2="100%">
+      <stop offset="0%" stop-color="#FF5733"/>
+      <stop offset="30%" stop-color="#D946EF"/>
+      <stop offset="75%" stop-color="#3B82F6"/>
+      <stop offset="100%" stop-color="#06B6D4"/>
+    </linearGradient>
+
+    <!-- Soft Drop Shadow for Depth -->
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Background container (Optional rounded rect for app icon usage) -->
+  <rect width="512" height="512" rx="96" fill="url(#bg-glow)" />
+
+  <!-- Main Symbol Group -->
+  <g filter="url(#glow)">
+    <!-- Top Joint Pivot Ring -->
+    <circle cx="256" cy="148" r="42" fill="none" stroke="url(#spine-grad)" stroke-width="26" stroke-linecap="round" />
+
+    <!-- Outer Left Bracket (<) connected to Joint -->
+    <path d="M 218 178 L 132 256 L 222 334" 
+          fill="none" 
+          stroke="url(#spine-grad)" 
+          stroke-width="26" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+
+    <!-- Outer Right Bracket (>) -->
+    <path d="M 294 178 L 380 256 L 290 334" 
+          fill="none" 
+          stroke="url(#spine-grad)" 
+          stroke-width="26" 
+          stroke-linecap="round" 
+          stroke-linejoin="round" />
+
+    <!-- Center Rigging Bone / IK Spine Blade (V-shape) -->
+    <path d="M 206 230 L 256 386 L 306 230 L 278 226 L 256 312 L 234 226 Z" 
+          fill="url(#bone-grad)" 
+          stroke="url(#bone-grad)"
+          stroke-width="4"
+          stroke-linejoin="round"
+          stroke-linecap="round" />
+  </g>
+</svg>
