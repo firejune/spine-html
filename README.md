@@ -44,9 +44,12 @@ Measured so far (PoC, Chromium on Apple silicon):
 
 ```bash
 bun install
-bun run fetch-assets   # downloads the official spineboy example (not redistributed here)
 bun run dev
 ```
+
+The official spineboy example assets are downloaded automatically on first `dev`/`build`
+(they are owned by Esoteric Software and not redistributed in this repository — see
+[NOTICE.md](NOTICE.md)); `bun run fetch-assets` runs the same idempotent step manually.
 
 ## How it works
 

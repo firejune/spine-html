@@ -9,7 +9,9 @@
     "url": "https://github.com/firejune/spine-html.git"
   },
   "scripts": {
+    "predev": "bash scripts/fetch-assets.sh",
     "dev": "vite",
+    "prebuild": "bash scripts/fetch-assets.sh",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "fetch-assets": "bash scripts/fetch-assets.sh"
