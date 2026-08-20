@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>spine-html — Spine skeletons rendered as plain DOM</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        margin: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+        background: #14161a;
+        color: #d5d9e0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 10px 16px;
+        background: #1c1f26;
+        border-bottom: 1px solid #2a2e37;
+        flex-wrap: wrap;
+      }
+      h1 {
+        font-size: 14px;
+        font-weight: 600;
+      }
+      h1 span {
+        color: #7a8494;
+        font-weight: 400;
+      }
+      label {
+        font-size: 12px;
+        color: #9aa3b2;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      select,
+      input {
+        background: #262a33;
+        color: #d5d9e0;
+        border: 1px solid #333846;
+        border-radius: 4px;
+        padding: 4px 8px;
+        font: inherit;
+        font-size: 12px;
+      }
+      input {
+        width: 56px;
+      }
+      #stats {
+        margin-left: auto;
+        font-size: 12px;
+        color: #8fd3a0;
+        white-space: nowrap;
+      }
+      #stage {
+        position: relative;
+        flex: 1;
+        overflow: hidden;
+        background:
+          linear-gradient(#14161a 96%, #2a2e37 96%) 0 0 / 100% 100%;
+      }
+      .skeleton-root {
+        position: absolute;
+        bottom: 4%;
+        transform-origin: 0 0;
+      }
+      .skeleton-root img {
+        image-rendering: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>spine-html <span>— skeletons as plain DOM, one CSS matrix per slot</span></h1>
+      <label>animation <select id="anim"></select></label>
+      <label>skeletons <input id="count" type="number" min="1" max="50" value="1" /></label>
+      <div id="stats">loading…</div>
+    </header>
+    <div id="stage"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

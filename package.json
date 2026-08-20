@@ -1,0 +1,24 @@
+{
+  "name": "spine-html",
+  "version": "0.1.0",
+  "description": "Render Spine skeletal animations with plain DOM elements and CSS transforms — no canvas for rigid parts.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/firejune/spine-html.git"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "fetch-assets": "bash scripts/fetch-assets.sh"
+  },
+  "dependencies": {
+    "@esotericsoftware/spine-core": "^4.3.13"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}
