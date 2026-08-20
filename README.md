@@ -17,9 +17,12 @@ The idea has been floated on the official forum three times since 2014 and was n
 built — the blockers named were meshes, clipping, and DOM update overhead. This project
 is the experiment: how far does the DOM actually go, and how cheap is it?
 
-Measured so far (PoC, Chromium on Apple silicon): 10 skeletons / 180 slot images
-animate at **~0.03 ms skeleton math + ~0.22 ms DOM writes per frame** — about 1.5% of a
-60 fps frame budget.
+Measured so far (PoC, Chromium on Apple silicon):
+
+- Rigid only (spineboy-ess): 10 skeletons / 180 slot images at **~0.03 ms skeleton math
+  + ~0.22 ms DOM writes per frame** — about 1.5% of a 60 fps frame budget.
+- With meshes (spineboy-pro): 1 skeleton = **~0.05 ms + ~0.5 ms render** (8 mesh
+  canvases, 323 triangles); 10 running skeletons = **~4.4 ms/frame** total.
 
 ## Status
 
@@ -27,13 +30,15 @@ animate at **~0.03 ms skeleton math + ~0.22 ms DOM writes per frame** — about 
 
 - ✅ Region attachments (rigid parts): exact affine mapping, draw-order via `z-index`,
   attachment swaps, alpha
-- ✅ Atlas unpacking at load time (90°-packed regions restored), so the per-frame path
-  never touches a canvas
-- ⬜ Mesh attachments (deform tier) — planned as small per-part canvases layered into
-  the same stacking context; the DOM handles the bones, a rasterizer handles the warps
-- ⬜ Clipping — deliberately unsupported; layered transparent parts + `overflow: hidden`
-  cover the practical cases
-- ⬜ Tinting / additive blending (`mix-blend-mode: plus-lighter`)
+- ✅ Atlas unpacking at load time (90°-packed regions restored), so the rigid per-frame
+  path never touches a canvas
+- ✅ Mesh attachments (deform tier): small per-part canvases sized to the mesh's world
+  bounds, interleaved with the rigid `<img>` slots in one stacking context — the DOM
+  handles the bones, a rasterizer handles the warps
+- ✅ Blend modes via `mix-blend-mode` (additive = `plus-lighter`)
+- ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
+  parts + `overflow: hidden` cover the practical cases
+- ⬜ RGB tinting (alpha works); DPR-aware mesh canvas backing store
 
 ## Quick start
 
