@@ -1,25 +1,56 @@
 {
   "name": "spine-html",
   "version": "0.1.0",
-  "description": "Render Spine skeletal animations with plain DOM elements and CSS transforms — no canvas for rigid parts.",
+  "description": "Render Spine skeletal animations as plain DOM — rigid slots as <img> posed by CSS matrix, deform meshes on small per-part canvases, interleaved in one stacking context.",
   "type": "module",
   "license": "MIT",
+  "author": "firejune",
   "repository": {
     "type": "git",
     "url": "https://github.com/firejune/spine-html.git"
   },
+  "homepage": "https://github.com/firejune/spine-html#readme",
+  "bugs": "https://github.com/firejune/spine-html/issues",
+  "keywords": [
+    "spine",
+    "spine2d",
+    "skeletal-animation",
+    "mesh-deformation",
+    "dom",
+    "css-transform",
+    "renderer",
+    "2d",
+    "animation",
+    "character-animation"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "NOTICE.md"
+  ],
+  "sideEffects": false,
   "scripts": {
     "predev": "bash scripts/fetch-assets.sh",
     "dev": "vite",
     "prebuild": "bash scripts/fetch-assets.sh",
     "build": "tsc --noEmit && vite build",
+    "build:lib": "rm -rf dist && tsc -p tsconfig.build.json",
+    "prepublishOnly": "npm run build:lib",
     "preview": "vite preview",
     "fetch-assets": "bash scripts/fetch-assets.sh"
   },
-  "dependencies": {
-    "@esotericsoftware/spine-core": "^4.3.13"
+  "peerDependencies": {
+    "@esotericsoftware/spine-core": "^4.3.0"
   },
   "devDependencies": {
+    "@esotericsoftware/spine-core": "^4.3.13",
     "typescript": "^5.6.0",
     "vite": "^6.0.0"
   }

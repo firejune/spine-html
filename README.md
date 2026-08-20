@@ -47,7 +47,48 @@ Measured so far (PoC, Chromium on Apple silicon):
   slower than Chromium (measured ~7.6ms vs ~0.5ms per frame headless) — dirty-check
   skipping and/or an optional WebGL blit backend are the candidates
 
-## Quick start
+## Install
+
+```bash
+npm i spine-html @esotericsoftware/spine-core
+```
+
+```ts
+import { TextureAtlas, AtlasAttachmentLoader, SkeletonJson, Skeleton,
+  AnimationState, AnimationStateData, Physics } from '@esotericsoftware/spine-core';
+import { SpineHtmlRenderer, DomTexture, unpackRegions } from 'spine-html';
+
+// Load: parse the atlas, attach page images, unpack per-region bitmaps once.
+const atlas = new TextureAtlas(atlasText);
+const pageImages = new Map<string, HTMLImageElement>();
+for (const page of atlas.pages) {
+  const image = await loadImage(page.name); // your loader
+  page.setTexture(new DomTexture(image));
+  pageImages.set(page.name, image);
+}
+const regionImages = await unpackRegions(atlas, pageImages);
+const data = new SkeletonJson(new AtlasAttachmentLoader(atlas)).readSkeletonData(jsonText);
+
+// A positioned element becomes the skeleton origin (Spine is Y-up: the
+// skeleton grows upward from it).
+const skeleton = new Skeleton(data);
+const state = new AnimationState(new AnimationStateData(data));
+state.setAnimation(0, 'walk', true);
+const renderer = new SpineHtmlRenderer(rootElement, regionImages);
+
+function frame(delta: number) {
+  state.update(delta);
+  state.apply(skeleton);
+  skeleton.update(delta);
+  skeleton.updateWorldTransform(Physics.update);
+  renderer.render(skeleton);
+}
+```
+
+`spine-html` is a third-party renderer and is not affiliated with or endorsed by
+Esoteric Software.
+
+## Demo (this repository)
 
 ```bash
 bun install
