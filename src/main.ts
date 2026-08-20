@@ -112,12 +112,11 @@ function main(
       // Desync walk cycles so N instances don't look like one stamped sprite.
       state.update((i * 0.37) % 2);
 
-      instances.push({
-        skeleton,
-        state,
-        renderer: new SpineHtmlRenderer(container, regionImages),
-        container,
-      });
+      const renderer = new SpineHtmlRenderer(container, regionImages);
+      // Debug knob: ?expand=0 disables the crack-closing clip overdraw.
+      const expandParam = new URLSearchParams(location.search).get('expand');
+      if (expandParam !== null) renderer.triangleExpand = Number(expandParam) || 0;
+      instances.push({ skeleton, state, renderer, container });
     }
   }
 

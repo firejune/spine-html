@@ -36,9 +36,16 @@ Measured so far (PoC, Chromium on Apple silicon):
   bounds, interleaved with the rigid `<img>` slots in one stacking context — the DOM
   handles the bones, a rasterizer handles the warps
 - ✅ Blend modes via `mix-blend-mode` (additive = `plus-lighter`)
+- ✅ Crack-free mesh seams on clip-antialiasing browsers (Safari): each triangle's
+  clip polygon is expanded 0.5px from its centroid so neighbours overlap — the
+  texture is continuous across shared edges, so the overlap is invisible
+  (`?expand=0` shows the cracks for comparison)
 - ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
   parts + `overflow: hidden` cover the practical cases
 - ⬜ RGB tinting (alpha works); DPR-aware mesh canvas backing store
+- ⬜ WebKit mesh-canvas cost: Safari rasterizes the per-triangle path noticeably
+  slower than Chromium (measured ~7.6ms vs ~0.5ms per frame headless) — dirty-check
+  skipping and/or an optional WebGL blit backend are the candidates
 
 ## Quick start
 

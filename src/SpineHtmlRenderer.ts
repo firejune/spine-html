@@ -13,6 +13,16 @@ import type { RegionImage } from './DomTexture';
 
 const regionVertices = new Float32Array(8);
 
+/** Push a point away from (cx, cy) by `amount` pixels. */
+function expandPoint(x: number, y: number, cx: number, cy: number, amount: number): [number, number] {
+  const dx = x - cx;
+  const dy = y - cy;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 1e-6) return [x, y];
+  const s = amount / len;
+  return [x + dx * s, y + dy * s];
+}
+
 type SlotKind = 'image' | 'canvas';
 
 interface SlotView {
@@ -62,6 +72,12 @@ export class SpineHtmlRenderer {
   meshCount = 0;
   /** Triangles rasterized last frame. */
   triangleCount = 0;
+  /**
+   * How far (px) each triangle's clip polygon is expanded from its centroid.
+   * Closes antialiased-clip cracks between adjacent triangles (Safari);
+   * set to 0 to see them.
+   */
+  triangleExpand = 0.5;
 
   private readonly views = new Map<Slot, SlotView>();
   private meshVertices = new Float32Array(256);
@@ -242,9 +258,13 @@ export class SpineHtmlRenderer {
    * Standard canvas triangle texture mapping (same math as the official
    * spine-canvas renderer): derive the affine that sends the triangle's
    * texture-space corners to its screen-space corners, clip, draw the page.
-   * Chromium does not antialias clip paths, so adjacent triangles meet
-   * without visible cracks there; overdraw compensation is a follow-up for
-   * browsers that do.
+   *
+   * The clip polygon is expanded outward from the centroid by a fraction of
+   * a pixel. Browsers that antialias clip paths (Safari) otherwise leave
+   * hairline cracks between adjacent triangles; the expanded clips overlap
+   * into the neighbouring triangle, and since the texture is continuous
+   * across the shared edge the overlap draws the same pixels — cracks close
+   * with no visible cost. The texture-mapping affine itself stays exact.
    */
   private drawTriangle(
     ctx: CanvasRenderingContext2D, img: HTMLImageElement,
@@ -252,10 +272,13 @@ export class SpineHtmlRenderer {
     x1: number, y1: number, u1: number, v1: number,
     x2: number, y2: number, u2: number, v2: number,
   ): void {
+    const cx = (x0 + x1 + x2) / 3;
+    const cy = (y0 + y1 + y2) / 3;
+    const expand = this.triangleExpand;
     ctx.beginPath();
-    ctx.moveTo(x0, y0);
-    ctx.lineTo(x1, y1);
-    ctx.lineTo(x2, y2);
+    ctx.moveTo(...expandPoint(x0, y0, cx, cy, expand));
+    ctx.lineTo(...expandPoint(x1, y1, cx, cy, expand));
+    ctx.lineTo(...expandPoint(x2, y2, cx, cy, expand));
     ctx.closePath();
 
     x1 -= x0; y1 -= y0;
