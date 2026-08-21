@@ -33,8 +33,10 @@ Measured so far (PoC, Chromium on Apple silicon):
   canvases, 323 triangles); 10 running skeletons = **~3.5 ms/frame** total.
 - Dirty-skip: 10 *static* skeletons (pose held) = **~0.4 ms/frame** on both Chromium
   and WebKit — unchanged meshes reuse their raster, so idle parts cost nothing.
-  The same scene animating costs WebKit ~140 ms/frame (headless), which is the
-  remaining optimization target below.
+- Real Safari (on-device, not headless): 10 running skeletons ≈ **4–5 ms/frame**,
+  1 skeleton ≈ **0.7 ms**, frozen poses ≈ **0.6 ms** with every mesh reused. The
+  ~140 ms/frame seen on *headless* WebKit is its software rasterizer, not a Safari
+  property — on-device canvas2d is GPU-accelerated and lands on par with Chromium.
 
 ## Status
 
@@ -64,11 +66,12 @@ Measured so far (PoC, Chromium on Apple silicon):
   whole pixels) pay zero raster. 10 frozen spineboys: WebKit ~141 → ~0.5 ms/frame
 - ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
   parts + `overflow: hidden` cover the practical cases
-- ⬜ WebKit cost for *continuously deforming* meshes: the per-triangle canvas2d path
-  is ~15× slower than Chromium and the cost is per-triangle, not per-pixel (a 0.4×
-  backing store measures the same as 1×) — an optional WebGL blit backend
-  (one offscreen GL context → `transferToImageBitmap` → per-part `bitmaprenderer`)
-  is the remaining candidate
+- ✅ WebKit cost resolved by on-device measurement: the "~15× slower per-triangle
+  path" observed earlier is a **headless-WebKit artifact** (software rasterization —
+  which is also why a 0.4× backing store measured the same as 1× there). Real Safari
+  runs 10 continuously-deforming skeletons at ~4–5 ms/frame, on par with Chromium,
+  so the once-planned WebGL blit backend is shelved — no real-device workload
+  needs it
 
 ## Install
 

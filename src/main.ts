@@ -215,8 +215,12 @@ function main(
           ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused`
           : '';
       const clipNote = clips ? ` · ${clips} clips skipped` : '';
+      // Real fps from rAF cadence: catches bottlenecks that live outside the
+      // frame callback (compositing, page throttling) which the ms split
+      // cannot see.
+      const fps = (frames * 1000) / (now - statsAt);
       stats.textContent =
-        `${instances.length} skeleton(s) · ` +
+        `${instances.length} skeleton(s) · ${fps.toFixed(0)} fps · ` +
         `skeleton ${(updateMs / frames).toFixed(2)}ms · ` +
         `render ${(renderMs / frames).toFixed(2)}ms / frame${meshNote}${clipNote}`;
       updateMs = renderMs = 0;
