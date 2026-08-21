@@ -168,6 +168,29 @@ meshes through the shared WebGL blitter (also a live header select; the stats li
 names the active backend), and `?time=1.2` seeks every instance to the same pose
 for deterministic captures.
 
+## Tests
+
+```bash
+bun run test   # builds + serves the demo, then runs chromium + webkit
+```
+
+Playwright drives the demo (`tests/`, config in `playwright.config.ts`; CI
+runs the same suite on ubuntu). The visual check is **A/B within one run**:
+no golden snapshots are committed (they rot across platforms/GPUs) — instead
+the same deterministic pose (`?time` + `?timescale=0`) is screenshotted with
+`?backend=canvas2d` and `?backend=webgl` in the same engine and the buffers
+are diffed directly with a shift-tolerant comparison, so missing parts,
+wrong colors, and tint/blend divergence fail regardless of platform.
+Hairline seams are guarded by a deterministic canary (`?expand=0` must
+change the canvas2d raster), and counter tests pin the dirty-skip /
+grow-only-backing / clip-skip invariants plus spine-core's region corner
+order (BL, UL, UR, BR).
+
+Standing rule: **headless numbers are never Safari performance evidence** —
+nothing in the suite asserts timing, and headless-WebKit fps/ms readings do
+not transfer (software rasterizer, measured up to 28× off real Safari). The
+perf oracle is the demo's stats line on a real device.
+
 ## How it works
 
 1. `@esotericsoftware/spine-core` loads the skeleton and drives `AnimationState`,
