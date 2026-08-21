@@ -285,9 +285,12 @@ export class SpineHtmlRenderer {
     const needW = Math.max(1, Math.round(w * ratio));
     const needH = Math.max(1, Math.round(h * ratio));
     if (needW > view.canvasW || needH > view.canvasH || view.meshRatio !== ratio) {
+      // 25% slack: at low fps the animation is sampled sparsely, so new bbox
+      // maxima keep being discovered for many seconds — allocate ahead of the
+      // curve instead of chasing it.
       const step = 32;
-      view.canvasW = Math.ceil(Math.max(needW, view.canvasW) / step) * step;
-      view.canvasH = Math.ceil(Math.max(needH, view.canvasH) / step) * step;
+      view.canvasW = Math.ceil(Math.max(needW * 1.25, view.canvasW) / step) * step;
+      view.canvasH = Math.ceil(Math.max(needH * 1.25, view.canvasH) / step) * step;
       view.meshRatio = ratio;
       canvas.width = view.canvasW;
       canvas.height = view.canvasH;
