@@ -18,7 +18,11 @@ export class DomTexture extends Texture {
 }
 
 export interface RegionImage {
-  /** URL of the unpacked (rotation-restored) region pixels. */
+  /**
+   * URL of the unpacked (rotation-restored) region pixels: a blob URL minted
+   * by unpackRegions, the page image URL itself when the region covers its
+   * whole page, or anything the caller put there in a hand-built map.
+   */
   url: string;
   /** Unpacked width in atlas pixels. */
   width: number;
@@ -45,10 +49,13 @@ function revokeOwned(url: string): void {
 /**
  * Cuts every atlas region out of the page image into its own bitmap once at
  * load time, restoring 90° packing rotation, so the per-frame path never
- * touches a canvas. Returns blob URLs keyed by region name.
+ * touches a canvas. Returns image URLs keyed by region name.
  *
  * This is a loading-pipeline step, not a rendering step: after this runs,
  * rendering is pure DOM (one <img> per slot, one CSS matrix write per frame).
+ *
+ * A region that covers its whole page unrotated skips the cut and reuses the
+ * page image URL — see the pass-through below.
  *
  * The blob URLs stay alive until revokeRegions() frees them — a document-wide
  * allocation the GC cannot reclaim on its own. Callers that load and unload
@@ -62,6 +69,13 @@ export async function unpackRegions(
   pageImages: Map<string, HTMLImageElement>,
 ): Promise<Map<string, RegionImage>> {
   const result = new Map<string, RegionImage>();
+  // Duplicate region names would otherwise strand the shadowed URL in the
+  // ledger with nothing left pointing at it.
+  const put = (name: string, entry: RegionImage): void => {
+    const shadowed = result.get(name);
+    if (shadowed) revokeOwned(shadowed.url);
+    result.set(name, entry);
+  };
 
   try {
     for (const region of atlas.regions) {
@@ -71,6 +85,28 @@ export async function unpackRegions(
 
       const w = region.width;
       const h = region.height;
+
+      // Whole-page pass-through: an unrotated region covering its entire page
+      // would be cut into a pixel-for-pixel copy of the page image, so reuse
+      // the page URL instead — no canvas, no PNG re-encode, no second decoded
+      // copy in memory, and nothing to revoke afterwards. Atlases written as
+      // one part per page (the loose-part-PNG workflow, where every part is
+      // declared its own page) hit this for every single region.
+      //
+      // The test is against the image, not the atlas `size:` line: a page
+      // declared at the wrong size still goes through the cut, since the cut
+      // is what the region's coordinates actually describe.
+      if (
+        region.degrees === 0 &&
+        atlasRegion.x === 0 &&
+        atlasRegion.y === 0 &&
+        w === image.naturalWidth &&
+        h === image.naturalHeight
+      ) {
+        put(atlasRegion.name, { url: image.src, width: w, height: h });
+        continue;
+      }
+
       const canvas = document.createElement('canvas');
       canvas.width = w;
       canvas.height = h;
@@ -92,11 +128,7 @@ export async function unpackRegions(
       });
       const url = URL.createObjectURL(blob);
       ownedUrls.add(url);
-      // Duplicate region names would otherwise strand the shadowed URL in the
-      // ledger with nothing left pointing at it.
-      const shadowed = result.get(atlasRegion.name);
-      if (shadowed) revokeOwned(shadowed.url);
-      result.set(atlasRegion.name, { url, width: w, height: h });
+      put(atlasRegion.name, { url, width: w, height: h });
     }
   } catch (error) {
     revokeRegions(result);
@@ -112,7 +144,8 @@ export async function unpackRegions(
  * `renderer.dispose()`, since a live <img> would keep pointing at a dead URL).
  *
  * Only URLs this module created are revoked: entries the caller supplied
- * itself (a hand-built map of loose part PNGs) are left alone. Idempotent —
+ * itself (a hand-built map of loose part PNGs) and page images reused
+ * verbatim by the whole-page pass-through are left alone. Idempotent —
  * revoking twice is a no-op, so it is safe on a map that is shared or
  * partially reused.
  *

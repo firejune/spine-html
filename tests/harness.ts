@@ -19,6 +19,24 @@ half-right
 bounds: 32, 0, 32, 32
 `;
 
+/**
+ * Whole-page regions (the one-part-per-page shape) plus the two cases that
+ * must still be cut: a sub-rect, and a rotated region covering its page.
+ */
+const WHOLE_PAGE_ATLAS = `part.png
+size: 64, 32
+whole
+bounds: 0, 0, 64, 32
+sub
+bounds: 0, 0, 32, 32
+
+rot.png
+size: 32, 64
+whole-rotated
+bounds: 0, 0, 64, 32
+rotate: true
+`;
+
 /** Second page has no image, so unpackRegions throws after minting the first. */
 const MISSING_PAGE_ATLAS = `part.png
 size: 64, 32
@@ -51,6 +69,14 @@ export interface UnpackProbeResult {
   aliveAfter: Record<string, boolean>;
 }
 
+export interface PassThroughProbeResult {
+  /** Page image URLs by page name, all caller-owned. */
+  pageUrls: Record<string, string>;
+  createdUrls: string[];
+  regions: RegionEntry[];
+  aliveAfter: Record<string, boolean>;
+}
+
 export interface UnpackFailureProbeResult {
   /** Message of the error unpackRegions threw ('' if it did not throw). */
   message: string;
@@ -61,6 +87,7 @@ export interface UnpackFailureProbeResult {
 
 export interface SpineHtmlHarness {
   unpackProbe(): Promise<UnpackProbeResult>;
+  passThroughProbe(): Promise<PassThroughProbeResult>;
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
 }
 
@@ -180,6 +207,31 @@ async function unpackProbe(): Promise<UnpackProbeResult> {
   };
 }
 
+async function passThroughProbe(): Promise<PassThroughProbeResult> {
+  const part = await makePageImage(64, 32);
+  const rot = await makePageImage(32, 64);
+  const atlas = new TextureAtlas(WHOLE_PAGE_ATLAS);
+  const pageImages = new Map([
+    ['part.png', part.image],
+    ['rot.png', rot.image],
+  ]);
+  for (const atlasPage of atlas.pages) {
+    const image = pageImages.get(atlasPage.name);
+    if (image) atlasPage.setTexture(new DomTexture(image));
+  }
+
+  const unpacked = await trackObjectUrls(() => unpackRegions(atlas, pageImages));
+  const regions = entries(unpacked.result);
+  revokeRegions(unpacked.result);
+
+  return {
+    pageUrls: { 'part.png': part.url, 'rot.png': rot.url },
+    createdUrls: unpacked.created,
+    regions,
+    aliveAfter: await alive([part.url, rot.url, ...regions.map((region) => region.url)]),
+  };
+}
+
 async function unpackFailureProbe(): Promise<UnpackFailureProbeResult> {
   const page = await makePageImage(64, 32);
   const atlas = new TextureAtlas(MISSING_PAGE_ATLAS);
@@ -204,4 +256,4 @@ async function unpackFailureProbe(): Promise<UnpackFailureProbeResult> {
   };
 }
 
-window.spineHtmlHarness = { unpackProbe, unpackFailureProbe };
+window.spineHtmlHarness = { unpackProbe, passThroughProbe, unpackFailureProbe };

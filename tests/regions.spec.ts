@@ -34,6 +34,37 @@ test('revokeRegions frees every unpacked URL and nothing else', async ({ page })
   expect(probe.aliveAfter[probe.pageUrl]).toBe(true);
 });
 
+test('a region covering its whole page reuses the page image', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.passThroughProbe());
+  const region = (name: string) => probe.regions.find((entry) => entry.name === name);
+
+  // One part per page: the cut would reproduce the page pixel for pixel, so
+  // the page URL is handed through — no canvas, no PNG re-encode, no copy.
+  expect(region('whole')).toEqual({
+    name: 'whole',
+    url: probe.pageUrls['part.png'],
+    width: 64,
+    height: 32,
+  });
+  // Still cut: a sub-rect, and a region that covers its page but is packed
+  // rotated (the bitmap has to be turned upright).
+  expect(region('sub')?.url).toMatch(/^blob:/);
+  expect(region('whole-rotated')).toEqual({
+    name: 'whole-rotated',
+    url: expect.stringMatching(/^blob:/),
+    width: 64,
+    height: 32,
+  });
+  // Exactly the two cut regions were encoded — that count is the pass-through.
+  expect(probe.createdUrls.length).toBe(2);
+
+  // Pass-through URLs belong to the caller: revokeRegions must not free them,
+  // or the whole atlas would go blank on the next load/unload cycle.
+  expect(probe.aliveAfter[probe.pageUrls['part.png']]).toBe(true);
+  expect(probe.aliveAfter[probe.pageUrls['rot.png']]).toBe(true);
+  for (const url of probe.createdUrls) expect(probe.aliveAfter[url]).toBe(false);
+});
+
 test('a failed unpack revokes what it already minted', async ({ page }) => {
   const probe = await page.evaluate(() => window.spineHtmlHarness.unpackFailureProbe());
 
