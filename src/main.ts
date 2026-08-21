@@ -173,6 +173,18 @@ function main(
   countInput.value = String(initialCount);
   rebuild(initialCount);
 
+  // Click the stats line to copy it (hand-selecting it mid-animation is fiddly).
+  stats.title = 'click to copy';
+  stats.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(stats.textContent ?? '');
+      stats.style.color = '#ffd166';
+      setTimeout(() => (stats.style.color = ''), 300);
+    } catch {
+      // Clipboard unavailable (non-secure context) — selecting stays possible.
+    }
+  });
+
   // --- frame loop with split timings (skeleton math vs DOM writes) ---
   let last = performance.now();
   let updateMs = 0;
