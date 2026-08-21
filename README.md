@@ -44,18 +44,24 @@ they do **not** substitute for each other):
   Safari antialiases canvas2d **clip paths**, so every triangle pays for an AA
   mask. Chromium doesn't antialias clips and stays smooth. This is what the
   optional WebGL mesh backend (below) removes.
-- Real Safari (on-device), **webgl mesh backend**: the same meshed ×10 scene jumps
-  **3–4 → 45 fps** — 80 mesh canvases / 3230 triangles redrawn every frame
-  (0 reused, the worst case), in-callback JS ~5.8 ms at dpr=1. The per-triangle
-  clip-AA tax is gone; the remaining gap to 60 is the blit/compositing cost of a
-  10-skeleton stress scene, not a per-triangle cost.
+- Real Safari (on-device), **webgl mesh backend**: meshed ×1 holds **60 fps**
+  (vs 37 on canvas2d), and the meshed ×10 stress scene jumps **3–4 → 45 fps** —
+  80 mesh canvases / 3230 triangles redrawn every frame (0 reused, the worst
+  case), in-callback JS ~5.8 ms at dpr=1. The per-triangle clip-AA tax is gone;
+  the remaining gap to 60 is the blit/compositing cost of a 10-skeleton stress
+  scene, not a per-triangle cost.
 - Headless-WebKit numbers are a **software rasterizer** and measured up to 28×
   off real Safari in both directions — useful for visual regression only, never
   as Safari perf evidence.
 
 ## Status
 
-**Proof of concept.**
+**Production.** The questions this started as a PoC to answer — how far does the
+DOM actually go, and how cheap is it — are answered with on-device numbers: the
+practical scenario (a character or two, mostly holding pose, a few parts
+deforming) holds **60 fps on every engine measured**, and the 10-skeleton
+stress scene holds 45 fps on the weakest one (Safari, webgl backend). Ships
+with a self-contained test suite (backend visual parity + invariants) and CI.
 
 - ✅ Region attachments (rigid parts): exact affine mapping, draw-order via `z-index`,
   attachment swaps, alpha
