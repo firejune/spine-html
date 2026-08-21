@@ -43,6 +43,17 @@ README.md for architecture and measured numbers.
 - Element-level features (z-index draw order, SVG-filter tint, mix-blend-mode,
   dirty-skip, backing policy) are backend-agnostic. Keep them out of the raster
   backends.
+- **A RegionImage map belongs to the caller, not to a renderer.** Its URLs may
+  be blobs from `unpackRegions`, an atlas page passed through whole, or the
+  caller's own part PNGs — and one map is normally shared by several renderers
+  (the demo does it). So only `revokeRegions` frees anything, and only URLs
+  this package minted (the `ownedUrls` ledger in DomTexture.ts). Never revoke
+  from `dispose()`.
+- `loadSkeletonAssets` is a convenience layer, not a dependency: nothing else
+  in `src/` imports it, so it tree-shakes away. Keep it that way, and keep the
+  low-level path (TextureAtlas + DomTexture + unpackRegions) fully usable on
+  its own — the shapes it does not cover are real (one atlas across several
+  skeletons, in-memory images).
 
 ## Testing
 
@@ -51,6 +62,11 @@ README.md for architecture and measured numbers.
 - Parity strategy: **A/B canvas2d-vs-webgl within one run, no golden snapshot
   files** (goldens rot across platforms). The `?expand=0` canary covers seam
   cracks, which sit below the statistical noise floor.
+- Rendering is tested through the demo; the **loading path is tested through
+  `tests/harness.html`** (a second vite build entry that exposes the library on
+  `window.spineHtmlHarness`). Blob-URL ownership has no visual signature, so
+  its oracle is the browser: a revoked object URL stops resolving. Keep test
+  hooks in the harness, out of the demo.
 - Keep `@playwright/test` pinned to a version whose browser revisions match the
   machine's `~/Library/Caches/ms-playwright` before bumping it.
 
@@ -69,3 +85,13 @@ README.md for architecture and measured numbers.
   systematic sub-texel offset, invisible at demo scale but the dominant residue
   in A/B parity diffs. Align on the GL convention when next touching the raster
   paths (and expect parity-test tolerances to tighten).
+- `loadSkeletonAssets` reads JSON exports only. Binary (`.skel`) would mean
+  importing `SkeletonBinary`, which every user of the loader would then carry —
+  worth a separate entry point rather than a branch, if it is ever asked for.
+- `loadSkeletonAssets` is one atlas per skeleton. Sharing one atlas across
+  several skeletons (what the demo does) still needs the low-level path; a
+  `skeletonUrls: string[]` variant would cover it without double-unpacking.
+- The mesh tier keeps a page image alive per atlas page (it samples the page
+  bitmap every frame), so unloading a skeleton frees the region blobs but not
+  the pages. Nothing leaks — the images are the caller's and drop with the
+  atlas — but a consumer counting bytes should know the pages are the floor.

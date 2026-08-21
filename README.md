@@ -66,7 +66,8 @@ with a self-contained test suite (backend visual parity + invariants) and CI.
 - ✅ Region attachments (rigid parts): exact affine mapping, draw-order via `z-index`,
   attachment swaps, alpha
 - ✅ Atlas unpacking at load time (90°-packed regions restored), so the rigid per-frame
-  path never touches a canvas
+  path never touches a canvas — a region that covers its whole page is passed through
+  uncut, and `revokeRegions()` frees the rest when a skeleton is unloaded
 - ✅ Mesh attachments (deform tier): small per-part canvases sized to the mesh's world
   bounds, interleaved with the rigid `<img>` slots in one stacking context — the DOM
   handles the bones, a rasterizer handles the warps
@@ -114,11 +115,51 @@ npm i spine-html @esotericsoftware/spine-core
 ```
 
 ```ts
-import { TextureAtlas, AtlasAttachmentLoader, SkeletonJson, Skeleton,
-  AnimationState, AnimationStateData, Physics } from '@esotericsoftware/spine-core';
-import { SpineHtmlRenderer, DomTexture, unpackRegions } from 'spine-html';
+import { Skeleton, AnimationState, AnimationStateData, Physics }
+  from '@esotericsoftware/spine-core';
+import { loadSkeletonAssets, SpineHtmlRenderer } from 'spine-html';
 
-// Load: parse the atlas, attach page images, unpack per-region bitmaps once.
+const assets = await loadSkeletonAssets({
+  atlasUrl: '/spineboy/spineboy.atlas',
+  skeletonUrl: '/spineboy/spineboy-pro.json',
+});
+
+// A positioned element becomes the skeleton origin (Spine is Y-up: the
+// skeleton grows upward from it). Layout and scaling are the caller's.
+const skeleton = new Skeleton(assets.data);
+const state = new AnimationState(new AnimationStateData(assets.data));
+state.setAnimation(0, 'walk', true);
+const renderer = new SpineHtmlRenderer(rootElement, assets.regionImages);
+
+function frame(delta: number) {
+  state.update(delta);
+  state.apply(skeleton);
+  skeleton.update(delta);
+  skeleton.updateWorldTransform(Physics.update);
+  renderer.render(skeleton);
+}
+
+// Unloading (a cutscene ends, a level swaps): elements first, bitmaps second.
+// The unpacked regions are blob URLs — nothing else frees them.
+renderer.dispose();
+assets.dispose();
+```
+
+`spine-html` is a third-party renderer and is not affiliated with or endorsed by
+Esoteric Software.
+
+### Loading it yourself
+
+`loadSkeletonAssets` is optional sugar over five `spine-core` calls, and the
+package works without it. Drop to the low-level path whenever you need
+something it does not do — one atlas shared by several skeletons, a binary
+export, images that are already in memory:
+
+```ts
+import { TextureAtlas, AtlasAttachmentLoader, SkeletonJson }
+  from '@esotericsoftware/spine-core';
+import { DomTexture, unpackRegions, revokeRegions } from 'spine-html';
+
 const atlas = new TextureAtlas(atlasText);
 const pageImages = new Map<string, HTMLImageElement>();
 for (const page of atlas.pages) {
@@ -129,31 +170,73 @@ for (const page of atlas.pages) {
 const regionImages = await unpackRegions(atlas, pageImages);
 const data = new SkeletonJson(new AtlasAttachmentLoader(atlas)).readSkeletonData(jsonText);
 
-// A positioned element becomes the skeleton origin (Spine is Y-up: the
-// skeleton grows upward from it).
-const skeleton = new Skeleton(data);
-const state = new AnimationState(new AnimationStateData(data));
-state.setAnimation(0, 'walk', true);
-const renderer = new SpineHtmlRenderer(rootElement, regionImages);
-// Mesh canvases raster at devicePixelRatio by default; if you scale the
-// root element, fold that scale in so the raster matches the screen:
-// renderer.pixelRatio = devicePixelRatio * rootScale;
-// Mesh rasterizer: 'canvas2d' (default) or 'webgl' — same output, but on
-// Safari heavy deforming scenes should use 'webgl' (see Measured above).
-// Falls back to canvas2d automatically when WebGL is unavailable.
-// renderer.meshBackend = 'webgl';
-
-function frame(delta: number) {
-  state.update(delta);
-  state.apply(skeleton);
-  skeleton.update(delta);
-  skeleton.updateWorldTransform(Physics.update);
-  renderer.render(skeleton);
-}
+// …and on unload, after every renderer using them is disposed:
+revokeRegions(regionImages);
 ```
 
-`spine-html` is a third-party renderer and is not affiliated with or endorsed by
-Esoteric Software.
+`unpackRegions` mints one blob URL per region; `revokeRegions` is its
+counterpart. It only frees URLs `unpackRegions` created, so a map you built
+yourself (below) and page images reused by the whole-page pass-through survive
+it — and calling it twice is a no-op. Load once for the page's lifetime and you
+can ignore it; load and unload repeatedly without it and you leak an atlas per
+cycle.
+
+### One part per page (loose part PNGs)
+
+Not every pipeline runs the Spine editor's texture packer. If your parts are
+loose PNGs, declare each one as its own atlas page — a blank line closes a page
+block, the next line opens the next:
+
+```
+head.png
+size: 512, 512
+head
+bounds: 0, 0, 512, 512
+
+torso.png
+size: 640, 480
+torso
+bounds: 0, 0, 640, 480
+```
+
+`spine-core` parses this as a normal multi-page atlas and nothing here needs a
+flag. Two things to know:
+
+- **`size:` must be the PNG's real pixel size.** UVs are derived from it
+  (`region.x / page.width`), and a wrong value skews the mesh tier while the
+  rigid tier still looks fine — a confusing failure to chase.
+- Regions like these cover their whole page, so `unpackRegions` hands the page
+  image straight through instead of cutting and re-encoding it. Load cost for
+  this atlas shape is just the image loads.
+
+For a **rigid-only** skeleton you can skip atlas unpacking altogether and hand
+the renderer a map you build yourself — meshes cannot, because the deform tier
+samples the page bitmap through the atlas region:
+
+```ts
+const regionImages = new Map([
+  ['head', { url: '/parts/head.png', width: 512, height: 512 }],
+]);
+const renderer = new SpineHtmlRenderer(rootElement, regionImages);
+```
+
+### Runtime knobs and what they cost
+
+- `renderer.pixelRatio` — mesh-canvas backing pixels per CSS pixel (defaults to
+  `devicePixelRatio`; if you scale the root element, fold that scale in so the
+  raster matches the screen: `devicePixelRatio * rootScale`). **Writing it
+  reallocates every mesh canvas backing store on the next frame**, and each
+  reallocation recreates a GPU surface — the cost that took real Safari to ~3 fps
+  when it happened per frame. Set it when a layout settles, never per frame:
+  debounce resize drags and quantize the value instead of tracking it
+  continuously. `renderer.canvasReallocCount` is the check — it must fall back to
+  zero within a second or two.
+- `renderer.meshBackend` — `'canvas2d'` (default) or `'webgl'`; same output, but
+  heavy deforming scenes on Safari want `'webgl'` (see Measured above). Falls back
+  to canvas2d automatically when WebGL is unavailable. Switching re-rasters every
+  mesh once (no reallocation), so it is fine to expose as a user setting.
+- `renderer.triangleExpand` — clip overdraw in px that closes antialiased mesh
+  seams (default 0.5). Also re-rasters every mesh once when changed.
 
 ## Demo (this repository)
 
@@ -192,6 +275,13 @@ change the canvas2d raster), and counter tests pin the dirty-skip /
 grow-only-backing / clip-skip invariants plus spine-core's region corner
 order (BL, UL, UR, BR).
 
+The loading path is not observable in a rendered frame, so it gets its own
+page (`tests/harness.html`, a second build entry) that exposes the library to
+the specs directly. Its oracle is the browser: a revoked object URL stops
+resolving, so blob ownership — every unpacked URL freed, nothing the caller
+owns touched, nothing stranded by a failed load — is asserted rather than
+assumed.
+
 Standing rule: **headless numbers are never Safari performance evidence** —
 nothing in the suite asserts timing, and headless-WebKit fps/ms readings do
 not transfer (software rasterizer, measured up to 28× off real Safari). The
@@ -202,7 +292,8 @@ perf oracle is the demo's stats line on a real device.
 1. `@esotericsoftware/spine-core` loads the skeleton and drives `AnimationState`,
    constraints, and physics — all CPU-side, renderer-agnostic.
 2. At load time each atlas region is cut into its own bitmap (rotation restored), one
-   blob URL per region.
+   blob URL per region — except regions that already cover their whole page, which are
+   used as they are.
 3. Per frame, for each slot in draw order: `computeWorldVertices` yields the region's
    four corners in world space (order **BL, UL, UR, BR** — note the comments inside
    `computeWorldVertices` are stale). Flip Y (Spine is Y-up), derive the affine from
