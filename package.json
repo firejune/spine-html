@@ -1,6 +1,6 @@
 {
   "name": "spine-html",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Render Spine skeletal animations as plain DOM — rigid slots as <img> posed by CSS matrix, deform meshes on small per-part canvases, interleaved in one stacking context.",
   "type": "module",
   "license": "MIT",
