@@ -1,5 +1,18 @@
-import { TextureAtlas } from '@esotericsoftware/spine-core';
-import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from '../src/index';
+import {
+  AnimationState,
+  AnimationStateData,
+  Physics,
+  Skeleton,
+  TextureAtlas,
+} from '@esotericsoftware/spine-core';
+import {
+  DomTexture,
+  loadSkeletonAssets,
+  type RegionImage,
+  revokeRegions,
+  SpineHtmlRenderer,
+  unpackRegions,
+} from '../src/index';
 
 /**
  * Browser-side test harness (see harness.html).
@@ -85,10 +98,33 @@ export interface UnpackFailureProbeResult {
   aliveAfter: Record<string, boolean>;
 }
 
+export interface LoaderProbeResult {
+  animations: string[];
+  pageCount: number;
+  regionCount: number;
+  /** Region URLs the loader minted, and what its dispose() revoked. */
+  createdUrls: string[];
+  revokedUrls: string[];
+  /** Elements the renderer put in the root for one rendered frame. */
+  imageCount: number;
+  canvasCount: number;
+  /** Root children left after renderer.dispose(). */
+  rootChildrenAfterDispose: number;
+  aliveAfter: Record<string, boolean>;
+}
+
+export interface LoaderFailureProbeResult {
+  message: string;
+  createdUrls: string[];
+  revokedUrls: string[];
+}
+
 export interface SpineHtmlHarness {
   unpackProbe(): Promise<UnpackProbeResult>;
   passThroughProbe(): Promise<PassThroughProbeResult>;
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
+  loaderProbe(): Promise<LoaderProbeResult>;
+  loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
 }
 
 declare global {
@@ -256,4 +292,79 @@ async function unpackFailureProbe(): Promise<UnpackFailureProbeResult> {
   };
 }
 
-window.spineHtmlHarness = { unpackProbe, passThroughProbe, unpackFailureProbe };
+/** End-to-end: the convenience loader against the real spineboy export. */
+async function loaderProbe(): Promise<LoaderProbeResult> {
+  const load = await trackObjectUrls(() =>
+    loadSkeletonAssets({
+      atlasUrl: '/spineboy/spineboy.atlas',
+      skeletonUrl: '/spineboy/spineboy-pro.json',
+    }),
+  );
+  const assets = load.result;
+
+  // One rendered frame proves the pieces are wired to each other, not just
+  // present: page textures on the atlas (mesh tier) and region images on the
+  // renderer (rigid tier).
+  const root = document.getElementById('root');
+  if (!root) throw new Error('#root missing');
+  root.replaceChildren();
+  const skeleton = new Skeleton(assets.data);
+  const state = new AnimationState(new AnimationStateData(assets.data));
+  state.setAnimation(0, 'walk', true);
+  state.update(1.2);
+  state.apply(skeleton);
+  skeleton.update(1.2);
+  skeleton.updateWorldTransform(Physics.update);
+  const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+  renderer.render(skeleton);
+  const imageCount = root.querySelectorAll('img').length;
+  const canvasCount = root.querySelectorAll('canvas').length;
+  renderer.dispose();
+
+  // Twice: dispose() is documented as idempotent.
+  const release = await trackObjectUrls(async () => {
+    assets.dispose();
+    assets.dispose();
+  });
+
+  return {
+    animations: assets.data.animations.map((animation) => animation.name),
+    pageCount: assets.atlas.pages.length,
+    regionCount: assets.regionImages.size,
+    createdUrls: load.created,
+    revokedUrls: release.revoked,
+    imageCount,
+    canvasCount,
+    rootChildrenAfterDispose: root.childElementCount,
+    aliveAfter: await alive(load.created),
+  };
+}
+
+/** The skeleton URL is not JSON, so the read throws after the unpack. */
+async function loaderFailureProbe(): Promise<LoaderFailureProbeResult> {
+  const attempt = await trackObjectUrls(async () => {
+    try {
+      await loadSkeletonAssets({
+        atlasUrl: '/spineboy/spineboy.atlas',
+        skeletonUrl: '/spineboy/spineboy.atlas',
+      });
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+
+  return {
+    message: attempt.result,
+    createdUrls: attempt.created,
+    revokedUrls: attempt.revoked,
+  };
+}
+
+window.spineHtmlHarness = {
+  unpackProbe,
+  passThroughProbe,
+  unpackFailureProbe,
+  loaderProbe,
+  loaderFailureProbe,
+};
