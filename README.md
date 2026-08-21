@@ -25,18 +25,28 @@ The idea has been floated on the official forum three times since 2014 and was n
 built — the blockers named were meshes, clipping, and DOM update overhead. This project
 is the experiment: how far does the DOM actually go, and how cheap is it?
 
-Measured so far (PoC, Chromium on Apple silicon):
+Measured so far (PoC, Apple silicon — headless and on-device numbers are labeled,
+they do **not** substitute for each other):
 
-- Rigid only (spineboy-ess): 10 skeletons / 180 slot images at **~0.03 ms skeleton math
-  + ~0.22 ms DOM writes per frame** — about 1.5% of a 60 fps frame budget.
-- With meshes (spineboy-pro): 1 skeleton = **~0.05 ms + ~0.5 ms render** (8 mesh
-  canvases, 323 triangles); 10 running skeletons = **~3.5 ms/frame** total.
-- Dirty-skip: 10 *static* skeletons (pose held) = **~0.4 ms/frame** on both Chromium
-  and WebKit — unchanged meshes reuse their raster, so idle parts cost nothing.
-- Real Safari (on-device, not headless): 10 running skeletons ≈ **4–5 ms/frame**,
-  1 skeleton ≈ **0.7 ms**, frozen poses ≈ **0.6 ms** with every mesh reused. The
-  ~140 ms/frame seen on *headless* WebKit is its software rasterizer, not a Safari
-  property — on-device canvas2d is GPU-accelerated and lands on par with Chromium.
+- Rigid only (spineboy-ess), headless Chromium: 10 skeletons / 180 slot images at
+  **~0.03 ms skeleton math + ~0.22 ms DOM writes per frame** — about 1.5% of a
+  60 fps frame budget. On-device Safari: 10 rigid skeletons hold **60 fps**.
+- With meshes (spineboy-pro), headless Chromium: 1 skeleton = **~0.05 ms + ~0.5 ms
+  render** (8 mesh canvases, 323 triangles); 10 running skeletons = **~3.5 ms/frame**
+  total, smooth.
+- Dirty-skip: 10 *static* skeletons (pose held) = **~0.4 ms/frame** headless and
+  **~0.6 ms** on-device Safari — unchanged meshes reuse their raster, so idle or
+  held parts cost nothing anywhere.
+- Real Safari (on-device), canvas2d mesh backend: in-callback JS stays **~4–5
+  ms/frame** for 10 running meshed skeletons — but the rAF rate tells the real
+  story: **meshed ×1 = 37 fps, meshed ×10 = 3–4 fps** (rigid-only ×10 = 60 fps).
+  The cost lives outside the frame callback, in the compositor/GPU process:
+  Safari antialiases canvas2d **clip paths**, so every triangle pays for an AA
+  mask. Chromium doesn't antialias clips and stays smooth. This is what the
+  optional WebGL mesh backend (below) removes.
+- Headless-WebKit numbers are a **software rasterizer** and measured up to 28×
+  off real Safari in both directions — useful for visual regression only, never
+  as Safari perf evidence.
 
 ## Status
 
@@ -66,12 +76,25 @@ Measured so far (PoC, Chromium on Apple silicon):
   whole pixels) pay zero raster. 10 frozen spineboys: WebKit ~141 → ~0.5 ms/frame
 - ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
   parts + `overflow: hidden` cover the practical cases
-- ✅ WebKit cost resolved by on-device measurement: the "~15× slower per-triangle
-  path" observed earlier is a **headless-WebKit artifact** (software rasterization —
-  which is also why a 0.4× backing store measured the same as 1× there). Real Safari
-  runs 10 continuously-deforming skeletons at ~4–5 ms/frame, on par with Chromium,
-  so the once-planned WebGL blit backend is shelved — no real-device workload
-  needs it
+- ✅ Safari mesh cost root-caused by on-device triangulation (two corrections deep):
+  the early "~15× slower per-triangle path" was a **headless-WebKit artifact**
+  (software rasterization), and the follow-up "on par with Chromium" held only for
+  in-callback JS time. Real-Safari rAF rates — rigid ×10 = 60 fps, meshed ×1 =
+  37 fps, meshed ×10 = 3–4 fps with JS flat at ~4–5 ms — put the real cost in the
+  GPU process: Safari antialiases canvas2d **clip paths**, so the per-triangle clip
+  mapping pays a per-triangle AA-mask tax (the same AA that caused the seam cracks)
+- ✅ Optional WebGL blit backend for the mesh tier: `renderer.meshBackend =
+  'webgl'` (default stays `'canvas2d'`). All dirty meshes are shelf-packed into
+  **one shared offscreen WebGL context** (module-level — browsers cap contexts at
+  ~16), drawn as textured triangles with premultiplied alpha, then rect-blitted
+  onto the same per-part canvases with an unclipped `drawImage` — cheap on Safari.
+  Everything element-level is unchanged: z-index interleave, tint filter,
+  `mix-blend-mode`, dirty-skip, grow-only backing. GL rasterizes shared triangle
+  edges seamlessly, so this path needs no crack overdraw. Falls back to canvas2d
+  when WebGL is unavailable or the context is lost. Backend parity verified by
+  headless Chromium+WebKit screenshot diffs (glow / clipping / tint scenes;
+  sub-pixel edge differences only); on-device Safari fps for the webgl backend:
+  measurement pending
 
 ## Install
 
@@ -104,6 +127,10 @@ const renderer = new SpineHtmlRenderer(rootElement, regionImages);
 // Mesh canvases raster at devicePixelRatio by default; if you scale the
 // root element, fold that scale in so the raster matches the screen:
 // renderer.pixelRatio = devicePixelRatio * rootScale;
+// Mesh rasterizer: 'canvas2d' (default) or 'webgl' — same output, but on
+// Safari heavy deforming scenes should use 'webgl' (see Measured above).
+// Falls back to canvas2d automatically when WebGL is unavailable.
+// renderer.meshBackend = 'webgl';
 
 function frame(delta: number) {
   state.update(delta);
@@ -130,8 +157,11 @@ The official spineboy example assets are downloaded automatically on first `dev`
 
 Debug knobs (query string): `?skel=pro|ess` `?anim=walk` `?count=10` pick the scene,
 `?tint=ff8080` tints the whole skeleton, `?dpr=2` overrides the mesh-canvas backing
-ratio, `?timescale=0` freezes the pose (every mesh should report "reused"), and
-`?expand=0` disables the crack-closing clip overdraw.
+ratio, `?timescale=0` freezes the pose (every mesh should report "reused"),
+`?expand=0` disables the crack-closing clip overdraw, `?backend=webgl` rasterizes
+meshes through the shared WebGL blitter (also a live header select; the stats line
+names the active backend), and `?time=1.2` seeks every instance to the same pose
+for deterministic captures.
 
 ## How it works
 
