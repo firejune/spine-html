@@ -211,6 +211,13 @@ export class SpineHtmlRenderer {
     }
   }
 
+  /**
+   * Removes every element this renderer added to the root (slot elements and
+   * the tint filter defs). The region bitmaps are deliberately untouched: the
+   * map is the caller's, and one map is normally shared by many renderers
+   * (disposing one instance must not blind the others). Free the unpacked
+   * blob URLs with revokeRegions() once no renderer needs them.
+   */
   dispose(): void {
     for (const view of this.views.values()) view.el.remove();
     this.views.clear();

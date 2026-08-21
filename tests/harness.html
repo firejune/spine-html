@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>spine-html — test harness</title>
+  </head>
+  <body>
+    <!--
+      Not a demo: Playwright loads this page so the specs can drive the
+      library's loading path directly (window.spineHtmlHarness). The demo page
+      stays clean of test hooks.
+    -->
+    <div id="root" style="position: absolute; left: 0; top: 0"></div>
+    <script type="module" src="./harness.ts"></script>
+  </body>
+</html>
