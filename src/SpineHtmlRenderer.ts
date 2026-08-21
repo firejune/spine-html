@@ -12,6 +12,9 @@ import {
 import type { RegionImage } from './DomTexture';
 
 const regionVertices = new Float32Array(8);
+const SVG_NS = 'http://www.w3.org/2000/svg';
+/** Unique tint-filter ids across renderer instances (ids are document-global). */
+let tintFilterSeq = 0;
 
 /** Push a point away from (cx, cy) by `amount` pixels. */
 function expandPoint(x: number, y: number, cx: number, cy: number, amount: number): [number, number] {
@@ -34,9 +37,30 @@ interface SlotView {
   zIndex: number;
   opacity: number;
   blendMode: BlendMode;
-  /** Canvas kind: current bitmap size, to avoid re-allocating each frame. */
+  /** Last transform string written, to skip no-op style writes. */
+  transform: string;
+  /** Current RGB tint; (1,1,1) means untinted (no filter applied). */
+  tintR: number;
+  tintG: number;
+  tintB: number;
+  /** Lazily created SVG reference filter for non-white tints. */
+  tintId: string;
+  tintMatrix: SVGFEColorMatrixElement | null;
+  /** Canvas kind: current backing-store size, to avoid re-allocating each frame. */
   canvasW: number;
   canvasH: number;
+  /** Canvas kind: shape signature of the last raster, for dirty-skipping. */
+  meshAttachment: MeshAttachment | null;
+  meshSequenceIndex: number;
+  meshExpand: number;
+  meshVertexCount: number;
+  /**
+   * Canvas-space (bbox-relative) vertices of the last raster. Float64: the
+   * compared values are f64 (f32 world vertex minus integer bbox origin);
+   * storing them as f32 would round some of them and leave those meshes
+   * permanently "dirty".
+   */
+  meshVertices: Float64Array;
 }
 
 const BLEND_CSS: Record<BlendMode, string> = {
@@ -54,12 +78,17 @@ const BLEND_CSS: Record<BlendMode, string> = {
  *   transforms are affine.
  * - Mesh attachments (deform parts) each get a small per-part <canvas> sized
  *   to the mesh's world bounding box, redrawn per frame with the standard
- *   per-triangle clip+transform+drawImage mapping.
+ *   per-triangle clip+transform+drawImage mapping. Frames where the
+ *   canvas-space vertices are unchanged reuse the previous raster.
  *
  * Both element kinds share one stacking context, so draw order interleaves
  * freely via z-index (rear hair canvas < torso img < front hair canvas).
- * Clipping attachments are deliberately unsupported (transparent layered
- * parts make them unnecessary); they are counted in clipSkipCount.
+ * RGB tint (skeleton × slot × attachment color) is applied per element with
+ * an SVG feColorMatrix reference filter — exact channel multiply, works the
+ * same on <img> and <canvas>. Dark (two-color) tint is not expressible that
+ * way and is unsupported. Clipping attachments are deliberately unsupported
+ * (transparent layered parts make them unnecessary); they are counted in
+ * clipSkipCount.
  *
  * Coordinate mapping: Spine is Y-up, CSS is Y-down — world Y is negated.
  * spine-core computes everything (bones, constraints, physics, deformed
@@ -68,8 +97,10 @@ const BLEND_CSS: Record<BlendMode, string> = {
 export class SpineHtmlRenderer {
   /** Clipping attachments encountered (visible but unsupported). */
   clipSkipCount = 0;
-  /** Mesh canvases drawn last frame. */
+  /** Mesh canvases rasterized last frame. */
   meshCount = 0;
+  /** Mesh canvases that reused their previous raster last frame. */
+  meshReuseCount = 0;
   /** Triangles rasterized last frame. */
   triangleCount = 0;
   /**
@@ -78,9 +109,17 @@ export class SpineHtmlRenderer {
    * set to 0 to see them.
    */
   triangleExpand = 0.5;
+  /**
+   * Mesh-canvas backing-store pixels per CSS pixel. Defaults to the device
+   * pixel ratio. If the caller scales the root element, fold that scale in
+   * (e.g. devicePixelRatio * rootScale) so the raster matches the on-screen
+   * resolution instead of over- or under-sampling.
+   */
+  pixelRatio = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1;
 
   private readonly views = new Map<Slot, SlotView>();
-  private meshVertices = new Float32Array(256);
+  private scratchVertices = new Float32Array(256);
+  private tintDefs: SVGSVGElement | null = null;
 
   /**
    * @param root Positioned element (e.g. position:absolute) that becomes the
@@ -96,9 +135,9 @@ export class SpineHtmlRenderer {
   render(skeleton: Skeleton): void {
     this.clipSkipCount = 0;
     this.meshCount = 0;
+    this.meshReuseCount = 0;
     this.triangleCount = 0;
     const drawOrder = skeleton.drawOrder.appliedPose;
-    const skeletonAlpha = skeleton.color.a;
 
     for (let i = 0, n = drawOrder.length; i < n; i++) {
       const slot = drawOrder[i];
@@ -110,9 +149,9 @@ export class SpineHtmlRenderer {
         continue;
       }
       if (attachment instanceof RegionAttachment) {
-        this.renderRegion(slot, pose, attachment, i, skeletonAlpha);
+        this.renderRegion(skeleton, slot, pose, attachment, i);
       } else if (attachment instanceof MeshAttachment) {
-        this.renderMesh(skeleton, slot, pose, attachment, i, skeletonAlpha);
+        this.renderMesh(skeleton, slot, pose, attachment, i);
       } else {
         if (attachment instanceof ClippingAttachment) this.clipSkipCount++;
         this.hide(slot);
@@ -123,16 +162,18 @@ export class SpineHtmlRenderer {
   dispose(): void {
     for (const view of this.views.values()) view.el.remove();
     this.views.clear();
+    this.tintDefs?.remove();
+    this.tintDefs = null;
   }
 
   // --- rigid tier -----------------------------------------------------------
 
   private renderRegion(
+    skeleton: Skeleton,
     slot: Slot,
     pose: SlotPose,
     attachment: RegionAttachment,
     zIndex: number,
-    skeletonAlpha: number,
   ): void {
     const sequence = attachment.sequence;
     const region = sequence.regions[sequence.resolveIndex(pose)] as TextureAtlasRegion | null;
@@ -166,9 +207,9 @@ export class SpineHtmlRenderer {
     const b = (ury - uly) / w;
     const c = (blx - ulx) / h;
     const d = (bly - uly) / h;
-    img.style.transform = `matrix(${a},${b},${c},${d},${ulx},${uly})`;
+    this.setTransform(view, `matrix(${a},${b},${c},${d},${ulx},${uly})`);
 
-    this.applyCommon(view, slot, zIndex, skeletonAlpha * pose.color.a * attachment.color.a);
+    this.applyCommon(view, slot, pose, attachment.color, skeleton, zIndex);
   }
 
   // --- deform tier ----------------------------------------------------------
@@ -179,7 +220,6 @@ export class SpineHtmlRenderer {
     pose: SlotPose,
     attachment: MeshAttachment,
     zIndex: number,
-    skeletonAlpha: number,
   ): void {
     const sequence: Sequence = attachment.sequence;
     const sequenceIndex = sequence.resolveIndex(pose);
@@ -191,8 +231,8 @@ export class SpineHtmlRenderer {
     }
 
     const count = attachment.worldVerticesLength;
-    if (this.meshVertices.length < count) this.meshVertices = new Float32Array(count);
-    const vertices = this.meshVertices;
+    if (this.scratchVertices.length < count) this.scratchVertices = new Float32Array(count);
+    const vertices = this.scratchVertices;
     attachment.computeWorldVertices(skeleton, slot, 0, count, vertices, 0, 2);
 
     // World bounds (in CSS coords: Y negated).
@@ -218,40 +258,78 @@ export class SpineHtmlRenderer {
 
     const view = this.view(slot, 'canvas');
     const canvas = view.el as HTMLCanvasElement;
-    // NOTE: 1x backing store for the PoC; the example atlas is 0.5-scale
-    // anyway. DPR-aware backing is a follow-up.
-    if (view.canvasW !== w || view.canvasH !== h) {
-      view.canvasW = w;
-      view.canvasH = h;
-      canvas.width = w;
-      canvas.height = h;
+    const ratio = this.pixelRatio;
+    const backingW = Math.max(1, Math.round(w * ratio));
+    const backingH = Math.max(1, Math.round(h * ratio));
+    let dirty =
+      view.meshAttachment !== attachment ||
+      view.meshSequenceIndex !== sequenceIndex ||
+      view.meshExpand !== this.triangleExpand ||
+      view.meshVertexCount !== count;
+    if (view.canvasW !== backingW || view.canvasH !== backingH) {
+      view.canvasW = backingW;
+      view.canvasH = backingH;
+      canvas.width = backingW; // resizing also clears the canvas
+      canvas.height = backingH;
+      canvas.style.width = `${w}px`;
+      canvas.style.height = `${h}px`;
+      dirty = true;
     }
-    canvas.style.transform = `translate(${minX}px,${minY}px)`;
 
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, w, h);
-
-    const uvs = sequence.getUVs(sequenceIndex);
-    const triangles = attachment.triangles;
-    const uw = page.width - 1;
-    const uh = page.height - 1;
-
-    for (let t = 0; t < triangles.length; t += 3) {
-      const i0 = triangles[t] * 2;
-      const i1 = triangles[t + 1] * 2;
-      const i2 = triangles[t + 2] * 2;
-      this.drawTriangle(
-        ctx, page,
-        vertices[i0] - minX, vertices[i0 + 1] - minY, uvs[i0] * uw, uvs[i0 + 1] * uh,
-        vertices[i1] - minX, vertices[i1 + 1] - minY, uvs[i1] * uw, uvs[i1 + 1] * uh,
-        vertices[i2] - minX, vertices[i2 + 1] - minY, uvs[i2] * uw, uvs[i2 + 1] * uh,
-      );
+    // Canvas-space vertices: identical values mean last frame's raster is
+    // still exact (static pose, or the part moved by whole pixels), so the
+    // per-triangle redraw can be skipped — the CSS translate below keeps
+    // tracking the part. This is the main WebKit cost lever: idle skeletons
+    // stop paying the raster entirely.
+    if (view.meshVertices.length < count) {
+      view.meshVertices = new Float64Array(count);
+      dirty = true;
     }
-    this.meshCount++;
-    this.triangleCount += triangles.length / 3;
+    const rel = view.meshVertices;
+    for (let v = 0; v < count; v += 2) {
+      const x = vertices[v] - minX;
+      const y = vertices[v + 1] - minY;
+      if (rel[v] !== x || rel[v + 1] !== y) dirty = true;
+      rel[v] = x;
+      rel[v + 1] = y;
+    }
 
-    this.applyCommon(view, slot, zIndex, skeletonAlpha * pose.color.a * attachment.color.a);
+    this.setTransform(view, `translate(${minX}px,${minY}px)`);
+
+    if (!dirty) {
+      this.meshReuseCount++;
+    } else {
+      view.meshAttachment = attachment;
+      view.meshSequenceIndex = sequenceIndex;
+      view.meshExpand = this.triangleExpand;
+      view.meshVertexCount = count;
+
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, w, h);
+
+      const uvs = sequence.getUVs(sequenceIndex);
+      const triangles = attachment.triangles;
+      const uw = page.width - 1;
+      const uh = page.height - 1;
+
+      for (let t = 0; t < triangles.length; t += 3) {
+        const i0 = triangles[t] * 2;
+        const i1 = triangles[t + 1] * 2;
+        const i2 = triangles[t + 2] * 2;
+        this.drawTriangle(
+          ctx, page,
+          rel[i0], rel[i0 + 1], uvs[i0] * uw, uvs[i0 + 1] * uh,
+          rel[i1], rel[i1 + 1], uvs[i1] * uw, uvs[i1 + 1] * uh,
+          rel[i2], rel[i2 + 1], uvs[i2] * uw, uvs[i2 + 1] * uh,
+        );
+      }
+      this.meshCount++;
+      this.triangleCount += triangles.length / 3;
+    }
+
+    this.applyCommon(view, slot, pose, attachment.color, skeleton, zIndex);
   }
 
   /**
@@ -306,15 +384,52 @@ export class SpineHtmlRenderer {
 
   // --- shared plumbing -------------------------------------------------------
 
-  private applyCommon(view: SlotView, slot: Slot, zIndex: number, alpha: number): void {
+  private setTransform(view: SlotView, transform: string): void {
+    if (view.transform !== transform) {
+      view.transform = transform;
+      view.el.style.transform = transform;
+    }
+  }
+
+  private applyCommon(
+    view: SlotView,
+    slot: Slot,
+    pose: SlotPose,
+    attachmentColor: { r: number; g: number; b: number; a: number },
+    skeleton: Skeleton,
+    zIndex: number,
+  ): void {
+    const sc = skeleton.color;
+    const pc = pose.color;
     if (view.zIndex !== zIndex) {
       view.zIndex = zIndex;
       view.el.style.zIndex = String(zIndex);
     }
-    // Alpha only; RGB tinting has no cheap DOM equivalent (out of scope).
+    const alpha = sc.a * pc.a * attachmentColor.a;
     if (view.opacity !== alpha) {
       view.opacity = alpha;
       view.el.style.opacity = alpha === 1 ? '' : String(alpha);
+    }
+    // RGB tint (uniform per slot) rides an feColorMatrix reference filter:
+    // scaling the channels is an exact multiply, applies to <img> and
+    // <canvas> alike, and never touches the raster. Needs reference-filter
+    // support (Safari 15+).
+    const r = sc.r * pc.r * attachmentColor.r;
+    const g = sc.g * pc.g * attachmentColor.g;
+    const b = sc.b * pc.b * attachmentColor.b;
+    if (view.tintR !== r || view.tintG !== g || view.tintB !== b) {
+      view.tintR = r;
+      view.tintG = g;
+      view.tintB = b;
+      if (r === 1 && g === 1 && b === 1) {
+        view.el.style.filter = '';
+      } else {
+        this.tintMatrixFor(view).setAttribute(
+          'values',
+          `${r} 0 0 0 0 0 ${g} 0 0 0 0 0 ${b} 0 0 0 0 0 1 0`,
+        );
+        view.el.style.filter = `url(#${view.tintId})`;
+      }
     }
     const blendMode = slot.data.blendMode;
     if (view.blendMode !== blendMode) {
@@ -327,10 +442,36 @@ export class SpineHtmlRenderer {
     }
   }
 
+  private tintMatrixFor(view: SlotView): SVGFEColorMatrixElement {
+    if (view.tintMatrix) return view.tintMatrix;
+    if (!this.tintDefs) {
+      const svg = document.createElementNS(SVG_NS, 'svg');
+      svg.setAttribute('width', '0');
+      svg.setAttribute('height', '0');
+      svg.style.position = 'absolute';
+      this.root.appendChild(svg);
+      this.tintDefs = svg;
+    }
+    const filter = document.createElementNS(SVG_NS, 'filter');
+    view.tintId = `spine-html-tint-${tintFilterSeq++}`;
+    filter.setAttribute('id', view.tintId);
+    // Filter math must happen in sRGB to match Spine's color multiply
+    // (SVG filters default to linearRGB).
+    filter.setAttribute('color-interpolation-filters', 'sRGB');
+    const matrix = document.createElementNS(SVG_NS, 'feColorMatrix');
+    matrix.setAttribute('in', 'SourceGraphic');
+    matrix.setAttribute('type', 'matrix');
+    filter.appendChild(matrix);
+    this.tintDefs.appendChild(filter);
+    view.tintMatrix = matrix;
+    return matrix;
+  }
+
   private view(slot: Slot, kind: SlotKind): SlotView {
     let view = this.views.get(slot);
     if (view && view.kind !== kind) {
       view.el.remove();
+      view.tintMatrix?.parentElement?.remove();
       view = undefined;
     }
     if (!view) {
@@ -351,8 +492,19 @@ export class SpineHtmlRenderer {
         zIndex: -1,
         opacity: 1,
         blendMode: BlendMode.Normal,
+        transform: '',
+        tintR: 1,
+        tintG: 1,
+        tintB: 1,
+        tintId: '',
+        tintMatrix: null,
         canvasW: 0,
         canvasH: 0,
+        meshAttachment: null,
+        meshSequenceIndex: -1,
+        meshExpand: -1,
+        meshVertexCount: -1,
+        meshVertices: new Float64Array(0),
       };
       this.views.set(slot, view);
       this.root.appendChild(el);

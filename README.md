@@ -30,7 +30,11 @@ Measured so far (PoC, Chromium on Apple silicon):
 - Rigid only (spineboy-ess): 10 skeletons / 180 slot images at **~0.03 ms skeleton math
   + ~0.22 ms DOM writes per frame** — about 1.5% of a 60 fps frame budget.
 - With meshes (spineboy-pro): 1 skeleton = **~0.05 ms + ~0.5 ms render** (8 mesh
-  canvases, 323 triangles); 10 running skeletons = **~4.4 ms/frame** total.
+  canvases, 323 triangles); 10 running skeletons = **~3.5 ms/frame** total.
+- Dirty-skip: 10 *static* skeletons (pose held) = **~0.4 ms/frame** on both Chromium
+  and WebKit — unchanged meshes reuse their raster, so idle parts cost nothing.
+  The same scene animating costs WebKit ~140 ms/frame (headless), which is the
+  remaining optimization target below.
 
 ## Status
 
@@ -48,12 +52,23 @@ Measured so far (PoC, Chromium on Apple silicon):
   clip polygon is expanded 0.5px from its centroid so neighbours overlap — the
   texture is continuous across shared edges, so the overlap is invisible
   (`?expand=0` shows the cracks for comparison)
+- ✅ RGB tinting (skeleton × slot × attachment color) via an SVG `feColorMatrix`
+  reference filter per element — an exact channel multiply that works identically on
+  `<img>` and `<canvas>` without touching the raster (needs reference-filter support,
+  Safari 15+; verified pixel-level on Chromium and WebKit). Dark/two-color tint is
+  not expressible this way and stays out of scope
+- ✅ DPR-aware mesh canvas backing store: `renderer.pixelRatio` (defaults to
+  `devicePixelRatio`; if you scale the root element, fold that scale in)
+- ✅ Dirty-skip: a mesh whose canvas-space vertices didn't change reuses last frame's
+  raster — the CSS translate still tracks it, so parts that hold a pose (or move by
+  whole pixels) pay zero raster. 10 frozen spineboys: WebKit ~141 → ~0.5 ms/frame
 - ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
   parts + `overflow: hidden` cover the practical cases
-- ⬜ RGB tinting (alpha works); DPR-aware mesh canvas backing store
-- ⬜ WebKit mesh-canvas cost: Safari rasterizes the per-triangle path noticeably
-  slower than Chromium (measured ~7.6ms vs ~0.5ms per frame headless) — dirty-check
-  skipping and/or an optional WebGL blit backend are the candidates
+- ⬜ WebKit cost for *continuously deforming* meshes: the per-triangle canvas2d path
+  is ~15× slower than Chromium and the cost is per-triangle, not per-pixel (a 0.4×
+  backing store measures the same as 1×) — an optional WebGL blit backend
+  (one offscreen GL context → `transferToImageBitmap` → per-part `bitmaprenderer`)
+  is the remaining candidate
 
 ## Install
 
@@ -83,6 +98,9 @@ const skeleton = new Skeleton(data);
 const state = new AnimationState(new AnimationStateData(data));
 state.setAnimation(0, 'walk', true);
 const renderer = new SpineHtmlRenderer(rootElement, regionImages);
+// Mesh canvases raster at devicePixelRatio by default; if you scale the
+// root element, fold that scale in so the raster matches the screen:
+// renderer.pixelRatio = devicePixelRatio * rootScale;
 
 function frame(delta: number) {
   state.update(delta);
@@ -106,6 +124,11 @@ bun run dev
 The official spineboy example assets are downloaded automatically on first `dev`/`build`
 (they are owned by Esoteric Software and not redistributed in this repository — see
 [NOTICE.md](NOTICE.md)); `bun run fetch-assets` runs the same idempotent step manually.
+
+Debug knobs (query string): `?skel=pro|ess` `?anim=walk` `?count=10` pick the scene,
+`?tint=ff8080` tints the whole skeleton, `?dpr=2` overrides the mesh-canvas backing
+ratio, `?timescale=0` freezes the pose (every mesh should report "reused"), and
+`?expand=0` disables the crack-closing clip overdraw.
 
 ## How it works
 

@@ -19,6 +19,22 @@ const SKELETONS = {
 type SkeletonVariant = keyof typeof SKELETONS;
 const STAGE_SCALE = 0.4;
 
+// Debug knobs: ?skel=pro|ess &anim=walk &count=10 pick the scene;
+// ?expand=0 shows the mesh cracks; ?tint=ff8080 tints the whole skeleton;
+// ?dpr=2 overrides the mesh-canvas backing ratio; ?timescale=0 freezes the
+// animation (isolates the dirty-skip path: every mesh should report reused).
+const params = new URLSearchParams(location.search);
+
+function parseTint(): { r: number; g: number; b: number } | null {
+  const hex = params.get('tint');
+  if (!hex || !/^[0-9a-fA-F]{6}$/.test(hex)) return null;
+  return {
+    r: parseInt(hex.slice(0, 2), 16) / 255,
+    g: parseInt(hex.slice(2, 4), 16) / 255,
+    b: parseInt(hex.slice(4, 6), 16) / 255,
+  };
+}
+
 interface Instance {
   skeleton: Skeleton;
   state: AnimationState;
@@ -74,9 +90,12 @@ function main(
   const countInput = document.getElementById('count') as HTMLInputElement;
   const stats = document.getElementById('stats') as HTMLDivElement;
 
-  let variant: SkeletonVariant = 'pro';
+  const skelParam = params.get('skel');
+  let variant: SkeletonVariant = skelParam === 'ess' ? 'ess' : 'pro';
+  skelSelect.value = variant;
   let stateData = new AnimationStateData(data[variant]);
   let instances: Instance[] = [];
+  const tint = parseTint();
 
   function fillAnimations(): void {
     animSelect.innerHTML = '';
@@ -107,15 +126,23 @@ function main(
       stage.appendChild(container);
 
       const skeleton = new Skeleton(data[variant]);
+      if (tint) skeleton.color.set(tint.r, tint.g, tint.b, 1);
       const state = new AnimationState(stateData);
       state.setAnimation(0, animSelect.value, true);
       // Desync walk cycles so N instances don't look like one stamped sprite.
       state.update((i * 0.37) % 2);
+      const timescaleParam = params.get('timescale');
+      if (timescaleParam !== null) state.timeScale = Number(timescaleParam) || 0;
 
       const renderer = new SpineHtmlRenderer(container, regionImages);
-      // Debug knob: ?expand=0 disables the crack-closing clip overdraw.
-      const expandParam = new URLSearchParams(location.search).get('expand');
+      const expandParam = params.get('expand');
       if (expandParam !== null) renderer.triangleExpand = Number(expandParam) || 0;
+      // Mesh canvases raster at the effective on-screen resolution: device
+      // pixels × the stage downscale (a plain devicePixelRatio would
+      // oversample by 1/STAGE_SCALE).
+      const dprParam = params.get('dpr');
+      renderer.pixelRatio =
+        dprParam !== null ? Number(dprParam) || 1 : (window.devicePixelRatio || 1) * STAGE_SCALE;
       instances.push({ skeleton, state, renderer, container });
     }
   }
@@ -138,7 +165,13 @@ function main(
 
   stateData.defaultMix = 0.2;
   fillAnimations();
-  rebuild(1);
+  const animParam = params.get('anim');
+  if (animParam && data[variant].animations.some((a) => a.name === animParam)) {
+    animSelect.value = animParam;
+  }
+  const initialCount = Math.min(50, Math.max(1, Number(params.get('count')) || 1));
+  countInput.value = String(initialCount);
+  rebuild(initialCount);
 
   // --- frame loop with split timings (skeleton math vs DOM writes) ---
   let last = performance.now();
@@ -168,14 +201,19 @@ function main(
 
     if (now - statsAt >= 500 && frames > 0) {
       let meshes = 0;
+      let reused = 0;
       let triangles = 0;
       let clips = 0;
       for (const inst of instances) {
         meshes += inst.renderer.meshCount;
+        reused += inst.renderer.meshReuseCount;
         triangles += inst.renderer.triangleCount;
         clips += inst.renderer.clipSkipCount;
       }
-      const meshNote = meshes ? ` · ${meshes} mesh canvases (${triangles} tris)` : '';
+      const meshNote =
+        meshes + reused
+          ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused`
+          : '';
       const clipNote = clips ? ` · ${clips} clips skipped` : '';
       stats.textContent =
         `${instances.length} skeleton(s) · ` +
