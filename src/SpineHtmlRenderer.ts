@@ -46,9 +46,11 @@ interface SlotView {
   /** Lazily created SVG reference filter for non-white tints. */
   tintId: string;
   tintMatrix: SVGFEColorMatrixElement | null;
-  /** Canvas kind: current backing-store size, to avoid re-allocating each frame. */
+  /** Canvas kind: allocated backing-store size (grow-only, quantized). */
   canvasW: number;
   canvasH: number;
+  /** Canvas kind: pixelRatio the backing/CSS sizing was computed with. */
+  meshRatio: number;
   /** Canvas kind: shape signature of the last raster, for dirty-skipping. */
   meshAttachment: MeshAttachment | null;
   meshSequenceIndex: number;
@@ -101,6 +103,12 @@ export class SpineHtmlRenderer {
   meshCount = 0;
   /** Mesh canvases that reused their previous raster last frame. */
   meshReuseCount = 0;
+  /**
+   * Mesh canvas backing stores (re)allocated last frame. Should drop to zero
+   * once an animation reaches its steady state; a persistent nonzero value
+   * means GPU surfaces are being recreated per frame (a Safari killer).
+   */
+  canvasReallocCount = 0;
   /** Triangles rasterized last frame. */
   triangleCount = 0;
   /**
@@ -136,6 +144,7 @@ export class SpineHtmlRenderer {
     this.clipSkipCount = 0;
     this.meshCount = 0;
     this.meshReuseCount = 0;
+    this.canvasReallocCount = 0;
     this.triangleCount = 0;
     const drawOrder = skeleton.drawOrder.appliedPose;
 
@@ -259,20 +268,32 @@ export class SpineHtmlRenderer {
     const view = this.view(slot, 'canvas');
     const canvas = view.el as HTMLCanvasElement;
     const ratio = this.pixelRatio;
-    const backingW = Math.max(1, Math.round(w * ratio));
-    const backingH = Math.max(1, Math.round(h * ratio));
     let dirty =
       view.meshAttachment !== attachment ||
       view.meshSequenceIndex !== sequenceIndex ||
       view.meshExpand !== this.triangleExpand ||
       view.meshVertexCount !== count;
-    if (view.canvasW !== backingW || view.canvasH !== backingH) {
-      view.canvasW = backingW;
-      view.canvasH = backingH;
-      canvas.width = backingW; // resizing also clears the canvas
-      canvas.height = backingH;
-      canvas.style.width = `${w}px`;
-      canvas.style.height = `${h}px`;
+    // The backing store only grows, in 32-device-px steps. Setting
+    // canvas.width recreates the GPU surface, and a deforming mesh changes
+    // its bbox every frame — reallocating every mesh canvas per frame
+    // stalled real Safari to ~3 fps while the JS split showed ~4 ms (the
+    // cost lives in the compositor, invisible to in-callback timing). With
+    // grow-only quantized backing, steady-state animation reallocates
+    // nothing. The CSS size mirrors the whole backing so the pixel mapping
+    // stays 1:1; the mesh draws into the top-left w×h logical region and
+    // the rest stays transparent.
+    const needW = Math.max(1, Math.round(w * ratio));
+    const needH = Math.max(1, Math.round(h * ratio));
+    if (needW > view.canvasW || needH > view.canvasH || view.meshRatio !== ratio) {
+      const step = 32;
+      view.canvasW = Math.ceil(Math.max(needW, view.canvasW) / step) * step;
+      view.canvasH = Math.ceil(Math.max(needH, view.canvasH) / step) * step;
+      view.meshRatio = ratio;
+      canvas.width = view.canvasW;
+      canvas.height = view.canvasH;
+      canvas.style.width = `${view.canvasW / ratio}px`;
+      canvas.style.height = `${view.canvasH / ratio}px`;
+      this.canvasReallocCount++;
       dirty = true;
     }
 
@@ -306,8 +327,11 @@ export class SpineHtmlRenderer {
 
       const ctx = canvas.getContext('2d');
       if (!ctx) return;
+      // Clear the full backing: the previous frame's bbox (and so its drawn
+      // region) may have been larger than today's.
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
-      ctx.clearRect(0, 0, w, h);
 
       const uvs = sequence.getUVs(sequenceIndex);
       const triangles = attachment.triangles;
@@ -500,6 +524,7 @@ export class SpineHtmlRenderer {
         tintMatrix: null,
         canvasW: 0,
         canvasH: 0,
+        meshRatio: -1,
         meshAttachment: null,
         meshSequenceIndex: -1,
         meshExpand: -1,

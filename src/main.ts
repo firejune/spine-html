@@ -214,17 +214,20 @@ function main(
     if (now - statsAt >= 500 && frames > 0) {
       let meshes = 0;
       let reused = 0;
+      let reallocs = 0;
       let triangles = 0;
       let clips = 0;
       for (const inst of instances) {
         meshes += inst.renderer.meshCount;
         reused += inst.renderer.meshReuseCount;
+        reallocs += inst.renderer.canvasReallocCount;
         triangles += inst.renderer.triangleCount;
         clips += inst.renderer.clipSkipCount;
       }
+      const reallocNote = reallocs ? ` / ${reallocs} realloc'd` : '';
       const meshNote =
         meshes + reused
-          ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused`
+          ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused${reallocNote}`
           : '';
       const clipNote = clips ? ` · ${clips} clips skipped` : '';
       // Real fps from rAF cadence: catches bottlenecks that live outside the
