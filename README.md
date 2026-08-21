@@ -44,6 +44,11 @@ they do **not** substitute for each other):
   Safari antialiases canvas2d **clip paths**, so every triangle pays for an AA
   mask. Chromium doesn't antialias clips and stays smooth. This is what the
   optional WebGL mesh backend (below) removes.
+- Real Safari (on-device), **webgl mesh backend**: the same meshed ×10 scene jumps
+  **3–4 → 45 fps** — 80 mesh canvases / 3230 triangles redrawn every frame
+  (0 reused, the worst case), in-callback JS ~5.8 ms at dpr=1. The per-triangle
+  clip-AA tax is gone; the remaining gap to 60 is the blit/compositing cost of a
+  10-skeleton stress scene, not a per-triangle cost.
 - Headless-WebKit numbers are a **software rasterizer** and measured up to 28×
   off real Safari in both directions — useful for visual regression only, never
   as Safari perf evidence.
@@ -93,8 +98,8 @@ they do **not** substitute for each other):
   edges seamlessly, so this path needs no crack overdraw. Falls back to canvas2d
   when WebGL is unavailable or the context is lost. Backend parity verified by
   headless Chromium+WebKit screenshot diffs (glow / clipping / tint scenes;
-  sub-pixel edge differences only); on-device Safari fps for the webgl backend:
-  measurement pending
+  sub-pixel edge differences only). On-device Safari, meshed ×10 with every mesh
+  redrawn per frame: **3–4 fps (canvas2d) → 45 fps (webgl)**
 
 ## Install
 
