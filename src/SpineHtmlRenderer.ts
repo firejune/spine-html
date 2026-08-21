@@ -10,6 +10,10 @@ import {
   type TextureAtlasRegion,
 } from '@esotericsoftware/spine-core';
 import type { RegionImage } from './DomTexture';
+import { getMeshGlBlitter, type MeshBlitJob } from './MeshGlBlitter';
+
+/** Rasterizer used for the mesh (deform) tier. */
+export type MeshBackend = 'canvas2d' | 'webgl';
 
 const regionVertices = new Float32Array(8);
 const SVG_NS = 'http://www.w3.org/2000/svg';
@@ -56,6 +60,8 @@ interface SlotView {
   meshSequenceIndex: number;
   meshExpand: number;
   meshVertexCount: number;
+  /** Backend that produced the last raster — a backend switch re-dirties. */
+  meshBackendDrawn: MeshBackend | '';
   /**
    * Canvas-space (bbox-relative) vertices of the last raster. Float64: the
    * compared values are f64 (f32 world vertex minus integer bbox origin);
@@ -79,9 +85,11 @@ const BLEND_CSS: Record<BlendMode, string> = {
  *   posed with a single CSS matrix() write per frame — exact, since bone
  *   transforms are affine.
  * - Mesh attachments (deform parts) each get a small per-part <canvas> sized
- *   to the mesh's world bounding box, redrawn per frame with the standard
- *   per-triangle clip+transform+drawImage mapping. Frames where the
- *   canvas-space vertices are unchanged reuse the previous raster.
+ *   to the mesh's world bounding box, redrawn per frame — either with the
+ *   standard per-triangle clip+transform+drawImage mapping (default), or via
+ *   a shared offscreen WebGL canvas that rect-blits into the same per-part
+ *   canvases (meshBackend = 'webgl'). Frames where the canvas-space vertices
+ *   are unchanged reuse the previous raster on both backends.
  *
  * Both element kinds share one stacking context, so draw order interleaves
  * freely via z-index (rear hair canvas < torso img < front hair canvas).
@@ -124,8 +132,27 @@ export class SpineHtmlRenderer {
    * resolution instead of over- or under-sampling.
    */
   pixelRatio = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1;
+  /**
+   * Rasterizer for the mesh (deform) tier. 'canvas2d' (default) maps each
+   * triangle with clip+transform+drawImage directly on the per-part canvas.
+   * 'webgl' rasterizes every dirty mesh into one shared offscreen WebGL
+   * canvas and rect-blits each mesh back onto its per-part canvas — the DOM
+   * structure and all element-level behavior (z-index interleave, tint
+   * filter, mix-blend-mode, dirty-skip) are identical, only the raster step
+   * changes. Motivation: Safari antialiases canvas2d clip paths, so the
+   * per-triangle clip mapping pays a per-triangle AA-mask cost in the GPU
+   * process that rAF-limits heavy scenes; GL rasterizes shared edges
+   * seamlessly (no clip, no crack overdraw) and the blit is an unclipped
+   * rect copy. Falls back to 'canvas2d' when WebGL is unavailable or the
+   * shared context is lost — see meshBackendActive.
+   */
+  meshBackend: MeshBackend = 'canvas2d';
+  /** Backend that actually rasterized the mesh tier during the last render(). */
+  meshBackendActive: MeshBackend = 'canvas2d';
 
   private readonly views = new Map<Slot, SlotView>();
+  private readonly pendingJobs: MeshBlitJob[] = [];
+  private readonly pendingViews: SlotView[] = [];
   private scratchVertices = new Float32Array(256);
   private tintDefs: SVGSVGElement | null = null;
 
@@ -146,6 +173,8 @@ export class SpineHtmlRenderer {
     this.meshReuseCount = 0;
     this.canvasReallocCount = 0;
     this.triangleCount = 0;
+    const blitter = this.meshBackend === 'webgl' ? getMeshGlBlitter() : null;
+    this.meshBackendActive = blitter ? 'webgl' : 'canvas2d';
     const drawOrder = skeleton.drawOrder.appliedPose;
 
     for (let i = 0, n = drawOrder.length; i < n; i++) {
@@ -165,6 +194,20 @@ export class SpineHtmlRenderer {
         if (attachment instanceof ClippingAttachment) this.clipSkipCount++;
         this.hide(slot);
       }
+    }
+
+    if (this.pendingJobs.length) {
+      if (!blitter || !blitter.flush(this.pendingJobs)) {
+        // Context lost mid-frame: rasterize this batch on the 2d path so the
+        // frame stays complete; the next render() re-selects the backend.
+        for (let i = 0; i < this.pendingJobs.length; i++) {
+          const job = this.pendingJobs[i];
+          this.pendingViews[i].meshBackendDrawn = 'canvas2d';
+          this.rasterizeMesh2d(job.canvas, job.page, job.vertices, job.uvs, job.triangles, job.ratio);
+        }
+      }
+      this.pendingJobs.length = 0;
+      this.pendingViews.length = 0;
     }
   }
 
@@ -272,7 +315,8 @@ export class SpineHtmlRenderer {
       view.meshAttachment !== attachment ||
       view.meshSequenceIndex !== sequenceIndex ||
       view.meshExpand !== this.triangleExpand ||
-      view.meshVertexCount !== count;
+      view.meshVertexCount !== count ||
+      view.meshBackendDrawn !== this.meshBackendActive;
     // The backing store only grows, in 32-device-px steps. Setting
     // canvas.width recreates the GPU surface, and a deforming mesh changes
     // its bbox every frame — reallocating every mesh canvas per frame
@@ -327,36 +371,65 @@ export class SpineHtmlRenderer {
       view.meshSequenceIndex = sequenceIndex;
       view.meshExpand = this.triangleExpand;
       view.meshVertexCount = count;
-
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      // Clear the full backing: the previous frame's bbox (and so its drawn
-      // region) may have been larger than today's.
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      view.meshBackendDrawn = this.meshBackendActive;
 
       const uvs = sequence.getUVs(sequenceIndex);
       const triangles = attachment.triangles;
-      const uw = page.width - 1;
-      const uh = page.height - 1;
-
-      for (let t = 0; t < triangles.length; t += 3) {
-        const i0 = triangles[t] * 2;
-        const i1 = triangles[t + 1] * 2;
-        const i2 = triangles[t + 2] * 2;
-        this.drawTriangle(
-          ctx, page,
-          rel[i0], rel[i0 + 1], uvs[i0] * uw, uvs[i0 + 1] * uh,
-          rel[i1], rel[i1 + 1], uvs[i1] * uw, uvs[i1 + 1] * uh,
-          rel[i2], rel[i2 + 1], uvs[i2] * uw, uvs[i2 + 1] * uh,
-        );
+      if (this.meshBackendActive === 'webgl') {
+        // Queued, not drawn: render() flushes the whole batch through the
+        // shared GL context once the slot loop is done. `rel` is this view's
+        // own signature array — nothing mutates it before the flush.
+        this.pendingJobs.push({
+          canvas,
+          page,
+          vertices: rel,
+          uvs,
+          triangles,
+          ratio,
+          width: Math.min(view.canvasW, Math.ceil(w * ratio)),
+          height: Math.min(view.canvasH, Math.ceil(h * ratio)),
+        });
+        this.pendingViews.push(view);
+      } else {
+        this.rasterizeMesh2d(canvas, page, rel, uvs, triangles, ratio);
       }
       this.meshCount++;
       this.triangleCount += triangles.length / 3;
     }
 
     this.applyCommon(view, slot, pose, attachment.color, skeleton, zIndex);
+  }
+
+  /** The canvas2d raster path: clear the backing, map each triangle. */
+  private rasterizeMesh2d(
+    canvas: HTMLCanvasElement,
+    page: HTMLImageElement,
+    vertices: Float64Array,
+    uvs: ArrayLike<number>,
+    triangles: ArrayLike<number>,
+    ratio: number,
+  ): void {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    // Clear the full backing: the previous frame's bbox (and so its drawn
+    // region) may have been larger than today's.
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+
+    const uw = page.width - 1;
+    const uh = page.height - 1;
+    for (let t = 0; t < triangles.length; t += 3) {
+      const i0 = triangles[t] * 2;
+      const i1 = triangles[t + 1] * 2;
+      const i2 = triangles[t + 2] * 2;
+      this.drawTriangle(
+        ctx, page,
+        vertices[i0], vertices[i0 + 1], uvs[i0] * uw, uvs[i0 + 1] * uh,
+        vertices[i1], vertices[i1 + 1], uvs[i1] * uw, uvs[i1 + 1] * uh,
+        vertices[i2], vertices[i2 + 1], uvs[i2] * uw, uvs[i2 + 1] * uh,
+      );
+    }
   }
 
   /**
@@ -532,6 +605,7 @@ export class SpineHtmlRenderer {
         meshSequenceIndex: -1,
         meshExpand: -1,
         meshVertexCount: -1,
+        meshBackendDrawn: '',
         meshVertices: new Float64Array(0),
       };
       this.views.set(slot, view);

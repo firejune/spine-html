@@ -9,7 +9,7 @@ import {
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
 import { DomTexture, type RegionImage, unpackRegions } from './DomTexture';
-import { SpineHtmlRenderer } from './SpineHtmlRenderer';
+import { type MeshBackend, SpineHtmlRenderer } from './SpineHtmlRenderer';
 
 const ASSET_BASE = '/spineboy';
 const SKELETONS = {
@@ -22,7 +22,9 @@ const STAGE_SCALE = 0.4;
 // Debug knobs: ?skel=pro|ess &anim=walk &count=10 pick the scene;
 // ?expand=0 shows the mesh cracks; ?tint=ff8080 tints the whole skeleton;
 // ?dpr=2 overrides the mesh-canvas backing ratio; ?timescale=0 freezes the
-// animation (isolates the dirty-skip path: every mesh should report reused).
+// animation (isolates the dirty-skip path: every mesh should report reused);
+// ?backend=webgl rasterizes meshes through the shared WebGL blitter;
+// ?time=1.2 seeks every instance to the same pose (deterministic screenshots).
 const params = new URLSearchParams(location.search);
 
 function parseTint(): { r: number; g: number; b: number } | null {
@@ -88,7 +90,9 @@ function main(
   const skelSelect = document.getElementById('skel') as HTMLSelectElement;
   const animSelect = document.getElementById('anim') as HTMLSelectElement;
   const countInput = document.getElementById('count') as HTMLInputElement;
+  const backendSelect = document.getElementById('backend') as HTMLSelectElement;
   const stats = document.getElementById('stats') as HTMLDivElement;
+  backendSelect.value = params.get('backend') === 'webgl' ? 'webgl' : 'canvas2d';
 
   const skelParam = params.get('skel');
   let variant: SkeletonVariant = skelParam === 'ess' ? 'ess' : 'pro';
@@ -129,12 +133,15 @@ function main(
       if (tint) skeleton.color.set(tint.r, tint.g, tint.b, 1);
       const state = new AnimationState(stateData);
       state.setAnimation(0, animSelect.value, true);
-      // Desync walk cycles so N instances don't look like one stamped sprite.
-      state.update((i * 0.37) % 2);
+      // Desync walk cycles so N instances don't look like one stamped sprite —
+      // unless ?time seeks them all to one pose (for deterministic captures).
+      const timeParam = params.get('time');
+      state.update(timeParam !== null ? Number(timeParam) || 0 : (i * 0.37) % 2);
       const timescaleParam = params.get('timescale');
       if (timescaleParam !== null) state.timeScale = Number(timescaleParam) || 0;
 
       const renderer = new SpineHtmlRenderer(container, regionImages);
+      renderer.meshBackend = backendSelect.value as MeshBackend;
       const expandParam = params.get('expand');
       if (expandParam !== null) renderer.triangleExpand = Number(expandParam) || 0;
       // Mesh canvases raster at the effective on-screen resolution: device
@@ -161,6 +168,10 @@ function main(
     const count = Math.min(50, Math.max(1, Number(countInput.value) || 1));
     countInput.value = String(count);
     rebuild(count);
+  });
+  backendSelect.addEventListener('change', () => {
+    // Live switch: the backend signature re-dirties every mesh on its own.
+    for (const inst of instances) inst.renderer.meshBackend = backendSelect.value as MeshBackend;
   });
 
   stateData.defaultMix = 0.2;
@@ -229,6 +240,14 @@ function main(
         meshes + reused
           ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused${reallocNote}`
           : '';
+      const first = instances[0]?.renderer;
+      // Surface the backend that actually ran, so a perf reading proves its path.
+      const backendNote =
+        first && first.meshBackend === 'webgl'
+          ? first.meshBackendActive === 'webgl'
+            ? ' · webgl'
+            : ' · webgl unavailable → canvas2d'
+          : '';
       const clipNote = clips ? ` · ${clips} clips skipped` : '';
       // Real fps from rAF cadence: catches bottlenecks that live outside the
       // frame callback (compositing, page throttling) which the ms split
@@ -237,7 +256,7 @@ function main(
       stats.textContent =
         `${instances.length} skeleton(s) · ${fps.toFixed(0)} fps · ` +
         `skeleton ${(updateMs / frames).toFixed(2)}ms · ` +
-        `render ${(renderMs / frames).toFixed(2)}ms / frame${meshNote}${clipNote}`;
+        `render ${(renderMs / frames).toFixed(2)}ms / frame${meshNote}${backendNote}${clipNote}`;
       updateMs = renderMs = 0;
       frames = 0;
       statsAt = now;
