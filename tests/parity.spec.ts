@@ -50,10 +50,26 @@ const CHANNEL_TOLERANCE = 24;
  * of drawn-content pixels. Calibrated 2026-08 on macOS (chromium 1234 /
  * webkit 2336): honest backend noise measures 0.29–1.30% across the three
  * scenes, while a dropped tint scores ~87% and a blanked mesh scores its
- * full area share — 0.04 keeps ~3× headroom on both sides, with slack for
- * CI engines whose AA flavor differs.
+ * full area share — 0.04 keeps ~3× headroom on both sides. Chromium holds
+ * this floor on linux too (CI), so it keeps the strict limit everywhere.
  */
 const BAD_RATIO_LIMIT = 0.04;
+/**
+ * Linux WebKit only: its raster flavor is measurably noisier than macOS
+ * WebKit's. Floors measured on ubuntu CI (run 32453426279, 2026-08):
+ * hoverboard 4.69%, walk+tint 5.59%, portal 0.63% — with contentMismatch
+ * ≤ 0.76% (still under its unchanged limit) and seam canary rawBad=76. The
+ * synthetic regressions score ~87% there like everywhere else, so 0.13
+ * (~2.3× headroom over the worst floor) loses no detection power; missing
+ * parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
+ */
+const BAD_RATIO_LIMIT_WEBKIT_LINUX = 0.13;
+
+function badRatioLimitFor(projectName: string): number {
+  return projectName === 'webkit' && process.platform === 'linux'
+    ? BAD_RATIO_LIMIT_WEBKIT_LINUX
+    : BAD_RATIO_LIMIT;
+}
 /**
  * Allowed relative difference in drawn-content pixel counts — the
  * missing-part guard. Measured noise ≤ 0.23%; blanking even the smallest
@@ -225,7 +241,8 @@ for (const scene of SCENES) {
         `ch>${CHANNEL_TOLERANCE}), maxDelta=${m.maxDelta}, ` +
         `contentMismatch=${(contentMismatch * 100).toFixed(3)}%`,
     );
-    if (badRatio > BAD_RATIO_LIMIT || contentMismatch > CONTENT_MISMATCH_LIMIT) {
+    const badRatioLimit = badRatioLimitFor(testInfo.project.name);
+    if (badRatio > badRatioLimit || contentMismatch > CONTENT_MISMATCH_LIMIT) {
       // Keep the pair on failure, for eyeballing the regression.
       writeFileSync(testInfo.outputPath('canvas2d.png'), canvas2d);
       writeFileSync(testInfo.outputPath('webgl.png'), webgl);
@@ -236,7 +253,7 @@ for (const scene of SCENES) {
     // Sub-pixel sampling differences are expected (and absorbed); missing
     // parts and wrong colors blow past these limits (calibrated: a dropped
     // tint scores ~87% bad, a blanked mesh shifts content by its area).
-    expect(badRatio).toBeLessThanOrEqual(BAD_RATIO_LIMIT);
+    expect(badRatio).toBeLessThanOrEqual(badRatioLimit);
     expect(contentMismatch).toBeLessThanOrEqual(CONTENT_MISMATCH_LIMIT);
   });
 }
