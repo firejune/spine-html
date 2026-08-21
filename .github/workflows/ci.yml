@@ -1,0 +1,29 @@
+# CI: typecheck + the playwright suite (chromium + webkit).
+#
+# The visual tests are A/B within one run and one engine (no golden files),
+# so they are platform-independent by design — ubuntu results are valid even
+# though local dev is macOS. Headless numbers are never performance
+# evidence; nothing here asserts timing.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx playwright install --with-deps chromium webkit
+      - run: bun run test
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results/
+          if-no-files-found: ignore
