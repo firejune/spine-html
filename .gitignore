@@ -1,5 +1,7 @@
 node_modules/
 dist/
+test-results/
+playwright-report/
 # Spine example assets are fetched, not redistributed — see NOTICE.md
 public/spineboy/
 .DS_Store
