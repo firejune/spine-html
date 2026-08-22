@@ -87,6 +87,14 @@ README.md for architecture and measured numbers.
 
 ## Known backlog
 
+- Linux WebKit is the remaining parity outlier, and it is not the texel offset
+  (fixing that halved its raw diff but left the shift-tolerant count alone:
+  1049 → 1042 bad pixels on hoverboard, maxDelta ~233). Those pixels have no
+  in-tolerance match anywhere in the other backend's 3×3, so something real
+  differs between canvas2d and GL under that software rasterizer — additive
+  blend and premultiplied alpha are the obvious suspects, unmeasured. Its
+  badRatio limit stays 26× looser than everyone else's until this is known.
+  Numbers: ubuntu CI run 32580117738.
 - `loadSkeletonAssets` reads JSON exports only. Binary (`.skel`) would mean
   importing `SkeletonBinary`, which every user of the loader would then carry —
   worth a separate entry point rather than a branch, if it is ever asked for.

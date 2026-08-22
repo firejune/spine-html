@@ -62,8 +62,9 @@ const CHANNEL_TOLERANCE = 24;
  * because the measured spread between raster flavors on one scene reaches
  * ~7.8× (pre-fix walk+tint: macOS WebKit 0.72% vs linux WebKit 5.59%) — a
  * limit under ~10× the floor would be one browser-raster change away from
- * red. Chromium's floor is platform-independent (pre-fix linux CI ran within
- * 8% of macOS on all three scenes), so it keeps the strict limit everywhere.
+ * red. Chromium's floor is platform-independent — ubuntu CI post-fix reads
+ * 0.000% / 0.009% / 0.000%, matching macOS — so it keeps the strict limit
+ * everywhere.
  *
  * Verified red, not just green: re-introducing the `- 1` texel offset takes
  * both hoverboard cells (1.25% / 1.29%) and webkit walk+tint (0.72%) past
@@ -72,16 +73,19 @@ const CHANNEL_TOLERANCE = 24;
 const BAD_RATIO_LIMIT = 0.005;
 /**
  * Linux WebKit only: its raster flavor is measurably noisier than macOS
- * WebKit's. Floors measured on ubuntu CI (run 32453426279, 2026-08):
- * hoverboard 4.69%, walk+tint 5.59%, portal 0.63% — with contentMismatch
- * ≤ 0.76% (still under its unchanged limit) and seam canary rawBad=76.
+ * WebKit's. Floors on ubuntu CI (run 32580117738, 2026-08-22, post-texel-fix):
+ * hoverboard 4.77%, walk+tint 4.32%, portal 0.53% — contentMismatch ≤ 0.40%
+ * (under its unchanged limit), seam canary rawBad=90.
  *
- * Those are PRE-fix numbers: this platform has not been re-measured since the
- * texel-addressing fix, and 0.13 is deliberately left where it was rather
- * than tightened on a guess. The first ubuntu CI run after the fix reports
- * the new floor in its log; tighten this then. Nothing is lost meanwhile —
- * the synthetic regressions score ~87% there like everywhere else, and
- * missing parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
+ * This limit is NOT tightened with the strict one, because the texel fix
+ * barely moved this platform: raw diff pixels roughly halved (3422 → 1580 on
+ * hoverboard) while the shift-tolerant count did not (1049 → 1042). Its
+ * residue is therefore not sub-pixel — those are pixels with no in-tolerance
+ * match anywhere in the other image's 3×3, at maxDelta ~233. Something else
+ * differs between the backends under that software rasterizer; until it is
+ * understood, 0.13 (~2.7× over the worst floor) stays. Nothing is lost: the
+ * synthetic regressions score ~87% there like everywhere else, and missing
+ * parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
  */
 const BAD_RATIO_LIMIT_WEBKIT_LINUX = 0.13;
 
@@ -92,8 +96,9 @@ function badRatioLimitFor(projectName: string): number {
 }
 /**
  * Allowed relative difference in drawn-content pixel counts — the
- * missing-part guard. Measured noise ≤ 0.23%; blanking even the smallest
- * spineboy-pro mesh moves it past ~1.6%, a dropped tint ~6%.
+ * missing-part guard. Measured noise ≤ 0.22%, except linux WebKit at ≤ 0.40%;
+ * blanking even the smallest spineboy-pro mesh moves it past ~1.6%, a dropped
+ * tint ~6%.
  */
 const CONTENT_MISMATCH_LIMIT = 0.015;
 
