@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "node",
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "bootstrap-sha": "244cbbe4f17bdb1221267b8afc7a7395df735f9e",
+  "pull-request-title-pattern": "release: v${version}",
+  "packages": {
+    ".": {
+      "package-name": "spine-html",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false
+    }
+  }
+}

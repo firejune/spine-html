@@ -1,0 +1,83 @@
+# Release: the cut is one click, and no secret leaves this repository.
+#
+# Every push to main hands the commits to release-please, which keeps a
+# "release: vX.Y.Z" pull request open — next version derived from the
+# conventional-commit subjects, CHANGELOG.md generated, package.json bumped.
+# Merging that PR is the release: the resulting push runs this workflow again,
+# release-please tags vX.Y.Z and cuts the GitHub release, and the same run
+# publishes to npm over OIDC (trusted publishing) — no npm token, no OTP.
+#
+# Two constraints are load-bearing, do not "simplify" them away:
+#   - The publish must stay in THIS file. npm's trusted publisher for
+#     spine-html is pinned to the workflow filename `release.yml`.
+#   - It must stay on a GitHub-hosted runner. npm does not support OIDC from
+#     self-hosted runners.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # release commit, tag, GitHub release
+      pull-requests: write # open and update the release PR
+      issues: write # release-please labels
+      id-token: write # OIDC token for npm trusted publishing
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          # GITHUB_TOKEN is the intended default here. Its one limitation is
+          # that a PR it opens does not start other workflows, so the release
+          # PR carries no CI checks of its own — see RELEASING.md for why that
+          # is acceptable and how to opt into RELEASE_PLEASE_TOKEN if it ever
+          # is not. The fallback below needs no edit to this file.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      # Everything below runs only on the push that merged the release PR.
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
+
+      - uses: oven-sh/setup-bun@v2
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+
+      - uses: actions/setup-node@v4
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      # Node 22 ships npm 10; OIDC exchange landed in npm 11.5.1.
+      - name: Use an npm that speaks OIDC
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: |
+          npm install -g npm@latest
+          npm --version
+
+      # The repository's lockfile is bun.lock — there is no package-lock.json,
+      # so `npm ci` has nothing to read. Deps exist only to let prepublishOnly
+      # run tsc; the publish itself is npm's.
+      - name: Install dependencies
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: bun install --frozen-lockfile
+
+      # prepublishOnly runs `build:lib` (tsc -p tsconfig.build.json), so the
+      # tarball is built from the tagged tree and a type error fails the
+      # publish instead of shipping.
+      - name: Publish to npm
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        run: npm publish --provenance --access public

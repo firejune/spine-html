@@ -80,10 +80,13 @@ README.md for architecture and measured numbers.
 ## Workflow
 
 - Conventional Commits, English subject and body. Commit each finished unit
-  immediately.
-- Pushing to origin is fine (owner-confirmed). `npm version` and `npm publish`
-  only on the owner's explicit call — publishing requires the owner's 2FA, so
-  stop at the EOTP gate and hand over.
+  immediately. The subjects are load-bearing now: release-please reads them to
+  pick the next version and to write CHANGELOG.md.
+- Pushing to origin is fine (owner-confirmed). Releases are not ours to cut:
+  pushing to `main` makes `release.yml` open a `release: vX.Y.Z` pull request,
+  and **merging that pull request is the owner's click**. Never merge it, and
+  never run `npm version` or `npm publish` by hand — the npm publish happens in
+  CI over OIDC. See RELEASING.md.
 
 ## Known backlog
 
