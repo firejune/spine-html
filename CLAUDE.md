@@ -32,6 +32,12 @@ README.md for architecture and measured numbers.
   (verified by execution on 4.2.98 and 4.3.13; the br/bl/ul/ur comments inside
   the upstream function are stale). A node-side test guards this against
   upstream reorderings.
+- **Both raster backends address texels as `uv * size`**, the continuous frame
+  where the page spans `[0, size]` — `drawImage` under an affine and
+  `texture2D()` read the same frame. `uv * (size - 1)` (a discrete
+  pixel-index frame) is the bug fixed in #1; it was worth 15–250× in parity
+  residue, depending on the scene. No half-texel term: the per-triangle affine
+  maps corners, it does not sample.
 - **One shared WebGL context** at module level — browsers cap WebGL contexts at
   ~16; never create one per renderer/mesh.
 - The mesh dirty-signature cache must stay **Float64** — storing the compared
@@ -60,8 +66,9 @@ README.md for architecture and measured numbers.
 - `bun run test` — Playwright, chromium + webkit projects; the config builds and
   serves the demo itself (port 4321).
 - Parity strategy: **A/B canvas2d-vs-webgl within one run, no golden snapshot
-  files** (goldens rot across platforms). The `?expand=0` canary covers seam
-  cracks, which sit below the statistical noise floor.
+  files** (goldens rot across platforms). Seam cracks get the deterministic
+  `?expand=0` canary rather than a screenshot threshold — they score below any
+  limit the statistical diff can carry.
 - Rendering is tested through the demo; the **loading path is tested through
   `tests/harness.html`** (a second vite build entry that exposes the library on
   `window.spineHtmlHarness`). Blob-URL ownership has no visual signature, so
@@ -80,11 +87,6 @@ README.md for architecture and measured numbers.
 
 ## Known backlog
 
-- Texel-addressing mismatch between backends: the canvas2d path maps UVs with
-  `uv * (page.width - 1)` while the GL blitter samples at `uv * page.width` — a
-  systematic sub-texel offset, invisible at demo scale but the dominant residue
-  in A/B parity diffs. Align on the GL convention when next touching the raster
-  paths (and expect parity-test tolerances to tighten).
 - `loadSkeletonAssets` reads JSON exports only. Binary (`.skel`) would mean
   importing `SkeletonBinary`, which every user of the loader would then carry —
   worth a separate entry point rather than a branch, if it is ever asked for.

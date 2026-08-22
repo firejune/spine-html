@@ -14,18 +14,23 @@ import { expect, type Page, test } from '@playwright/test';
  * colors, seams.
  *
  * Expected residual: the backends legitimately differ by sub-pixel amounts
- * (canvas2d closes seams with a 0.5px clip overdraw; its drawImage texel
- * addressing is offset from GL's texture2D by a fraction of a texel), which
- * shows up as speckle on high-contrast texture detail. The diff is therefore
- * shift-tolerant — a pixel is only "bad" with no in-tolerance match in the
- * other image's 3×3 neighborhood — and budgets are measured against drawn
- * content, not the mostly-empty stage.
+ * (canvas2d closes seams with a 0.5px clip overdraw, and the two rasterizers
+ * antialias edges differently), which shows up as speckle on high-contrast
+ * texture detail. The diff is therefore shift-tolerant — a pixel is only
+ * "bad" with no in-tolerance match in the other image's 3×3 neighborhood —
+ * and budgets are measured against drawn content, not the mostly-empty stage.
  *
- * Hairline seam cracks sit *below* that speckle floor (calibrated: cracks
- * score 0.07–0.20% of content vs 0.29–1.30% honest noise), so seams get
- * their own deterministic canary at the bottom of this file instead of a
- * screenshot threshold: with a frozen pose and one engine, `?expand=0` must
- * change the canvas2d raster — if the crack-closing overdraw ever dies, the
+ * Until 2026-08 the dominant residual was neither of those: the canvas2d path
+ * addressed texels as `uv * (size - 1)` against GL's `uv * size`, a systematic
+ * sub-texel offset over the whole page. Removing it (issue #1) dropped the
+ * floor by 15–250× depending on the cell, and the limits with it — every
+ * number on the constants below is post-fix.
+ *
+ * Hairline seam cracks (calibrated at 0.07–0.20% of content) no longer sit
+ * below the noise floor, but they still sit below any limit this diff can
+ * carry, so seams keep their own deterministic canary at the bottom of this
+ * file instead of a screenshot threshold: with a frozen pose and one engine,
+ * `?expand=0` must change the canvas2d raster — if the overdraw ever dies, the
  * two captures become bit-identical. (The GL path needs no overdraw:
  * adjacent triangles index the same vertex array entries, so shared edges
  * are watertight by construction.)
@@ -47,21 +52,36 @@ const SCENES = [
 const CHANNEL_TOLERANCE = 24;
 /**
  * Bad (shift-tolerant, see below) pixels allowed, as a fraction of the union
- * of drawn-content pixels. Calibrated 2026-08 on macOS (chromium 1234 /
- * webkit 2336): honest backend noise measures 0.29–1.30% across the three
- * scenes, while a dropped tint scores ~87% and a blanked mesh scores its
- * full area share — 0.04 keeps ~3× headroom on both sides. Chromium holds
- * this floor on linux too (CI), so it keeps the strict limit everywhere.
+ * of drawn-content pixels. Recalibrated 2026-08-22 after the texel-addressing
+ * fix, on macOS (chromium 1234 / webkit 2336): honest backend noise now
+ * measures 0.000–0.011% on chromium and 0.025–0.049% on webkit (it was
+ * 0.29–1.30% before the fix), while a dropped tint still scores ~87% and a
+ * blanked mesh its full area share.
+ *
+ * 0.005 keeps ~10× headroom over the worst floor. Ten, not the previous ~3×,
+ * because the measured spread between raster flavors on one scene reaches
+ * ~7.8× (pre-fix walk+tint: macOS WebKit 0.72% vs linux WebKit 5.59%) — a
+ * limit under ~10× the floor would be one browser-raster change away from
+ * red. Chromium's floor is platform-independent (pre-fix linux CI ran within
+ * 8% of macOS on all three scenes), so it keeps the strict limit everywhere.
+ *
+ * Verified red, not just green: re-introducing the `- 1` texel offset takes
+ * both hoverboard cells (1.25% / 1.29%) and webkit walk+tint (0.72%) past
+ * this limit, so a relapse fails the suite.
  */
-const BAD_RATIO_LIMIT = 0.04;
+const BAD_RATIO_LIMIT = 0.005;
 /**
  * Linux WebKit only: its raster flavor is measurably noisier than macOS
  * WebKit's. Floors measured on ubuntu CI (run 32453426279, 2026-08):
  * hoverboard 4.69%, walk+tint 5.59%, portal 0.63% — with contentMismatch
- * ≤ 0.76% (still under its unchanged limit) and seam canary rawBad=76. The
- * synthetic regressions score ~87% there like everywhere else, so 0.13
- * (~2.3× headroom over the worst floor) loses no detection power; missing
- * parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
+ * ≤ 0.76% (still under its unchanged limit) and seam canary rawBad=76.
+ *
+ * Those are PRE-fix numbers: this platform has not been re-measured since the
+ * texel-addressing fix, and 0.13 is deliberately left where it was rather
+ * than tightened on a guess. The first ubuntu CI run after the fix reports
+ * the new floor in its log; tighten this then. Nothing is lost meanwhile —
+ * the synthetic regressions score ~87% there like everywhere else, and
+ * missing parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
  */
 const BAD_RATIO_LIMIT_WEBKIT_LINUX = 0.13;
 
@@ -159,12 +179,12 @@ async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<DiffMetrics
         );
       };
       // Shift-tolerant match: the backends legitimately differ by sub-pixel
-      // amounts (canvas2d closes seams with a 0.5px clip overdraw, and its
-      // drawImage texel addressing is offset from GL's texture2D by up to a
-      // half texel), so a pixel only counts as bad when NOTHING in the other
-      // image's 3×3 neighborhood is within the channel tolerance. Real
-      // regressions — missing parts, wrong colors, interior seams — have no
-      // matching neighbor and stay caught.
+      // amounts (canvas2d closes seams with a 0.5px clip overdraw, and the
+      // two rasterizers antialias silhouette edges differently), so a pixel
+      // only counts as bad when NOTHING in the other image's 3×3 neighborhood
+      // is within the channel tolerance. Real regressions — missing parts,
+      // wrong colors, interior seams — have no matching neighbor and stay
+      // caught.
       const matchesNear = (
         from: Uint8ClampedArray,
         i: number,

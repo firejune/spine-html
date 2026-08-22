@@ -424,8 +424,14 @@ export class SpineHtmlRenderer {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
 
-    const uw = page.width - 1;
-    const uh = page.height - 1;
+    // Texel addressing, shared with the GL blitter: a normalized UV maps to
+    // `uv * size` in the continuous texture frame where the page spans
+    // [0, size] and texel i covers [i, i+1). drawImage-under-a-transform and
+    // texture2D() both read that frame, so both backends land on the same
+    // source pixels. (No half-texel term: the affine below *maps* corners, it
+    // does not sample — see drawTriangle.)
+    const uw = page.width;
+    const uh = page.height;
     for (let t = 0; t < triangles.length; t += 3) {
       const i0 = triangles[t] * 2;
       const i1 = triangles[t + 1] * 2;
@@ -450,6 +456,14 @@ export class SpineHtmlRenderer {
    * into the neighbouring triangle, and since the texture is continuous
    * across the shared edge the overlap draws the same pixels — cracks close
    * with no visible cost. The texture-mapping affine itself stays exact.
+   *
+   * No half-texel offset is applied to the incoming u/v: the `(i + 0.5) / size`
+   * texel-centre convention belongs to *sampling* (landing inside the intended
+   * texel instead of on a filter boundary). This solves for the affine that
+   * sends three source corners to three destination corners; the rasterizer
+   * then samples continuously along that map. Biasing all three corners by
+   * half a texel would translate the texture against the geometry — the very
+   * class of offset the `uv * size` addressing removes.
    */
   private drawTriangle(
     ctx: CanvasRenderingContext2D, img: HTMLImageElement,
