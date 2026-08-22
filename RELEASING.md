@@ -27,6 +27,20 @@ Every push to `main` runs `release.yml`, which hands the new commits to
 Squash-merge the release pull request, so the commit on `main` keeps the
 `release: vX.Y.Z` subject this repository has used since v0.2.0.
 
+## One-time setup (owner, GitHub)
+
+**Settings → Actions → General → Workflow permissions → tick "Allow GitHub
+Actions to create and approve pull requests."** It is off by default, and while
+it is off release-please cannot open the release pull request at all — the run
+fails with *GitHub Actions is not permitted to create or approve pull
+requests*. Nothing in a workflow file can grant this; it is a repository
+setting.
+
+The neighbouring "Workflow permissions" radio can stay on the read-only
+default: `release.yml` declares the write scopes it needs per job, and that
+elevation is granted (verified in run 32583344688 — the job received Contents,
+Issues and PullRequests write under a read-only repository default).
+
 ## One-time setup (owner, npmjs.com)
 
 Do this once, before the first automated cut. It cannot be done from here — it
@@ -59,6 +73,7 @@ Two properties of that configuration are load-bearing in the workflow:
 
 ## Cutting a release
 
+0. Once, before the first cut: both setup sections above.
 1. Land the work on `main` as usual, with conventional-commit subjects. CI runs
    on every push.
 2. Wait for the `release` run to open or update the `release: vX.Y.Z` pull
@@ -97,6 +112,29 @@ requests: read and write**, store it as the repository secret
 `RELEASE_PLEASE_TOKEN`, and the workflow picks it up
 (`secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN`). The cost is a
 credential to rotate.
+
+## What was pre-flighted, and what only the first cut can prove
+
+A throwaway branch (run 32583528151) exercised everything in the publish path
+that does not touch the registry: `id-token: write` mints an OIDC token with
+`aud: npm:registry.npmjs.org` and a `workflow_ref` claim naming the workflow
+file — which is the claim npm matches against the trusted publisher, so the
+filename in the form and the filename in `.github/workflows/` must agree.
+`npm install -g npm@latest` produced npm 12, well past the 11.5.1 that speaks
+OIDC. `bun install --frozen-lockfile` plus `prepublishOnly` built the tarball
+on the runner: 28 files, `dist/` included by the `files` allowlist even though
+git ignores it.
+
+One log detail that looks alarming and is not: the `GITHUB_TOKEN Permissions`
+group printed at the start of a job never lists `IdToken`, whether or not the
+job requested it. The probe requested `id-token: write`, the group showed only
+`Contents: read` / `Metadata: read`, and the token minted anyway.
+
+Only the first real cut can prove the registry side of the exchange, because it
+needs the trusted publisher to exist. If it fails on authentication rather than
+on a publisher mismatch, the first thing to try is dropping `registry-url` from
+the `setup-node` step: it exists only to write an `.npmrc`, and the `.npmrc` it
+writes carries a `NODE_AUTH_TOKEN` placeholder that nothing sets.
 
 ## If the automation is unavailable
 
