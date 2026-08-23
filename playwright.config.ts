@@ -15,7 +15,7 @@ export default defineConfig({
   testDir: './tests',
   timeout: 60_000,
   expect: { timeout: 30_000 },
-  // Two light spec files; cap workers so local runs stay polite next to
+  // Light spec files; cap workers so local runs stay polite next to
   // whatever else the machine is doing.
   workers: 2,
   retries: 0,
