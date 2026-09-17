@@ -34,6 +34,36 @@ import { expect, type Page, test } from '@playwright/test';
  * two captures become bit-identical. (The GL path needs no overdraw:
  * adjacent triangles index the same vertex array entries, so shared edges
  * are watertight by construction.)
+ *
+ * ## PARITY_DUMP=1 — the counts made visible
+ *
+ * The counts below say how many pixels disagree; they never say WHERE. That
+ * matters for the one platform whose residue is unexplained (linux WebKit,
+ * whose badRatio limit is held far looser): bad pixels on silhouettes, inside
+ * the additive glow, or spread over the fill point at different causes, and
+ * that platform exists only on the CI runner. So the environment variable
+ * `PARITY_DUMP=1` turns every parity cell into an instrument. It writes, into
+ * the test's output directory (and attaches, so artifact uploads and reporters
+ * both find them):
+ *
+ * - `a-canvas2d.png` / `b-webgl.png` — the two captures exactly as taken, not
+ *   re-captured: the bytes that were diffed.
+ * - `diff-mask.png` — same dimensions, a dimmed greyscale of capture A as the
+ *   backdrop (so the silhouette is readable), every shift-tolerant bad pixel
+ *   painted pure red, and every raw-bad pixel that the 3×3 match rescued
+ *   painted yellow.
+ * - `metrics.json` — the numbers of the log line, plus project, scene and
+ *   platform.
+ *
+ * The mask is painted by the SAME pass that counts, so red === `bad` and
+ * red + yellow === `rawBad` by construction; the dump branch asserts exactly
+ * that, which is the instrument's self-check (a mask drawn from the wrong set
+ * fails it). Greys can never collide with the two markers: the backdrop is
+ * dimmed to ≤ 115 per channel and has r === g === b.
+ *
+ * Without `PARITY_DUMP=1` nothing above happens — no mask is computed in the
+ * page, no file is written, and the assertions and log lines are the ones that
+ * have always run. This switch is an instrument, not a threshold.
  */
 
 const POSE = 'time=1.2&timescale=0&count=1&dpr=1';
@@ -102,6 +132,9 @@ function badRatioLimitFor(projectName: string): number {
  */
 const CONTENT_MISMATCH_LIMIT = 0.015;
 
+/** See the header: an on-demand instrument, never a threshold. */
+const DUMP = process.env.PARITY_DUMP === '1';
+
 interface DiffMetrics {
   width: number;
   height: number;
@@ -109,11 +142,24 @@ interface DiffMetrics {
   rawBad: number;
   /** Raw-bad pixels with no in-tolerance match in the other image's 3×3. */
   bad: number;
+  /** The two directions `bad` is the max of: A against B, and B against A. */
+  badAB: number;
+  badBA: number;
   maxDelta: number;
   /** Non-background pixels in each screenshot, and in their union. */
   contentA: number;
   contentB: number;
   contentUnion: number;
+  /** Only when the caller asked for one (PARITY_DUMP); see the header. */
+  mask?: {
+    /** The painted mask, PNG, base64 without the data: prefix. */
+    pngBase64: string;
+    /** Which direction's fail set was painted red — the one `bad` came from. */
+    direction: 'a-vs-b' | 'b-vs-a';
+    /** Counted back off the painted pixels, not off the loop's counters. */
+    red: number;
+    yellow: number;
+  };
 }
 
 async function captureStage(
@@ -141,10 +187,19 @@ async function captureStage(
  * reduce them to diff metrics. "Content" is any pixel that differs from the
  * stage background or the floor strip (sampled from the corners), so the
  * ratios measure the skeleton, not the empty stage around it.
+ *
+ * With `withMask` (PARITY_DUMP only) the same pass also paints the mask
+ * described in the header, so the picture and the counts cannot drift apart.
+ * Left false, not a byte of mask work runs in the page.
  */
-async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<DiffMetrics> {
+async function diffInPage(
+  page: Page,
+  a: Buffer,
+  b: Buffer,
+  withMask = false,
+): Promise<DiffMetrics> {
   return page.evaluate(
-    async ({ aB64, bB64, tolerance }) => {
+    async ({ aB64, bB64, tolerance, withMask }): Promise<DiffMetrics> => {
       const decode = async (b64: string): Promise<ImageData> => {
         const img = new Image();
         img.src = `data:image/png;base64,${b64}`;
@@ -222,6 +277,12 @@ async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<DiffMetrics
       let contentA = 0;
       let contentB = 0;
       let contentUnion = 0;
+      // Mask buffers, allocated only when dumping. `flags` remembers, per
+      // pixel, what the counting loop decided — bit 1 raw-bad, bit 2 "no match
+      // for A in B", bit 4 "no match for B in A" — so the picture below is
+      // painted from the counters' own verdicts rather than a second opinion.
+      const maskData = withMask ? new Uint8ClampedArray(pa.length) : null;
+      const flags = withMask ? new Uint8Array(pa.length / 4) : null;
       for (let i = 0; i < pa.length; i += 4) {
         const delta = Math.max(
           Math.abs(pa[i] - pb[i]),
@@ -232,8 +293,22 @@ async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<DiffMetrics
         if (delta > tolerance) {
           rawBad++;
           // Only pixels failing the direct compare need the neighborhood scan.
-          if (!matchesNear(pa, i, pb)) badAB++;
-          if (!matchesNear(pb, i, pa)) badBA++;
+          const missAB = !matchesNear(pa, i, pb);
+          const missBA = !matchesNear(pb, i, pa);
+          if (missAB) badAB++;
+          if (missBA) badBA++;
+          if (flags) flags[i / 4] = 1 | (missAB ? 2 : 0) | (missBA ? 4 : 0);
+        }
+        if (maskData) {
+          // Backdrop: capture A as dimmed greyscale. Dimmed so the markers
+          // read over it, greyscale so it can never BE a marker (r === g === b,
+          // and ≤ 115 per channel, while the markers are pure red and yellow).
+          const grey =
+            ((pa[i] * 0.299 + pa[i + 1] * 0.587 + pa[i + 2] * 0.114) * 0.45) | 0;
+          maskData[i] = grey;
+          maskData[i + 1] = grey;
+          maskData[i + 2] = grey;
+          maskData[i + 3] = 255;
         }
         const ca = isContent(pa, i);
         const cb = isContent(pb, i);
@@ -242,9 +317,62 @@ async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<DiffMetrics
         if (ca || cb) contentUnion++;
       }
       const bad = Math.max(badAB, badBA);
-      return { width: w, height: h, rawBad, bad, maxDelta, contentA, contentB, contentUnion };
+      let mask: DiffMetrics['mask'];
+      if (maskData && flags) {
+        // `bad` is the max of the two directions, so red is the fail set of
+        // whichever direction produced it — that is what makes red === bad by
+        // construction. Every other raw-bad pixel was rescued by the 3×3 match
+        // and goes yellow, so red + yellow === rawBad, also by construction.
+        const redBit = badAB >= badBA ? 2 : 4;
+        for (let p = 0; p < flags.length; p++) {
+          if (!(flags[p] & 1)) continue;
+          const i = p * 4;
+          maskData[i] = 255;
+          maskData[i + 1] = flags[p] & redBit ? 0 : 255;
+          maskData[i + 2] = 0;
+        }
+        // Count the markers back off the painted pixels — a scan of what the
+        // picture actually says, not a copy of the counters above.
+        let red = 0;
+        let yellow = 0;
+        for (let i = 0; i < maskData.length; i += 4) {
+          if (maskData[i] !== 255 || maskData[i + 2] !== 0) continue;
+          if (maskData[i + 1] === 0) red++;
+          else if (maskData[i + 1] === 255) yellow++;
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) throw new Error('2d context unavailable');
+        ctx.putImageData(new ImageData(maskData, w, h), 0, 0);
+        mask = {
+          pngBase64: canvas.toDataURL('image/png').replace(/^data:image\/png;base64,/, ''),
+          direction: badAB >= badBA ? 'a-vs-b' : 'b-vs-a',
+          red,
+          yellow,
+        };
+      }
+      return {
+        width: w,
+        height: h,
+        rawBad,
+        bad,
+        badAB,
+        badBA,
+        maxDelta,
+        contentA,
+        contentB,
+        contentUnion,
+        mask,
+      };
     },
-    { aB64: a.toString('base64'), bB64: b.toString('base64'), tolerance: CHANNEL_TOLERANCE },
+    {
+      aB64: a.toString('base64'),
+      bB64: b.toString('base64'),
+      tolerance: CHANNEL_TOLERANCE,
+      withMask,
+    },
   );
 }
 
@@ -252,7 +380,7 @@ for (const scene of SCENES) {
   test(`canvas2d / webgl parity: ${scene.name}`, async ({ page }, testInfo) => {
     const canvas2d = await captureStage(page, scene.query, 'canvas2d');
     const webgl = await captureStage(page, scene.query, 'webgl');
-    const m = await diffInPage(page, canvas2d, webgl);
+    const m = await diffInPage(page, canvas2d, webgl, DUMP);
 
     const badRatio = m.bad / Math.max(1, m.contentUnion);
     const contentMismatch =
@@ -271,6 +399,60 @@ for (const scene of SCENES) {
       // Keep the pair on failure, for eyeballing the regression.
       writeFileSync(testInfo.outputPath('canvas2d.png'), canvas2d);
       writeFileSync(testInfo.outputPath('webgl.png'), webgl);
+    }
+
+    if (DUMP) {
+      const mask = m.mask;
+      if (!mask) throw new Error('PARITY_DUMP is set but the diff returned no mask');
+      const files = {
+        'a-canvas2d.png': canvas2d,
+        'b-webgl.png': webgl,
+        'diff-mask.png': Buffer.from(mask.pngBase64, 'base64'),
+        'metrics.json': Buffer.from(
+          `${JSON.stringify(
+            {
+              project: testInfo.project.name,
+              scene: scene.name,
+              platform: process.platform,
+              width: m.width,
+              height: m.height,
+              contentA: m.contentA,
+              contentB: m.contentB,
+              contentUnion: m.contentUnion,
+              bad: m.bad,
+              badAB: m.badAB,
+              badBA: m.badBA,
+              rawBad: m.rawBad,
+              maxDelta: m.maxDelta,
+              channelTolerance: CHANNEL_TOLERANCE,
+              badRatio,
+              badRatioLimit,
+              contentMismatch,
+              contentMismatchLimit: CONTENT_MISMATCH_LIMIT,
+              maskDirection: mask.direction,
+              maskRed: mask.red,
+              maskYellow: mask.yellow,
+            },
+            null,
+            2,
+          )}\n`,
+        ),
+      };
+      for (const [name, body] of Object.entries(files)) {
+        const path = testInfo.outputPath(name);
+        writeFileSync(path, body);
+        await testInfo.attach(name, {
+          path,
+          contentType: name.endsWith('.png') ? 'image/png' : 'application/json',
+        });
+      }
+      // The instrument's self-check (dump runs only). The mask is painted by
+      // the counting pass, so a mask that disagrees with the counts means the
+      // picture is lying about which pixels the numbers are made of — the one
+      // failure mode that would send the reader of these images after the
+      // wrong cause.
+      expect(mask.red).toBe(m.bad);
+      expect(mask.red + mask.yellow).toBe(m.rawBad);
     }
 
     // The scene must actually draw something — a blank stage would "match".
