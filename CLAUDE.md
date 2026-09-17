@@ -45,7 +45,9 @@ README.md for architecture and measured numbers.
   permanently re-rastering.
 - Mesh canvas backing is **grow-only, quantized, with 25% slack** — writing
   `canvas.width` recreates the GPU surface, and doing that per frame stalled
-  real Safari to ~3 fps.
+  real Safari to ~3 fps — except on a `pixelRatio` change, which reallocates
+  every canvas anyway and therefore re-sizes from the new need alone, so a
+  lowered ratio actually shrinks.
 - Element-level features (z-index draw order, SVG-filter tint, mix-blend-mode,
   dirty-skip, backing policy) are backend-agnostic. Keep them out of the raster
   backends.

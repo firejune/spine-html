@@ -330,18 +330,26 @@ export class SpineHtmlRenderer {
     // stalled real Safari to ~3 fps while the JS split showed ~4 ms (the
     // cost lives in the compositor, invisible to in-callback timing). With
     // grow-only quantized backing, steady-state animation reallocates
-    // nothing. The CSS size mirrors the whole backing so the pixel mapping
-    // stays 1:1; the mesh draws into the top-left w×h logical region and
-    // the rest stays transparent.
+    // nothing. A pixelRatio change is the one exception to grow-only: it
+    // reallocates every mesh canvas anyway, so the new size comes from the
+    // new need alone. Keeping the old size as a floor there would make a
+    // ratio *drop* pay the reallocation and keep every oversized pixel — the
+    // backing would never come back down to what that ratio needs. The CSS
+    // size mirrors the whole backing so the pixel mapping stays 1:1; the mesh
+    // draws into the top-left w×h logical region and the rest stays
+    // transparent.
     const needW = Math.max(1, Math.round(w * ratio));
     const needH = Math.max(1, Math.round(h * ratio));
-    if (needW > view.canvasW || needH > view.canvasH || view.meshRatio !== ratio) {
+    const ratioChanged = view.meshRatio !== ratio;
+    if (needW > view.canvasW || needH > view.canvasH || ratioChanged) {
       // 25% slack: at low fps the animation is sampled sparsely, so new bbox
       // maxima keep being discovered for many seconds — allocate ahead of the
       // curve instead of chasing it.
       const step = 32;
-      view.canvasW = Math.ceil(Math.max(needW * 1.25, view.canvasW) / step) * step;
-      view.canvasH = Math.ceil(Math.max(needH * 1.25, view.canvasH) / step) * step;
+      const floorW = ratioChanged ? 0 : view.canvasW;
+      const floorH = ratioChanged ? 0 : view.canvasH;
+      view.canvasW = Math.ceil(Math.max(needW * 1.25, floorW) / step) * step;
+      view.canvasH = Math.ceil(Math.max(needH * 1.25, floorH) / step) * step;
       view.meshRatio = ratio;
       canvas.width = view.canvasW;
       canvas.height = view.canvasH;

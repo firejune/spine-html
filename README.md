@@ -227,7 +227,10 @@ const renderer = new SpineHtmlRenderer(rootElement, regionImages);
   raster matches the screen: `devicePixelRatio * rootScale`). **Writing it
   reallocates every mesh canvas backing store on the next frame**, and each
   reallocation recreates a GPU surface — the cost that took real Safari to ~3 fps
-  when it happened per frame. Set it when a layout settles, never per frame:
+  when it happened per frame. Each canvas is then sized from what the new ratio
+  needs, in both directions: lowering the ratio gives the backing pixels back
+  (the backing is grow-only *within* a ratio, not across a change of one). Set
+  it when a layout settles, never per frame:
   debounce resize drags and quantize the value instead of tracking it
   continuously. `renderer.canvasReallocCount` is the check — it must fall back to
   zero within a second or two.
