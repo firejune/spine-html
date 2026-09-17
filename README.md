@@ -295,12 +295,43 @@ const renderer = new SpineHtmlRenderer(rootElement, regionImages);
   debounce resize drags and quantize the value instead of tracking it
   continuously. `renderer.canvasReallocCount` is the check — it must fall back to
   zero within a second or two.
+- `renderer.syncPixelRatio()` — measures the root's effective on-screen scale
+  and sets `pixelRatio` to `devicePixelRatio × scale`, returning the ratio now
+  in effect. It appends a hidden 100 px box to the root, reads its box once and
+  removes it (the root itself is usually 0×0), so it is **one forced layout per
+  call** — which is exactly why the renderer never calls it for you: there is no
+  per-frame layout read anywhere in this library. Call it when a zoom or a
+  layout *settles* (gesture end, debounced resize), not during the drag. A
+  change under 0.1% is ignored, so layout jitter cannot churn GPU surfaces, and
+  a root that is not laid out (a `display: none` ancestor) leaves the ratio
+  alone. Under an ancestor rotation the measured box is inflated and the ratio
+  errs high — oversampling costs pixels, undersampling costs picture.
+- `renderer.meshBackingPixels` — allocated mesh-canvas backing pixels
+  (Σ width × height), computed on demand. This is what `pixelRatio` moves
+  quadratically, and the cheapest way to see an oversampling stage; the demo
+  prints it in the stats line as `backing N Mpx`.
 - `renderer.meshBackend` — `'canvas2d'` (default) or `'webgl'`; same output, but
   heavy deforming scenes on Safari want `'webgl'` (see Measured above). Falls back
   to canvas2d automatically when WebGL is unavailable. Switching re-rasters every
   mesh once (no reallocation), so it is fine to expose as a user setting.
 - `renderer.triangleExpand` — clip overdraw in px that closes antialiased mesh
   seams (default 0.5). Also re-rasters every mesh once when changed.
+
+**A zoomable stage.** The mesh tier rasters at `world × pixelRatio` in the
+root's own coordinates, and it cannot see a CSS transform above the root — so
+the most natural pan/zoom stage, `transform: scale(zoom)` on an ancestor, makes
+it oversample by `1/zoom²` in backing pixels until the zoom is folded in. The
+picture stays correct throughout, which is what makes this easy to ship: only
+the allocation and the frame rate move. Call `syncPixelRatio()` when the zoom
+settles, or set `pixelRatio = devicePixelRatio * zoom` yourself. Measured
+on-device (Chromium, dpr 2, stage under `scale(0.25)`, ~2.2 M CSS px on screen):
+
+| scene | `pixelRatio` | `meshBackingPixels` | fps |
+| --- | --- | --- | --- |
+| 57 meshes | `devicePixelRatio` (2) | 139.1 Mpx | 14–21 |
+| 57 meshes | `dpr × zoom` (0.5) | 9.1 Mpx | 61 |
+| 92 meshes | `devicePixelRatio` (2) | 141.1 Mpx | 36–39 |
+| 92 meshes | `dpr × zoom` (0.5) | 9.1 Mpx | 60–61 |
 
 ## Demo (this repository)
 

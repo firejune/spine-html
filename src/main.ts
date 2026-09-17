@@ -228,17 +228,22 @@ function main(
       let reallocs = 0;
       let triangles = 0;
       let clips = 0;
+      let backing = 0;
       for (const inst of instances) {
         meshes += inst.renderer.meshCount;
         reused += inst.renderer.meshReuseCount;
         reallocs += inst.renderer.canvasReallocCount;
         triangles += inst.renderer.triangleCount;
         clips += inst.renderer.clipSkipCount;
+        backing += inst.renderer.meshBackingPixels;
       }
       const reallocNote = reallocs ? ` / ${reallocs} realloc'd` : '';
+      // Allocated mesh-canvas pixels: what an oversampling stage (a scaled
+      // root whose scale is not folded into pixelRatio) shows first.
+      const backingNote = backing ? ` · backing ${(backing / 1e6).toFixed(1)} Mpx` : '';
       const meshNote =
         meshes + reused
-          ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused${reallocNote}`
+          ? ` · mesh canvases ${meshes} drawn (${triangles} tris) / ${reused} reused${reallocNote}${backingNote}`
           : '';
       const first = instances[0]?.renderer;
       // Surface the backend that actually ran, so a perf reading proves its path.
