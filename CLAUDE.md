@@ -66,7 +66,12 @@ README.md for architecture and measured numbers.
 ## Testing
 
 - `bun run test` — Playwright, chromium + webkit projects; the config builds and
-  serves the demo itself (port 4321).
+  serves the demo itself (port 4321, and it reuses a server already on that port
+  outside CI). So concurrent checkouts — worktrees, a second clone — must each
+  export their own `TEST_PORT`, or the second run borrows the first one's server
+  and tests the wrong tree without going red. `TEST_PORT` also turns reuse off,
+  so a busy port fails loudly, and a malformed value is rejected rather than
+  silently defaulted back to 4321.
 - Parity strategy: **A/B canvas2d-vs-webgl within one run, no golden snapshot
   files** (goldens rot across platforms). Seam cracks get the deterministic
   `?expand=0` canary rather than a screenshot threshold — they score below any

@@ -285,6 +285,15 @@ resolving, so blob ownership — every unpacked URL freed, nothing the caller
 owns touched, nothing stranded by a failed load — is asserted rather than
 assumed.
 
+The server is part of the test: a run tests whatever is being served on its
+port. Two checkouts of this repository on one machine (a worktree, a second
+clone) default to the same port 4321 and reuse an existing server, so the
+second run quietly tests the first one's build — green, and about the wrong
+tree. Give each concurrent checkout its own port with `TEST_PORT`
+(`TEST_PORT=4333 bun run test`); setting it also disables server reuse, so a
+busy port fails the run instead of being borrowed. Unset, nothing changes:
+port 4321, reuse unless `CI`.
+
 Standing rule: **headless numbers are never Safari performance evidence** —
 nothing in the suite asserts timing, and headless-WebKit fps/ms readings do
 not transfer (software rasterizer, measured up to 28× off real Safari). The
