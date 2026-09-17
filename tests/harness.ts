@@ -7,7 +7,9 @@ import {
 } from '@esotericsoftware/spine-core';
 import {
   DomTexture,
+  loadAtlasAssets,
   loadSkeletonAssets,
+  loadSkeletonJson,
   type RegionImage,
   revokeRegions,
   SpineHtmlRenderer,
@@ -153,6 +155,8 @@ export interface SpineHtmlHarness {
   loaderProbe(): Promise<LoaderProbeResult>;
   loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
   backingProbe(): Promise<BackingProbeResult>;
+  loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult>;
+  sharedAtlasProbe(): Promise<SharedAtlasProbeResult>;
 }
 
 declare global {
@@ -498,6 +502,206 @@ async function backingProbe(): Promise<BackingProbeResult> {
   };
 }
 
+export interface LoaderHttpFailureProbeResult {
+  /** What the static server actually answers a missing path with. */
+  status: number;
+  /** Attempt 1 — the missing URL, exactly as this server answers it. */
+  missingMessage: string;
+  missingCreatedUrls: string[];
+  missingRevokedUrls: string[];
+  missingAliveAfter: Record<string, boolean>;
+  /** URLs attempt 2's fetch double was asked for, in the order it was asked. */
+  fetchOrder: string[];
+  /** Attempt 2 — a fetch double answering the skeleton URL with 404. */
+  httpMessage: string;
+  httpCreatedUrls: string[];
+  httpRevokedUrls: string[];
+  httpAliveAfter: Record<string, boolean>;
+}
+
+export interface SharedAtlasProbeResult {
+  /** Object URLs minted while loadAtlasAssets ran — one atlas, cut once. */
+  createdUrls: string[];
+  /** Object URLs minted while the two skeletons were read against it. */
+  skeletonCreatedUrls: string[];
+  regionCount: number;
+  /** Animation names from each skeleton, proving both actually parsed. */
+  essAnimations: string[];
+  proAnimations: string[];
+  /** <img>/<canvas> each renderer put in its own root for one frame. */
+  essElementCount: number;
+  proElementCount: number;
+  essCanvasCount: number;
+  proCanvasCount: number;
+  /** Message from a read that fails against the shared assets ('' if it did not). */
+  badReadMessage: string;
+  /** What that failed read revoked — the caller's assets, so: nothing. */
+  badReadRevokedUrls: string[];
+  /** Object URLs revoked by shared.dispose(), which is called twice. */
+  revokedUrls: string[];
+  aliveBefore: Record<string, boolean>;
+  aliveAfter: Record<string, boolean>;
+}
+
+/** Runs a load that must fail, and reports what it left behind. */
+async function failedLoad(
+  skeletonUrl: string,
+  fetchImpl?: typeof globalThis.fetch,
+): Promise<{ message: string; created: string[]; revoked: string[] }> {
+  const attempt = await trackObjectUrls(async () => {
+    try {
+      await loadSkeletonAssets({
+        atlasUrl: '/spineboy/spineboy.atlas',
+        skeletonUrl,
+        fetch: fetchImpl,
+      });
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+  return { message: attempt.result, created: attempt.created, revoked: attempt.revoked };
+}
+
+/**
+ * A skeleton that never arrives, in both shapes the web has: the URL a static
+ * server cannot resolve, and a real HTTP error.
+ *
+ * Which of the two a missing path produces is the server's choice, not the
+ * library's — a preview server with an SPA fallback answers 200 with an HTML
+ * body, which reaches the JSON read rather than the status check. So the
+ * status is reported, and the error branch is reached deterministically with a
+ * fetch double instead of by guessing at the server.
+ *
+ * Either way the regions are already unpacked when the skeleton half fails,
+ * which is the one moment a load can strand them.
+ */
+async function loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult> {
+  const status = (await fetch('/spineboy/does-not-exist.json')).status;
+  const missing = await failedLoad('/spineboy/does-not-exist.json');
+
+  // The double also records the order it is called in. The skeleton URL being
+  // asked for before the atlas URL is what "both halves are in flight" looks
+  // like from outside: a loader that read the atlas first would ask for it
+  // first.
+  const fetchOrder: string[] = [];
+  const notFound: typeof globalThis.fetch = (input, init) => {
+    const url = String(input instanceof Request ? input.url : input);
+    fetchOrder.push(url);
+    if (url.endsWith('.json')) {
+      return Promise.resolve(new Response('', { status: 404, statusText: 'Not Found' }));
+    }
+    return fetch(input, init);
+  };
+  const http = await failedLoad('/spineboy/spineboy-pro.json', notFound);
+
+  return {
+    status,
+    fetchOrder,
+    missingMessage: missing.message,
+    missingCreatedUrls: missing.created,
+    missingRevokedUrls: missing.revoked,
+    missingAliveAfter: await alive(missing.created),
+    httpMessage: http.message,
+    httpCreatedUrls: http.created,
+    httpRevokedUrls: http.revoked,
+    httpAliveAfter: await alive(http.created),
+  };
+}
+
+/** Poses a skeleton for one frame into `root` and reports what landed there. */
+function renderOnce(
+  root: HTMLElement,
+  skeleton: Skeleton,
+  regionImages: Map<string, RegionImage>,
+): { elementCount: number; canvasCount: number } {
+  const state = new AnimationState(new AnimationStateData(skeleton.data));
+  state.setAnimation(0, 'walk', true);
+  state.update(1.2);
+  state.apply(skeleton);
+  skeleton.update(1.2);
+  skeleton.updateWorldTransform(Physics.update);
+  const renderer = new SpineHtmlRenderer(root, regionImages);
+  renderer.render(skeleton);
+  const counts = {
+    elementCount: root.querySelectorAll('img, canvas').length,
+    canvasCount: root.querySelectorAll('canvas').length,
+  };
+  renderer.dispose();
+  return counts;
+}
+
+/**
+ * One atlas, two skeletons: loadAtlasAssets once, loadSkeletonJson per
+ * skeleton. What is under test is that the regions are cut exactly once and
+ * that the one map backs both renderers — the shape calling loadSkeletonAssets
+ * twice cannot have.
+ */
+async function sharedAtlasProbe(): Promise<SharedAtlasProbeResult> {
+  const load = await trackObjectUrls(() =>
+    loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' }),
+  );
+  const shared = load.result;
+
+  // Reading a skeleton owns nothing, so these two must mint no URL at all.
+  const read = await trackObjectUrls(() =>
+    Promise.all([
+      loadSkeletonJson(shared, '/spineboy/spineboy-ess.json'),
+      loadSkeletonJson(shared, '/spineboy/spineboy-pro.json'),
+    ]),
+  );
+  const [essData, proData] = read.result;
+
+  const root = document.getElementById('root');
+  if (!root) throw new Error('#root missing');
+  root.replaceChildren();
+  // The second root is created here rather than in harness.html: it belongs to
+  // this probe, and every other probe must still see the page it knows.
+  const secondRoot = document.createElement('div');
+  secondRoot.style.cssText = 'position: absolute; left: 0; top: 0';
+  document.body.append(secondRoot);
+
+  const ess = renderOnce(root, new Skeleton(essData), shared.regionImages);
+  const pro = renderOnce(secondRoot, new Skeleton(proData), shared.regionImages);
+  secondRoot.remove();
+
+  // Ownership: the assets are the caller's, so a read that throws must not
+  // take them with it — the skeletons already read from them are still using
+  // them. The alive sample below is taken after this failure, not before it.
+  const badRead = await trackObjectUrls(async () => {
+    try {
+      await loadSkeletonJson(shared, '/spineboy/spineboy.atlas');
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+
+  const aliveBefore = await alive(load.created);
+  // Twice: dispose() is documented as idempotent.
+  const release = await trackObjectUrls(async () => {
+    shared.dispose();
+    shared.dispose();
+  });
+
+  return {
+    createdUrls: load.created,
+    skeletonCreatedUrls: read.created,
+    regionCount: shared.regionImages.size,
+    essAnimations: essData.animations.map((animation) => animation.name),
+    proAnimations: proData.animations.map((animation) => animation.name),
+    essElementCount: ess.elementCount,
+    proElementCount: pro.elementCount,
+    essCanvasCount: ess.canvasCount,
+    proCanvasCount: pro.canvasCount,
+    badReadMessage: badRead.result,
+    badReadRevokedUrls: badRead.revoked,
+    revokedUrls: release.revoked,
+    aliveBefore,
+    aliveAfter: await alive(load.created),
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -505,4 +709,6 @@ window.spineHtmlHarness = {
   loaderProbe,
   loaderFailureProbe,
   backingProbe,
+  loaderHttpFailureProbe,
+  sharedAtlasProbe,
 };
