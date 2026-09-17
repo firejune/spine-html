@@ -56,7 +56,10 @@ README.md for architecture and measured numbers.
   caller's own part PNGs — and one map is normally shared by several renderers
   (the demo does it). So only `revokeRegions` frees anything, and only URLs
   this package minted (the `ownedUrls` ledger in DomTexture.ts). Never revoke
-  from `dispose()`.
+  from `dispose()`. The same boundary covers atlas pages — the page image is
+  the caller's too, so nothing here nulls `page.texture` or drops a page to
+  reclaim memory (the reason step 2 of #7 was declined); a page goes when the
+  caller drops the atlas and the skeleton data that reach it.
 - `loadSkeletonAssets` is a convenience layer, not a dependency: nothing else
   in `src/` imports it, so it tree-shakes away. Keep it that way, and keep the
   low-level path (TextureAtlas + DomTexture + unpackRegions) fully usable on
@@ -111,7 +114,3 @@ README.md for architecture and measured numbers.
 - `loadSkeletonAssets` is one atlas per skeleton. Sharing one atlas across
   several skeletons (what the demo does) still needs the low-level path; a
   `skeletonUrls: string[]` variant would cover it without double-unpacking.
-- The mesh tier keeps a page image alive per atlas page (it samples the page
-  bitmap every frame), so unloading a skeleton frees the region blobs but not
-  the pages. Nothing leaks — the images are the caller's and drop with the
-  atlas — but a consumer counting bytes should know the pages are the floor.
