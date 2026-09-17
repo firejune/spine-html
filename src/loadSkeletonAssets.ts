@@ -4,8 +4,8 @@ import {
   SkeletonJson,
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
-import type { RegionImage } from './DomTexture';
-import { fetchText, type LoadAtlasAssetsOptions, loadAtlasAssets } from './loadAtlasAssets';
+import type { RegionImage } from './DomTexture.js';
+import { fetchText, type LoadAtlasAssetsOptions, loadAtlasAssets } from './loadAtlasAssets.js';
 
 /**
  * Optional convenience loader: fetch a skeleton export and its atlas, attach

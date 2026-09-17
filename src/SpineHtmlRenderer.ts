@@ -9,8 +9,8 @@ import {
   type SlotPose,
   type TextureAtlasRegion,
 } from '@esotericsoftware/spine-core';
-import type { RegionImage } from './DomTexture';
-import { getMeshGlBlitter, type MeshBlitJob } from './MeshGlBlitter';
+import type { RegionImage } from './DomTexture.js';
+import { getMeshGlBlitter, type MeshBlitJob } from './MeshGlBlitter.js';
 
 /** Rasterizer used for the mesh (deform) tier. */
 export type MeshBackend = 'canvas2d' | 'webgl';

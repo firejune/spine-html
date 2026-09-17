@@ -49,6 +49,16 @@ README.md for architecture and measured numbers.
   expansion's reach in texture space is `triangleExpand` × the local
   texels-per-canvas-unit, ~0.26 to 8.6 texels across the demo's own meshes.
   The overdraw canary in `tests/parity.spec.ts` is what holds this.
+- **Relative imports in `src/` carry `.js`** — `from './DomTexture.js'`, never
+  `from './DomTexture'`. TypeScript resolves the `.js` specifier back to the
+  `.ts` file under `moduleResolution: "bundler"`, and vite does the same for
+  both build entries, so nothing in development notices either way. What
+  notices is node: `tsc` emits the specifier *unchanged*, and node's ESM
+  resolver requires the extension, so extensionless specifiers shipped a
+  package that no plain `node` could import (#16 — `ERR_MODULE_NOT_FOUND`,
+  invisible to every bundler and to esm.sh). Building under `NodeNext` is not
+  an escape: it does not rewrite specifiers either, it just refuses to compile
+  without the `.js` (TS2835). The guard is `tests/package.spec.ts`.
 - **One shared WebGL context** at module level — browsers cap WebGL contexts at
   ~16; never create one per renderer/mesh. Because it outlives every renderer,
   its page textures are reference-counted per page (retained as a mesh job is
@@ -94,10 +104,11 @@ README.md for architecture and measured numbers.
   the `./binary` key in the `exports` map). It is the only file that imports
   `SkeletonBinary`, and **`index.ts` must never re-export it** — that subpath is
   the entire mechanism keeping the second parser out of a JSON-only consumer's
-  bundle, and one re-export line undoes it. Nothing in the suite catches that —
-  a re-export costs bundle size, not behaviour — so the guard is review, and the
-  check to run by hand is an import-graph walk of built `dist/index.js`: nothing
-  it reaches may name `SkeletonBinary` or import `./binary`.
+  bundle, and one re-export line undoes it. `tests/package.spec.ts` holds that
+  now: it walks the import graph of a freshly built `dist/index.js` and fails if
+  anything reachable from it names `SkeletonBinary` or imports `./binary`. A
+  re-export costs bundle size, not behaviour, so this used to be a review item
+  and a walk to run by hand — it is neither any more.
 
 ## Testing
 
@@ -117,6 +128,15 @@ README.md for architecture and measured numbers.
   `window.spineHtmlHarness`). Blob-URL ownership has no visual signature, so
   its oracle is the browser: a revoked object URL stops resolving. Keep test
   hooks in the harness, out of the demo.
+- What npm ships is tested by **`tests/package.spec.ts`, node-side, no
+  browser**: it builds the library to a temp directory, assembles a throwaway
+  `node_modules/spine-html` there (real manifest, peer symlinked) and imports
+  both entry points *by package name* through node's own resolver — the only
+  way to exercise the `exports` map, which a relative import of `dist/` would
+  bypass entirely. It must **never** build into the repository's own `dist/`:
+  during a run `vite preview` is serving the demo out of `dist/` and
+  `build:lib` opens with `rm -rf dist`, so a lib build there would pull the
+  ground out from under every other spec in the same run.
 - Keep `@playwright/test` pinned to a version whose browser revisions match the
   machine's `~/Library/Caches/ms-playwright` before bumping it.
 
