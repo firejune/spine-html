@@ -227,8 +227,12 @@ page, and `SkeletonData` reaches that same image through every attachment
 skeleton data and every renderer drawing from them are gone. `atlas.dispose()`
 does not do it — `DomTexture.dispose()` is a no-op, because the image is yours.
 With the `webgl` mesh backend the shared blitter also uploads each page image on
-first use and keeps that GL texture, keyed by the image, for the lifetime of the
-module.
+first use, but that GL texture is not the module's forever: every renderer
+drawing the page holds a reference to it, `renderer.dispose()` hands those back,
+and the texture is deleted once the last renderer using that page is disposed —
+a later frame that needs the page uploads it again. The cache is keyed weakly by
+the page image, so a renderer dropped without `dispose()` costs GPU memory until
+the context is lost, but never keeps the image itself alive.
 
 A meshed skeleton samples the page bitmap every frame, so its decoded form stays
 in use: a floor on the order of `page width × page height × 4` bytes per page —

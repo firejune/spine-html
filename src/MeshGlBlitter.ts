@@ -20,6 +20,13 @@
  * preserveDrawingBuffer nor cross-frame content is relied on. The buffer
  * grows quantized and never shrinks, mirroring the per-part backing policy
  * (reallocating GPU surfaces per frame is a Safari killer).
+ *
+ * Page textures are the one thing here with a lifetime, and since this object
+ * outlives every renderer they are reference-counted: a renderer retains each
+ * page it queues a job for and releases them in dispose(), and the last
+ * release deletes the GL texture (a later job re-uploads it). The cache is
+ * keyed weakly by the page image, so a consumer that never disposes still
+ * loses nothing but GPU memory — this object never pins the caller's image.
  */
 
 export interface MeshBlitJob {
@@ -66,13 +73,33 @@ const GUTTER = 1;
 /** Drawing-buffer growth quantum (device px). */
 const GROW_STEP = 256;
 
+/** Cache entry for one atlas page: the upload, and how many renderers want it. */
+interface PageTexture {
+  /** Uploaded lazily, on the first flush that binds this page. */
+  texture: WebGLTexture | null;
+  /** Live retain() calls outstanding — one per renderer drawing this page. */
+  users: number;
+}
+
 class MeshGlBlitter {
   lost = false;
+  /**
+   * Page textures created minus deleted, i.e. how many uploads are live right
+   * now. Deterministic (no GC in the path), which is what the lifetime tests
+   * assert against — see tests/gl-textures.spec.ts.
+   */
+  liveTextureCount = 0;
 
   private readonly canvas = document.createElement('canvas');
   private readonly gl: WebGLRenderingContext;
   private readonly uResolution: WebGLUniformLocation;
-  private readonly textures = new Map<HTMLImageElement, WebGLTexture>();
+  /**
+   * Weak by the page image on purpose: a consumer that forgets dispose()
+   * leaks its texture until context loss, but dropping the image still lets
+   * the image (and then the WebGLTexture this entry holds) be collected.
+   * Reassigned wholesale on context loss, never iterated.
+   */
+  private textures = new WeakMap<HTMLImageElement, PageTexture>();
   private readonly maxSize: number;
   private vertexData = new Float32Array(8192);
   /** Per-job packed rect origins, filled by flush(). */
@@ -93,7 +120,7 @@ class MeshGlBlitter {
     // No restore attempt: on loss the renderer falls back to canvas2d and the
     // backend signature re-dirties every mesh, so frames stay complete.
     this.canvas.addEventListener('webglcontextlost', () => {
-      this.lost = true;
+      this.markLost();
     });
 
     const program = gl.createProgram();
@@ -220,7 +247,7 @@ class MeshGlBlitter {
     // If the context died mid-batch the draws above were no-ops; report it
     // before blitting stale/blank rects onto the part canvases.
     if (gl.isContextLost()) {
-      this.lost = true;
+      this.markLost();
       return false;
     }
 
@@ -238,6 +265,51 @@ class MeshGlBlitter {
     return true;
   }
 
+  /**
+   * Declares one more user of `page`. The upload itself stays lazy (the first
+   * flush that binds the page does it) — this only counts, so that the last
+   * release() can free the texture instead of the module holding it forever.
+   * Callers retain once per page and hand the same page back exactly once;
+   * SpineHtmlRenderer keeps that ledger and settles it in dispose().
+   */
+  retain(page: HTMLImageElement): void {
+    const entry = this.textures.get(page);
+    if (entry) entry.users++;
+    else this.textures.set(page, { texture: null, users: 1 });
+  }
+
+  /**
+   * Gives back one retain(). The GL texture goes when the last user of the
+   * page is gone; a later job for the same page simply uploads it again. A
+   * page the cache does not know (a release after a context loss dropped
+   * everything, or a double dispose) is a no-op, so this is safe to call
+   * unconditionally.
+   */
+  release(page: HTMLImageElement): void {
+    const entry = this.textures.get(page);
+    if (!entry) return;
+    if (--entry.users > 0) return;
+    this.textures.delete(page);
+    if (!entry.texture) return;
+    // deleteTexture is a documented no-op on a lost context rather than a
+    // throw, but a lost context has already dropped the cache and zeroed the
+    // count — reaching here with `lost` set would mean decrementing twice.
+    if (!this.lost && !this.gl.isContextLost()) this.gl.deleteTexture(entry.texture);
+    this.liveTextureCount--;
+  }
+
+  /**
+   * Context loss invalidates every texture handle at once. Drop the cache and
+   * the count instead of carrying dead handles (deleting them is pointless —
+   * the GPU side is already gone) and let the next frames re-upload if the
+   * caller keeps drawing; the renderer meanwhile falls back to canvas2d.
+   */
+  private markLost(): void {
+    this.lost = true;
+    this.textures = new WeakMap();
+    this.liveTextureCount = 0;
+  }
+
   private compile(type: number, source: string): WebGLShader {
     const gl = this.gl;
     const shader = gl.createShader(type);
@@ -251,10 +323,10 @@ class MeshGlBlitter {
   }
 
   private textureFor(page: HTMLImageElement): WebGLTexture {
-    let texture = this.textures.get(page);
-    if (texture) return texture;
+    let entry = this.textures.get(page);
+    if (entry?.texture) return entry.texture;
     const gl = this.gl;
-    texture = gl.createTexture();
+    const texture = gl.createTexture();
     if (!texture) throw new Error('createTexture failed');
     gl.bindTexture(gl.TEXTURE_2D, texture);
     // Premultiply at upload so blending and the premultiplied canvas agree.
@@ -266,7 +338,17 @@ class MeshGlBlitter {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    this.textures.set(page, texture);
+    if (!entry) {
+      // Nobody retained this page — not a path this package takes, since the
+      // renderer retains as it queues each job. Cache it anyway so the batch
+      // does not re-upload per flush; with no users only a context loss (or
+      // the image being collected, which takes the weak entry with it) clears
+      // it, which is exactly the old behavior for a caller that opts out.
+      entry = { texture: null, users: 0 };
+      this.textures.set(page, entry);
+    }
+    entry.texture = texture;
+    this.liveTextureCount++;
     return texture;
   }
 }

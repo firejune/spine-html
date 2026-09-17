@@ -50,7 +50,12 @@ README.md for architecture and measured numbers.
   texels-per-canvas-unit, ~0.26 to 8.6 texels across the demo's own meshes.
   The overdraw canary in `tests/parity.spec.ts` is what holds this.
 - **One shared WebGL context** at module level — browsers cap WebGL contexts at
-  ~16; never create one per renderer/mesh.
+  ~16; never create one per renderer/mesh. Because it outlives every renderer,
+  its page textures are reference-counted per page (retained as a mesh job is
+  queued, released by `dispose()`, deleted at the last release — #15), and the
+  cache is keyed weakly by the page image so a forgotten `dispose()` never pins
+  the caller's image. A context loss drops both the cache and the count: every
+  handle is dead, and the next frames re-upload.
 - The mesh dirty-signature cache must stay **Float64** — storing the compared
   f64 values in a Float32Array rounds some of them and leaves those meshes
   permanently re-rastering.
