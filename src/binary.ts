@@ -4,7 +4,7 @@ import {
   SkeletonBinary,
   type TextureAtlas,
 } from '@esotericsoftware/spine-core';
-import { fetchBytes } from './loadAtlasAssets';
+import { fetchBytes } from './loadAtlasAssets.js';
 
 /**
  * Binary (.skel) skeleton exports — a separate package entry point.

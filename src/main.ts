@@ -8,8 +8,8 @@ import {
   SkeletonJson,
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
-import { DomTexture, type RegionImage, unpackRegions } from './DomTexture';
-import { type MeshBackend, SpineHtmlRenderer } from './SpineHtmlRenderer';
+import { DomTexture, type RegionImage, unpackRegions } from './DomTexture.js';
+import { type MeshBackend, SpineHtmlRenderer } from './SpineHtmlRenderer.js';
 
 const ASSET_BASE = '/spineboy';
 const SKELETONS = {

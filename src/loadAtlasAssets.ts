@@ -1,5 +1,5 @@
 import { TextureAtlas } from '@esotericsoftware/spine-core';
-import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from './DomTexture';
+import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from './DomTexture.js';
 
 /**
  * Optional convenience loader, atlas half: fetch an atlas export, attach the
