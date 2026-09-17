@@ -181,6 +181,31 @@ it — and calling it twice is a no-op. Load once for the page's lifetime and yo
 can ignore it; load and unload repeatedly without it and you leak an atlas per
 cycle.
 
+### What unloading frees
+
+`revokeRegions()` — and `assets.dispose()`, which just calls it — frees the blob
+URLs `unpackRegions` minted, and nothing else. The rest is pinned by objects you
+own: an atlas **page image** is held by the `DomTexture` you attached to its
+page, and `SkeletonData` reaches that same image through every attachment
+(`region.texture.getImage()`), so a page is released only once the atlas, the
+skeleton data and every renderer drawing from them are gone. `atlas.dispose()`
+does not do it — `DomTexture.dispose()` is a no-op, because the image is yours.
+With the `webgl` mesh backend the shared blitter also uploads each page image on
+first use and keeps that GL texture, keyed by the image, for the lifetime of the
+module.
+
+A meshed skeleton samples the page bitmap every frame, so its decoded form stays
+in use: a floor on the order of `page width × page height × 4` bytes per page —
+1 MiB for spineboy's single 1024×256 page. A rigid-only skeleton draws nothing
+from the page after `unpackRegions`, and what a merely reachable, undrawn image
+costs is up to the browser, not measurable from script.
+
+Unload in this order:
+
+1. `renderer.dispose()`, for every renderer using the images.
+2. `revokeRegions(regionImages)` (or `assets.dispose()`).
+3. Drop your references to the atlas and the skeleton data.
+
 ### One part per page (loose part PNGs)
 
 Not every pipeline runs the Spine editor's texture packer. If your parts are
