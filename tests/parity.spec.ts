@@ -37,11 +37,10 @@ import { expect, type Page, test } from '@playwright/test';
  *
  * ## PARITY_DUMP=1 — the counts made visible
  *
- * The counts below say how many pixels disagree; they never say WHERE. That
- * matters for the one platform whose residue is unexplained (linux WebKit,
- * whose badRatio limit is held far looser): bad pixels on silhouettes, inside
- * the additive glow, or spread over the fill point at different causes, and
- * that platform exists only on the CI runner. So the environment variable
+ * The counts below say how many pixels disagree; they never say WHERE. Bad
+ * pixels on silhouettes, inside the additive glow, or spread over the fill
+ * point at different causes, and the platform that had residue to explain
+ * (linux WebKit) exists only on the CI runner. So the environment variable
  * `PARITY_DUMP=1` turns every parity cell into an instrument. It writes, into
  * the test's output directory (and attaches, so artifact uploads and reporters
  * both find them):
@@ -64,6 +63,12 @@ import { expect, type Page, test } from '@playwright/test';
  * Without `PARITY_DUMP=1` nothing above happens — no mask is computed in the
  * page, no file is written, and the assertions and log lines are the ones that
  * have always run. This switch is an instrument, not a threshold.
+ *
+ * It has already paid for itself: the mask read on the CI runner put linux
+ * WebKit's long-standing residue on whole triangles of the head, goggles and
+ * foot meshes rather than on edges, which is what identified the canvas2d
+ * backend as the broken side and retired that platform's looser limit — see
+ * BAD_RATIO_LIMIT.
  */
 
 const POSE = 'time=1.2&timescale=0&count=1&dpr=1';
@@ -99,31 +104,36 @@ const CHANNEL_TOLERANCE = 24;
  * Verified red, not just green: re-introducing the `- 1` texel offset takes
  * both hoverboard cells (1.25% / 1.29%) and webkit walk+tint (0.72%) past
  * this limit, so a relapse fails the suite.
+ *
+ * ## One limit, every project — there used to be two
+ *
+ * `BAD_RATIO_LIMIT_WEBKIT_LINUX = 0.13`, 26× looser, carried linux WebKit
+ * alone, whose floors on ubuntu CI (run 32580117738, 2026-08-22,
+ * post-texel-fix) read hoverboard 4.77%, walk+tint 4.32%, portal 0.53%
+ * (contentMismatch ≤ 0.40%, seam canary rawBad=90). It was written up as a
+ * noisier raster flavor, with additive blend and premultiplied alpha as the
+ * unmeasured suspects.
+ *
+ * The evidence against that reading was already in the numbers: the texel fix
+ * had halved this platform's raw diff (3422 → 1580 on hoverboard) while the
+ * shift-tolerant count stood still (1049 → 1042), at maxDelta ~233. Pixels with
+ * no in-tolerance match anywhere in the other backend's 3×3 are not sub-pixel
+ * noise. PARITY_DUMP put them on the map: whole triangles of the head, goggles
+ * and foot meshes, carrying displaced texture, while the webgl capture of the
+ * same pose was clean. The canvas2d backend was the broken side, and the
+ * platform limit had been absorbing a rendering bug for months.
+ *
+ * What triggers it is drawing the WHOLE atlas page under each triangle's steep
+ * affine; drawing a source sub-rect instead — same mapping, same texture-space
+ * position, see drawTriangle — takes those floors to hoverboard 2 bad pixels
+ * (0.009%, maxDelta 233 → 30), portal 4, walk+tint 3, with every Chromium
+ * capture byte-identical. [measured on the ubuntu CI runner through
+ * PARITY_DUMP: run 35209262693 with a fixed 2-texel pad, run 35213286993 with
+ * the derived pad that shipped — identical counts, and the whole suite green
+ * there under this one limit; the mechanism inside that rasterizer is still
+ * not identified.]
  */
 const BAD_RATIO_LIMIT = 0.005;
-/**
- * Linux WebKit only: its raster flavor is measurably noisier than macOS
- * WebKit's. Floors on ubuntu CI (run 32580117738, 2026-08-22, post-texel-fix):
- * hoverboard 4.77%, walk+tint 4.32%, portal 0.53% — contentMismatch ≤ 0.40%
- * (under its unchanged limit), seam canary rawBad=90.
- *
- * This limit is NOT tightened with the strict one, because the texel fix
- * barely moved this platform: raw diff pixels roughly halved (3422 → 1580 on
- * hoverboard) while the shift-tolerant count did not (1049 → 1042). Its
- * residue is therefore not sub-pixel — those are pixels with no in-tolerance
- * match anywhere in the other image's 3×3, at maxDelta ~233. Something else
- * differs between the backends under that software rasterizer; until it is
- * understood, 0.13 (~2.7× over the worst floor) stays. Nothing is lost: the
- * synthetic regressions score ~87% there like everywhere else, and missing
- * parts stay guarded by CONTENT_MISMATCH_LIMIT, which is not relaxed.
- */
-const BAD_RATIO_LIMIT_WEBKIT_LINUX = 0.13;
-
-function badRatioLimitFor(projectName: string): number {
-  return projectName === 'webkit' && process.platform === 'linux'
-    ? BAD_RATIO_LIMIT_WEBKIT_LINUX
-    : BAD_RATIO_LIMIT;
-}
 /**
  * Allowed relative difference in drawn-content pixel counts — the
  * missing-part guard. Measured noise ≤ 0.22%, except linux WebKit at ≤ 0.40%;
@@ -394,8 +404,7 @@ for (const scene of SCENES) {
         `ch>${CHANNEL_TOLERANCE}), maxDelta=${m.maxDelta}, ` +
         `contentMismatch=${(contentMismatch * 100).toFixed(3)}%`,
     );
-    const badRatioLimit = badRatioLimitFor(testInfo.project.name);
-    if (badRatio > badRatioLimit || contentMismatch > CONTENT_MISMATCH_LIMIT) {
+    if (badRatio > BAD_RATIO_LIMIT || contentMismatch > CONTENT_MISMATCH_LIMIT) {
       // Keep the pair on failure, for eyeballing the regression.
       writeFileSync(testInfo.outputPath('canvas2d.png'), canvas2d);
       writeFileSync(testInfo.outputPath('webgl.png'), webgl);
@@ -426,7 +435,7 @@ for (const scene of SCENES) {
               maxDelta: m.maxDelta,
               channelTolerance: CHANNEL_TOLERANCE,
               badRatio,
-              badRatioLimit,
+              badRatioLimit: BAD_RATIO_LIMIT,
               contentMismatch,
               contentMismatchLimit: CONTENT_MISMATCH_LIMIT,
               maskDirection: mask.direction,
@@ -460,7 +469,7 @@ for (const scene of SCENES) {
     // Sub-pixel sampling differences are expected (and absorbed); missing
     // parts and wrong colors blow past these limits (calibrated: a dropped
     // tint scores ~87% bad, a blanked mesh shifts content by its area).
-    expect(badRatio).toBeLessThanOrEqual(badRatioLimit);
+    expect(badRatio).toBeLessThanOrEqual(BAD_RATIO_LIMIT);
     expect(contentMismatch).toBeLessThanOrEqual(CONTENT_MISMATCH_LIMIT);
   });
 }
@@ -478,4 +487,37 @@ test('seam canary: the canvas2d crack-closing overdraw is alive', async ({ page 
   const m = await diffInPage(page, withExpand, withoutExpand);
   console.log(`[parity] ${test.info().project.name} seam canary: rawBad=${m.rawBad}`);
   expect(m.rawBad).toBeGreaterThanOrEqual(10);
+});
+
+test('overdraw canary: the canvas2d source sub-rect tracks the clip expansion', async ({ page }) => {
+  // The canvas2d path draws each triangle from a source sub-rect of the atlas
+  // page instead of the whole page (see drawTriangle). The rect is *derived*:
+  // the clip polygon — the triangle expanded outward by triangleExpand canvas
+  // px — is carried back into texture space through the inverse of the
+  // per-triangle affine, and that bbox plus a texel of bilinear support is what
+  // gets drawn. Replace the derivation with a fixed pad and the rect stops
+  // following the expansion: the rim of the overdraw draws nothing, which is
+  // how the seams the overdraw exists to close come back.
+  //
+  // At the shipped expansion that has no signature — 0.5 px reaches ~0.26
+  // texels on a typical spineboy triangle (measured across all 424 hoverboard
+  // triangles: ~0.26 median, 8.6 on the most foreshortened one), so any
+  // plausible fixed pad still covers it. So this canary drives the knob
+  // instead, the way the seam canary above does: same engine, same frozen pose,
+  // canvas2d at expand=32 against canvas2d at expand=8. Both renders are
+  // deterministic, so the count is exact, not statistical.
+  //
+  // A rect that follows the expansion keeps both bands whole, and the captures
+  // differ by the band's whole area: rawBad 2758 (chromium) / 2802 (macOS
+  // webkit), which is what the whole-page draw this replaced also measured
+  // (2758 / 2806). A fixed pad truncates both bands at the same few texels, so
+  // the two captures collapse toward each other: 661 / 714 with a 2-texel pad,
+  // 428 / 475 with none. The limit sits between the two populations, ~1.8×
+  // under the real floor and ~2.1× over the loudest mutant.
+  const query = `skel=pro&anim=hoverboard&${POSE}`;
+  const wide = await captureStage(page, `${query}&expand=32`, 'canvas2d');
+  const narrow = await captureStage(page, `${query}&expand=8`, 'canvas2d');
+  const m = await diffInPage(page, wide, narrow);
+  console.log(`[parity] ${test.info().project.name} overdraw canary: rawBad=${m.rawBad}`);
+  expect(m.rawBad).toBeGreaterThanOrEqual(1500);
 });
