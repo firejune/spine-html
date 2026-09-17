@@ -38,6 +38,17 @@ README.md for architecture and measured numbers.
   pixel-index frame) is the bug fixed in #1; it was worth 15–250× in parity
   residue, depending on the scene. No half-texel term: the per-triangle affine
   maps corners, it does not sample.
+- **The canvas2d path draws a per-triangle source sub-rect, never the whole
+  page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
+  affines — measured (displaced texture on head/goggles/foot triangles while
+  webgl stayed clean; hoverboard bad pixels 1042 → 2 with the source rect as
+  the only variable), mechanism not identified. The rect is derived from the
+  clip, not fixed: the expanded clip polygon is carried back through the
+  inverse of the per-triangle affine, plus one texel of bilinear support,
+  snapped outward to texel boundaries. A fixed pad is wrong because the
+  expansion's reach in texture space is `triangleExpand` × the local
+  texels-per-canvas-unit, ~0.26 to 8.6 texels across the demo's own meshes.
+  The overdraw canary in `tests/parity.spec.ts` is what holds this.
 - **One shared WebGL context** at module level — browsers cap WebGL contexts at
   ~16; never create one per renderer/mesh.
 - The mesh dirty-signature cache must stay **Float64** — storing the compared
@@ -103,14 +114,12 @@ README.md for architecture and measured numbers.
 
 ## Known backlog
 
-- Linux WebKit is the remaining parity outlier, and it is not the texel offset
-  (fixing that halved its raw diff but left the shift-tolerant count alone:
-  1049 → 1042 bad pixels on hoverboard, maxDelta ~233). Those pixels have no
-  in-tolerance match anywhere in the other backend's 3×3, so something real
-  differs between canvas2d and GL under that software rasterizer — additive
-  blend and premultiplied alpha are the obvious suspects, unmeasured. Its
-  badRatio limit stays 26× looser than everyone else's until this is known.
-  Numbers: ubuntu CI run 32580117738.
+- Linux WebKit is no longer a parity outlier — it was canvas2d drawing the
+  whole atlas page per triangle, and the source sub-rect above retired both the
+  residue and that platform's 26×-looser badRatio limit. What stays open is
+  **why**: the mechanism inside that rasterizer is not identified, and it
+  reproduces on the CI runner only. `PARITY_DUMP=1` is the instrument if it
+  resurfaces.
 - The loaders read JSON exports only. Binary (`.skel`) would mean importing
   `SkeletonBinary`, which every user of the loader would then carry — so it
   belongs in a separate entry point rather than a branch, and the seam for it

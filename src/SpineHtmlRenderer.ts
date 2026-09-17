@@ -456,7 +456,8 @@ export class SpineHtmlRenderer {
   /**
    * Standard canvas triangle texture mapping (same math as the official
    * spine-canvas renderer): derive the affine that sends the triangle's
-   * texture-space corners to its screen-space corners, clip, draw the page.
+   * texture-space corners to its screen-space corners, clip, draw the page —
+   * but only the part of the page this triangle can show (see below).
    *
    * The clip polygon is expanded outward from the centroid by a fraction of
    * a pixel. Browsers that antialias clip paths (Safari) otherwise leave
@@ -464,6 +465,43 @@ export class SpineHtmlRenderer {
    * into the neighbouring triangle, and since the texture is continuous
    * across the shared edge the overlap draws the same pixels — cracks close
    * with no visible cost. The texture-mapping affine itself stays exact.
+   *
+   * ## Why a source sub-rect instead of the whole page
+   *
+   * The draw is a 9-argument `drawImage` whose source rect covers exactly what
+   * the clip can reveal, placed at the same texture-space position, so the
+   * mapping is identical to drawing the whole page — the same affine, the same
+   * texels, only fewer of them offered to the rasterizer.
+   *
+   * That is not an optimization. Linux WebKit — the software rasterizer, the
+   * only engine this has been observed on; Chromium and macOS WebKit never show
+   * it — garbles individual triangles when the whole page is drawn under a
+   * steep per-triangle affine: read off the parity dump, head/goggles/foot
+   * triangles land with displaced texture while the webgl capture of the same
+   * pose stays clean. Switching this one call to a source sub-rect — the only
+   * variable changed — took that platform's bad-pixel counts from 1042 to 2
+   * (hoverboard), 231 to 4 (portal) and 803 to 3 (walk + tint), and left every
+   * Chromium capture byte-identical. [measured on the ubuntu CI runner, with a
+   * fixed 2-texel pad standing in for the derived rect below.] WHY that
+   * rasterizer garbles the whole-page form is not identified; steep affines
+   * making whole-page coordinates large is a suspicion, not a measurement. The
+   * sub-rect sidesteps it. (Moving `clip()` before `transform()` was tried as a
+   * separate one-variable experiment: every number came back identical, so the
+   * clip path is not the cause.)
+   *
+   * ## How the sub-rect is derived
+   *
+   * It must provably cover everything the clip can reveal, which is the
+   * *expanded* polygon, not the triangle. So each clip corner's canvas-space
+   * displacement is pushed back through the inverse of the 2×2 affine into
+   * texture space, the bounding box is taken over the displaced corners, one
+   * texel of bilinear support is added, and the result is floor/ceil'd to texel
+   * boundaries (so the sub-rect itself resamples nothing) and clamped to the
+   * page. A fixed pad would not do: the texture-space reach of the expansion is
+   * `triangleExpand` times the local texels-per-canvas-unit, which on the
+   * demo's own meshes ranges from ~0.26 texels on a typical triangle to ~8.6 on
+   * a foreshortened one. Under-padding lets the rim of the overdraw sample
+   * nothing, which brings back the very seams the overdraw exists to close.
    *
    * No half-texel offset is applied to the incoming u/v: the `(i + 0.5) / size`
    * texel-centre convention belongs to *sampling* (landing inside the intended
@@ -482,32 +520,70 @@ export class SpineHtmlRenderer {
     const cx = (x0 + x1 + x2) / 3;
     const cy = (y0 + y1 + y2) / 3;
     const expand = this.triangleExpand;
+    const [px0, py0] = expandPoint(x0, y0, cx, cy, expand);
+    const [px1, py1] = expandPoint(x1, y1, cx, cy, expand);
+    const [px2, py2] = expandPoint(x2, y2, cx, cy, expand);
     ctx.beginPath();
-    ctx.moveTo(...expandPoint(x0, y0, cx, cy, expand));
-    ctx.lineTo(...expandPoint(x1, y1, cx, cy, expand));
-    ctx.lineTo(...expandPoint(x2, y2, cx, cy, expand));
+    ctx.moveTo(px0, py0);
+    ctx.lineTo(px1, py1);
+    ctx.lineTo(px2, py2);
     ctx.closePath();
 
-    x1 -= x0; y1 -= y0;
-    x2 -= x0; y2 -= y0;
-    u1 -= u0; v1 -= v0;
-    u2 -= u0; v2 -= v0;
+    // Edge vectors, in canvas space and in texture space.
+    const ex1 = x1 - x0, ey1 = y1 - y0;
+    const ex2 = x2 - x0, ey2 = y2 - y0;
+    const eu1 = u1 - u0, ev1 = v1 - v0;
+    const eu2 = u2 - u0, ev2 = v2 - v0;
 
-    let det = u1 * v2 - u2 * v1;
+    let det = eu1 * ev2 - eu2 * ev1;
     if (det === 0) return;
     det = 1 / det;
 
-    const a = (v2 * x1 - v1 * x2) * det;
-    const b = (v2 * y1 - v1 * y2) * det;
-    const c = (u1 * x2 - u2 * x1) * det;
-    const d = (u1 * y2 - u2 * y1) * det;
+    const a = (ev2 * ex1 - ev1 * ex2) * det;
+    const b = (ev2 * ey1 - ev1 * ey2) * det;
+    const c = (eu1 * ex2 - eu2 * ex1) * det;
+    const d = (eu1 * ey2 - eu2 * ey1) * det;
     const e = x0 - a * u0 - c * v0;
     const f = y0 - b * u0 - d * v0;
+
+    // Texture-space bounds of the clip polygon. The triangle's own corners
+    // first, then the three expansion offsets carried back through the inverse
+    // of [[a, c], [b, d]] — the clip reaches exactly that far and no further.
+    let minU = Math.min(u0, u1, u2);
+    let maxU = Math.max(u0, u1, u2);
+    let minV = Math.min(v0, v1, v2);
+    let maxV = Math.max(v0, v1, v2);
+    const detM = a * d - b * c;
+    if (detM !== 0) {
+      const im = 1 / detM;
+      const ia = d * im, ic = -c * im, ib = -b * im, id = a * im;
+      let gx = px0 - x0, gy = py0 - y0;
+      let tu = u0 + ia * gx + ic * gy, tv = v0 + ib * gx + id * gy;
+      minU = Math.min(minU, tu); maxU = Math.max(maxU, tu);
+      minV = Math.min(minV, tv); maxV = Math.max(maxV, tv);
+      gx = px1 - x1; gy = py1 - y1;
+      tu = u1 + ia * gx + ic * gy; tv = v1 + ib * gx + id * gy;
+      minU = Math.min(minU, tu); maxU = Math.max(maxU, tu);
+      minV = Math.min(minV, tv); maxV = Math.max(maxV, tv);
+      gx = px2 - x2; gy = py2 - y2;
+      tu = u2 + ia * gx + ic * gy; tv = v2 + ib * gx + id * gy;
+      minU = Math.min(minU, tu); maxU = Math.max(maxU, tu);
+      minV = Math.min(minV, tv); maxV = Math.max(maxV, tv);
+    }
+    // One texel of bilinear support on every side, snapped outward to texel
+    // boundaries, clamped to the page. Source rect and destination rect are the
+    // same rect in texture space, so the affine below maps it exactly as it
+    // mapped the whole page.
+    const sx = Math.max(0, Math.floor(minU - 1));
+    const sy = Math.max(0, Math.floor(minV - 1));
+    const sw = Math.min(img.width, Math.ceil(maxU + 1)) - sx;
+    const sh = Math.min(img.height, Math.ceil(maxV + 1)) - sy;
+    if (!(sw > 0) || !(sh > 0)) return;
 
     ctx.save();
     ctx.transform(a, b, c, d, e, f);
     ctx.clip();
-    ctx.drawImage(img, 0, 0);
+    ctx.drawImage(img, sx, sy, sw, sh, sx, sy, sw, sh);
     ctx.restore();
   }
 
