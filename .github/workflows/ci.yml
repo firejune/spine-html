@@ -14,6 +14,16 @@ on:
   # workflow, so the release branch can be tested on demand from the Actions
   # tab instead. See RELEASING.md.
   workflow_dispatch:
+    inputs:
+      parity_dump:
+        # The parity diff counts bad pixels but cannot say where they are, and
+        # the one platform whose residue is unexplained (linux WebKit) exists
+        # only on this runner. With this on, every parity cell also writes the
+        # two captures, a red/yellow diff mask and metrics.json, and the run
+        # uploads them green or red. See the header of tests/parity.spec.ts.
+        description: 'Dump parity captures + diff masks as an artifact'
+        type: boolean
+        default: false
 
 jobs:
   test:
@@ -25,9 +35,32 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bunx playwright install --with-deps chromium webkit
       - run: bun run test
+        env:
+          # Empty on push / pull_request — the spec only dumps on the exact
+          # string "1", so those runs are the unchanged default path.
+          PARITY_DUMP: ${{ github.event_name == 'workflow_dispatch' && inputs.parity_dump && '1' || '' }}
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: test-results
+          path: test-results/
+          if-no-files-found: ignore
+      # The dump is the point of such a run, so it must be uploaded whether the
+      # suite ends green or red. Two Actions rules shape the condition:
+      #   1. a step `if:` with no status function means `success() && <expr>`,
+      #      so the dispatch clause alone would skip the upload exactly when
+      #      the suite failed — the run most worth looking at;
+      #   2. ANY status function in the expression removes that implicit
+      #      success(), so the outcome guard has to be spelled out — hence
+      #      `(success() || failure())`.
+      # It is ANDed with the dispatch clause rather than written as
+      # `failure() || <dispatch clause>` so that ordinary push/pull_request
+      # failures do not also upload under a name promising a dump they do not
+      # contain. Those events keep exactly today's behaviour: the
+      # `test-results` upload above, on failure only.
+      - if: ${{ (success() || failure()) && github.event_name == 'workflow_dispatch' && inputs.parity_dump }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-dump
           path: test-results/
           if-no-files-found: ignore
