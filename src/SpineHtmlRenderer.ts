@@ -481,8 +481,9 @@ export class SpineHtmlRenderer {
    * pose stays clean. Switching this one call to a source sub-rect — the only
    * variable changed — took that platform's bad-pixel counts from 1042 to 2
    * (hoverboard), 231 to 4 (portal) and 803 to 3 (walk + tint), and left every
-   * Chromium capture byte-identical. [measured on the ubuntu CI runner, with a
-   * fixed 2-texel pad standing in for the derived rect below.] WHY that
+   * Chromium capture byte-identical. [measured on the ubuntu CI runner through
+   * PARITY_DUMP: first with a fixed 2-texel pad (run 35209262693), then with
+   * the derived rect below — the same counts (run 35213286993).] WHY that
    * rasterizer garbles the whole-page form is not identified; steep affines
    * making whole-page coordinates large is a suspicion, not a measurement. The
    * sub-rect sidesteps it. (Moving `clip()` before `transform()` was tried as a

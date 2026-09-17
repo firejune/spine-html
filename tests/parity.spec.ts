@@ -128,8 +128,10 @@ const CHANNEL_TOLERANCE = 24;
  * position, see drawTriangle — takes those floors to hoverboard 2 bad pixels
  * (0.009%, maxDelta 233 → 30), portal 4, walk+tint 3, with every Chromium
  * capture byte-identical. [measured on the ubuntu CI runner through
- * PARITY_DUMP, with a fixed 2-texel pad standing in for the derived pad that
- * shipped; the mechanism inside that rasterizer is still not identified.]
+ * PARITY_DUMP: run 35209262693 with a fixed 2-texel pad, run 35213286993 with
+ * the derived pad that shipped — identical counts, and the whole suite green
+ * there under this one limit; the mechanism inside that rasterizer is still
+ * not identified.]
  */
 const BAD_RATIO_LIMIT = 0.005;
 /**
