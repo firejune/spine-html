@@ -148,12 +148,48 @@ assets.dispose();
 `spine-html` is a third-party renderer and is not affiliated with or endorsed by
 Esoteric Software.
 
+### One atlas, several skeletons
+
+Skeletons that share an atlas — a character's `-ess` and `-pro` exports, a whole
+cast packed onto one page — load in two steps instead. Calling
+`loadSkeletonAssets` once per skeleton would fetch and unpack the same pages
+again and mint a second set of region blob URLs:
+
+```ts
+import { loadAtlasAssets, loadSkeletonJson, SpineHtmlRenderer } from 'spine-html';
+
+const shared = await loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' });
+const [essData, proData] = await Promise.all([
+  loadSkeletonJson(shared, '/spineboy/spineboy-ess.json'),
+  loadSkeletonJson(shared, '/spineboy/spineboy-pro.json'),
+]);
+
+const ess = new SpineHtmlRenderer(essRoot, shared.regionImages);
+const pro = new SpineHtmlRenderer(proRoot, shared.regionImages);
+
+// Unloading: every renderer first, then the one dispose() that owns the bitmaps.
+ess.dispose();
+pro.dispose();
+shared.dispose();
+```
+
+`loadAtlasAssets` takes the atlas half of the options above (`resolvePage`,
+`crossOrigin`, `fetch`) and `loadSkeletonJson` the skeleton half (`scale`,
+`fetch`). Ownership is the thing to keep straight: the atlas assets belong to
+the caller, reading a skeleton against them never frees them, and one
+`regionImages` map is meant to be handed to several renderers — so there is
+exactly one `dispose()` for however many skeletons were read. `loadSkeletonJson`
+asks only for `{ atlas }`, so a caller that built its atlas by hand (below) can
+still use it for the read. `loadSkeletonAssets` is these two calls with the
+atlas half kept private: use it for one atlas and one skeleton, this for the
+rest.
+
 ### Loading it yourself
 
 `loadSkeletonAssets` is optional sugar over five `spine-core` calls, and the
 package works without it. Drop to the low-level path whenever you need
-something it does not do — one atlas shared by several skeletons, a binary
-export, images that are already in memory:
+something neither loader does — a binary export, images that are already in
+memory, an atlas that is not fetched from a URL at all:
 
 ```ts
 import { TextureAtlas, AtlasAttachmentLoader, SkeletonJson }

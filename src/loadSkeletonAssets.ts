@@ -4,7 +4,8 @@ import {
   SkeletonJson,
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
-import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from './DomTexture';
+import type { RegionImage } from './DomTexture';
+import { fetchText, type LoadAtlasAssetsOptions, loadAtlasAssets } from './loadAtlasAssets';
 
 /**
  * Optional convenience loader: fetch a skeleton export and its atlas, attach
@@ -14,31 +15,24 @@ import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from './Do
  * deliberately the *only* thing this module does — it owns no frame loop, no
  * AnimationState, no layout, and it is not on the renderer's path, so the
  * low-level route (TextureAtlas + DomTexture + unpackRegions by hand) stays
- * the way to do anything this does not cover: sharing one atlas across
- * several skeletons, binary (.skel) exports, images that come from somewhere
- * other than a URL. Nothing else in the package imports this file, so a
- * bundler drops it when it is unused.
+ * the way to do anything this does not cover: binary (.skel) exports, images
+ * that come from somewhere other than a URL. Sharing one atlas across several
+ * skeletons has its own seam: `loadAtlasAssets` (loadAtlasAssets.ts) plus one
+ * `loadSkeletonJson` per skeleton, which is what this function is built on.
+ * Nothing else in the package imports this file, so a bundler drops it when it
+ * is unused.
  */
 
-export interface LoadSkeletonAssetsOptions {
-  /** URL of the atlas (.atlas) export. */
-  atlasUrl: string;
+export interface LoadSkeletonAssetsOptions extends LoadAtlasAssetsOptions {
   /** URL of the skeleton JSON (.json) export. */
   skeletonUrl: string;
-  /**
-   * Maps an atlas page name to the URL its image lives at. Defaults to
-   * resolving the page name against the atlas URL's directory, which is what
-   * a Spine editor export next to its atlas needs.
-   */
-  resolvePage?: (pageName: string, atlasUrl: string) => string;
   /** SkeletonJson.scale — scales the skeleton as it is read. */
   scale?: number;
-  /**
-   * crossOrigin attribute for the page images. Needed when the images come
-   * from another origin: the region cut reads them into a canvas, and a
-   * tainted canvas cannot be exported (SecurityError from toBlob).
-   */
-  crossOrigin?: string;
+}
+
+export interface LoadSkeletonJsonOptions {
+  /** SkeletonJson.scale — scales the skeleton as it is read. */
+  scale?: number;
   /** fetch implementation, for custom headers or a test double. */
   fetch?: typeof globalThis.fetch;
 }
@@ -58,24 +52,37 @@ export interface SkeletonAssets {
   dispose(): void;
 }
 
-function resolveAgainstAtlas(pageName: string, atlasUrl: string): string {
-  return new URL(pageName, new URL(atlasUrl, document.baseURI)).href;
+function readSkeletonData(atlas: TextureAtlas, text: string, scale?: number): SkeletonData {
+  const json = new SkeletonJson(new AtlasAttachmentLoader(atlas));
+  if (scale !== undefined) json.scale = scale;
+  return json.readSkeletonData(text);
 }
 
-async function fetchText(fetchImpl: typeof globalThis.fetch, url: string): Promise<string> {
-  const response = await fetchImpl(url);
-  if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
-  return response.text();
-}
-
-function loadImage(url: string, crossOrigin?: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const image = new Image();
-    if (crossOrigin !== undefined) image.crossOrigin = crossOrigin;
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error(`Failed to load atlas page image: ${url}`));
-    image.src = url;
-  });
+/**
+ * Reads one skeleton JSON export against already-loaded atlas assets — the
+ * second step of the shared-atlas path.
+ *
+ * ```ts
+ * const shared = await loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' });
+ * const [ess, pro] = await Promise.all([
+ *   loadSkeletonJson(shared, '/spineboy/spineboy-ess.json'),
+ *   loadSkeletonJson(shared, '/spineboy/spineboy-pro.json'),
+ * ]);
+ * ```
+ *
+ * `assets` needs nothing but a parsed atlas with its page textures attached,
+ * so a caller on the low-level path can pass its own `{ atlas }`. Ownership
+ * stays with the caller: this never disposes `assets`, whether it succeeds or
+ * throws, because the same assets normally back several skeletons.
+ */
+export async function loadSkeletonJson(
+  assets: { atlas: TextureAtlas },
+  skeletonUrl: string,
+  options: LoadSkeletonJsonOptions = {},
+): Promise<SkeletonData> {
+  const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
+  const text = await fetchText(fetchImpl, skeletonUrl);
+  return readSkeletonData(assets.atlas, text, options.scale);
 }
 
 /**
@@ -91,53 +98,42 @@ function loadImage(url: string, crossOrigin?: string): Promise<HTMLImageElement>
  * // …later: renderer.dispose(); assets.dispose();
  * ```
  *
- * Page images load in parallel. If anything fails part-way, no blob URL is
- * left behind.
+ * One atlas, one skeleton. Several skeletons sharing one atlas is the two-step
+ * path instead (`loadAtlasAssets` + `loadSkeletonJson`), which this is built
+ * on — calling this once per skeleton would refetch and re-unpack the atlas.
+ *
+ * Page images load in parallel, and the skeleton export downloads alongside
+ * the atlas half. If anything fails part-way, no blob URL is left behind.
  */
 export async function loadSkeletonAssets(
   options: LoadSkeletonAssetsOptions,
 ): Promise<SkeletonAssets> {
-  const { atlasUrl, skeletonUrl, crossOrigin, scale } = options;
   const fetchImpl = options.fetch ?? globalThis.fetch.bind(globalThis);
-  const resolvePage = options.resolvePage ?? resolveAgainstAtlas;
 
-  const [atlasText, skeletonText] = await Promise.all([
-    fetchText(fetchImpl, atlasUrl),
-    fetchText(fetchImpl, skeletonUrl),
-  ]);
+  // Started before the atlas half is awaited, so the two downloads overlap.
+  const skeletonText = fetchText(fetchImpl, options.skeletonUrl);
+  // The atlas half can throw first and leave this rejection unobserved until
+  // the catch below, which is an unhandled rejection in between. A no-op
+  // handler marks it observed; the value/error is still read from the promise.
+  skeletonText.catch(() => {});
 
-  const atlas = new TextureAtlas(atlasText);
-  const pageImages = new Map<string, HTMLImageElement>();
-  await Promise.all(
-    atlas.pages.map(async (page) => {
-      const image = await loadImage(resolvePage(page.name, atlasUrl), crossOrigin);
-      page.setTexture(new DomTexture(image));
-      pageImages.set(page.name, image);
-    }),
-  );
-
-  const regionImages = await unpackRegions(atlas, pageImages);
+  const assets = await loadAtlasAssets(options);
   let data: SkeletonData;
   try {
-    const json = new SkeletonJson(new AtlasAttachmentLoader(atlas));
-    if (scale !== undefined) json.scale = scale;
-    data = json.readSkeletonData(skeletonText);
+    data = readSkeletonData(assets.atlas, await skeletonText, options.scale);
   } catch (error) {
-    // Reading the skeleton is the one step after the regions exist, so it is
-    // the one step that could strand them.
-    revokeRegions(regionImages);
+    // The regions exist by now, so the skeleton half is the one step that
+    // could strand them — whether the fetch failed or the read did.
+    assets.dispose();
     throw error;
   }
 
-  let disposed = false;
   return {
-    atlas,
+    atlas: assets.atlas,
     data,
-    regionImages,
+    regionImages: assets.regionImages,
     dispose(): void {
-      if (disposed) return;
-      disposed = true;
-      revokeRegions(regionImages);
+      assets.dispose();
     },
   };
 }

@@ -60,11 +60,14 @@ README.md for architecture and measured numbers.
   the caller's too, so nothing here nulls `page.texture` or drops a page to
   reclaim memory (the reason step 2 of #7 was declined); a page goes when the
   caller drops the atlas and the skeleton data that reach it.
-- `loadSkeletonAssets` is a convenience layer, not a dependency: nothing else
-  in `src/` imports it, so it tree-shakes away. Keep it that way, and keep the
-  low-level path (TextureAtlas + DomTexture + unpackRegions) fully usable on
-  its own — the shapes it does not cover are real (one atlas across several
-  skeletons, in-memory images).
+- The loaders (`loadAtlasAssets.ts`, `loadSkeletonAssets.ts`) are a convenience
+  layer, not a dependency: nothing else in `src/` imports them — only
+  `loadSkeletonAssets.ts` imports `loadAtlasAssets.ts` — so both tree-shake
+  away. Keep it that way, and keep the low-level path (TextureAtlas +
+  DomTexture + unpackRegions) fully usable on its own — the shapes they do not
+  cover are real (in-memory images, an atlas that is not fetched from a URL).
+  `loadAtlasAssets.ts` must not import a skeleton reader: it is the seam a
+  binary loader would sit on, and its users must not carry the JSON parser.
 
 ## Testing
 
@@ -108,9 +111,8 @@ README.md for architecture and measured numbers.
   blend and premultiplied alpha are the obvious suspects, unmeasured. Its
   badRatio limit stays 26× looser than everyone else's until this is known.
   Numbers: ubuntu CI run 32580117738.
-- `loadSkeletonAssets` reads JSON exports only. Binary (`.skel`) would mean
-  importing `SkeletonBinary`, which every user of the loader would then carry —
-  worth a separate entry point rather than a branch, if it is ever asked for.
-- `loadSkeletonAssets` is one atlas per skeleton. Sharing one atlas across
-  several skeletons (what the demo does) still needs the low-level path; a
-  `skeletonUrls: string[]` variant would cover it without double-unpacking.
+- The loaders read JSON exports only. Binary (`.skel`) would mean importing
+  `SkeletonBinary`, which every user of the loader would then carry — so it
+  belongs in a separate entry point rather than a branch, and the seam for it
+  already exists: `loadAtlasAssets` for the atlas half, a `loadSkeletonBinary`
+  beside `loadSkeletonJson` for the read.
