@@ -15,6 +15,8 @@ import {
   SpineHtmlRenderer,
   unpackRegions,
 } from '../src/index';
+import type { SkeletonData } from '@esotericsoftware/spine-core';
+import { loadSkeletonBinary } from '../src/binary';
 import { getMeshGlBlitter } from '../src/MeshGlBlitter';
 
 /**
@@ -160,6 +162,7 @@ export interface SpineHtmlHarness {
   scaledStageProbe(): Promise<ScaledStageProbeResult>;
   loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult>;
   sharedAtlasProbe(): Promise<SharedAtlasProbeResult>;
+  binaryProbe(): Promise<BinaryProbeResult>;
 }
 
 declare global {
@@ -1231,6 +1234,174 @@ async function glTextureProbe(): Promise<GlTextureProbeResult> {
   };
 }
 
+/** One skeleton read, described in the terms both formats must agree on. */
+export interface BinaryReadSummary {
+  /** Animation names, sorted — order is a format detail, the set is not. */
+  animations: string[];
+  boneCount: number;
+  slotCount: number;
+  /** Skin names, sorted. */
+  skins: string[];
+  /** <img>/<canvas> one frame of the deterministic pose put in its own root. */
+  imageCount: number;
+  canvasCount: number;
+}
+
+export interface BinaryProbeResult {
+  /** Object URLs minted while loadAtlasAssets ran — the atlas half, cut once. */
+  createdUrls: string[];
+  /** Object URLs minted while the two skeletons were read: reading owns none. */
+  skeletonCreatedUrls: string[];
+  regionCount: number;
+  /** The A/B pair: the same export read from .skel and from .json. */
+  binary: BinaryReadSummary;
+  json: BinaryReadSummary;
+  /** Bone whose setup length carries the scale check, and what it measured. */
+  scaleBone: string;
+  scaleFactor: number;
+  unscaledBoneLength: number;
+  scaledBoneLength: number;
+  /** A read whose body is not a .skel: it must reject and revoke nothing. */
+  badReadMessage: string;
+  badReadRevokedUrls: string[];
+  /** The same, through a fetch double answering the skeleton URL with 404. */
+  httpMessage: string;
+  httpCreatedUrls: string[];
+  httpRevokedUrls: string[];
+  /** Sampled after both failed reads, so a read that disposed shows up here. */
+  aliveBefore: Record<string, boolean>;
+  /** Object URLs revoked by shared.dispose(), which is called twice. */
+  revokedUrls: string[];
+  aliveAfter: Record<string, boolean>;
+}
+
+/**
+ * Binary (.skel) exports through the separate `spine-html/binary` entry.
+ *
+ * The oracle is A/B inside one run: the JSON read of the *same* export, against
+ * the *same* atlas assets. A binary reader that parsed something subtly
+ * different would still produce a plausible skeleton on its own, so nothing
+ * here is compared against a recorded number — every claim is an equality
+ * between the two formats, except the scale check, which is an equality
+ * against the unscaled read of the binary itself.
+ *
+ * The pose is the deterministic one the other probes use (walk, t = 1.2).
+ */
+async function binaryProbe(): Promise<BinaryProbeResult> {
+  const load = await trackObjectUrls(() =>
+    loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' }),
+  );
+  const shared = load.result;
+
+  // Reading a skeleton owns no bitmaps, in either format: these mint nothing.
+  const read = await trackObjectUrls(() =>
+    Promise.all([
+      loadSkeletonBinary(shared, '/spineboy/spineboy-pro.skel'),
+      loadSkeletonJson(shared, '/spineboy/spineboy-pro.json'),
+    ]),
+  );
+  const [binaryData, jsonData] = read.result;
+
+  /** Poses the data for one frame in a root of its own and describes both. */
+  function summarize(data: SkeletonData): BinaryReadSummary {
+    const root = document.createElement('div');
+    root.style.cssText = 'position: absolute; left: 0; top: 0';
+    document.body.append(root);
+    const skeleton = new Skeleton(data);
+    const state = new AnimationState(new AnimationStateData(data));
+    state.setAnimation(0, 'walk', true);
+    state.update(1.2);
+    state.apply(skeleton);
+    skeleton.update(1.2);
+    skeleton.updateWorldTransform(Physics.update);
+    const renderer = new SpineHtmlRenderer(root, shared.regionImages);
+    renderer.render(skeleton);
+    const summary = {
+      animations: data.animations.map((animation) => animation.name).sort(),
+      boneCount: data.bones.length,
+      slotCount: data.slots.length,
+      skins: data.skins.map((skin) => skin.name).sort(),
+      imageCount: root.querySelectorAll('img').length,
+      canvasCount: root.querySelectorAll('canvas').length,
+    };
+    renderer.dispose();
+    root.remove();
+    return summary;
+  }
+
+  const binary = summarize(binaryData);
+  const json = summarize(jsonData);
+
+  // scale: a setup length is the concrete number to halve. Bone lengths are
+  // read straight off the export, so this is the reader's scale and nothing
+  // else — no world transform, no renderer, no layout.
+  const scaleBone = 'torso';
+  const scaleFactor = 0.5;
+  const lengthOf = (data: SkeletonData): number => {
+    const bone = data.bones.find((candidate) => candidate.name === scaleBone);
+    if (!bone) throw new Error(`bone not found: ${scaleBone}`);
+    return bone.length;
+  };
+  const halfData = await loadSkeletonBinary(shared, '/spineboy/spineboy-pro.skel', {
+    scale: scaleFactor,
+  });
+
+  // Ownership, both failure shapes: the assets are the caller's, so a read
+  // that throws must leave them whole — the skeletons already read from them
+  // are still using the bitmaps. aliveBefore is sampled after both failures.
+  const badRead = await trackObjectUrls(async () => {
+    try {
+      await loadSkeletonBinary(shared, '/spineboy/spineboy.atlas');
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+
+  const notFound: typeof globalThis.fetch = (input, init) => {
+    const url = String(input instanceof Request ? input.url : input);
+    if (url.endsWith('.skel')) {
+      return Promise.resolve(new Response('', { status: 404, statusText: 'Not Found' }));
+    }
+    return fetch(input, init);
+  };
+  const httpRead = await trackObjectUrls(async () => {
+    try {
+      await loadSkeletonBinary(shared, '/spineboy/spineboy-pro.skel', { fetch: notFound });
+      return '';
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+
+  const aliveBefore = await alive(load.created);
+  // Twice: dispose() is documented as idempotent.
+  const release = await trackObjectUrls(async () => {
+    shared.dispose();
+    shared.dispose();
+  });
+
+  return {
+    createdUrls: load.created,
+    skeletonCreatedUrls: read.created,
+    regionCount: shared.regionImages.size,
+    binary,
+    json,
+    scaleBone,
+    scaleFactor,
+    unscaledBoneLength: lengthOf(binaryData),
+    scaledBoneLength: lengthOf(halfData),
+    badReadMessage: badRead.result,
+    badReadRevokedUrls: badRead.revoked,
+    httpMessage: httpRead.result,
+    httpCreatedUrls: httpRead.created,
+    httpRevokedUrls: httpRead.revoked,
+    aliveBefore,
+    revokedUrls: release.revoked,
+    aliveAfter: await alive(load.created),
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -1242,4 +1413,5 @@ window.spineHtmlHarness = {
   scaledStageProbe,
   loaderHttpFailureProbe,
   sharedAtlasProbe,
+  binaryProbe,
 };

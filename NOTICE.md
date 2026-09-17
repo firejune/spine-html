@@ -14,6 +14,7 @@ redistribution includes the Spine Runtimes license and copyright notice.
 
 ## Example assets
 
-The spineboy skeleton, atlas, and images used by the demo are owned by Esoteric
-Software. They are **not redistributed** in this repository; `scripts/fetch-assets.sh`
-downloads them from the official spine-runtimes repository for local evaluation.
+The spineboy skeleton exports (JSON and binary), atlas, and images used by the demo
+and the tests are owned by Esoteric Software. They are **not redistributed** in this
+repository; `scripts/fetch-assets.sh` downloads them from the official spine-runtimes
+repository for local evaluation.
