@@ -165,6 +165,12 @@ export class SpineHtmlRenderer {
   private readonly views = new Map<Slot, SlotView>();
   private readonly pendingJobs: MeshBlitJob[] = [];
   private readonly pendingViews: SlotView[] = [];
+  /**
+   * Atlas page images this renderer has retained from the shared blitter,
+   * one retain each. Allocated on the first webgl mesh job, so a renderer
+   * that never leaves canvas2d holds nothing and gives nothing back.
+   */
+  private glPages: Set<HTMLImageElement> | null = null;
   private scratchVertices = new Float32Array(256);
   private tintDefs: SVGSVGElement | null = null;
 
@@ -314,16 +320,31 @@ export class SpineHtmlRenderer {
 
   /**
    * Removes every element this renderer added to the root (slot elements and
-   * the tint filter defs). The region bitmaps are deliberately untouched: the
-   * map is the caller's, and one map is normally shared by many renderers
-   * (disposing one instance must not blind the others). Free the unpacked
-   * blob URLs with revokeRegions() once no renderer needs them.
+   * the tint filter defs), and hands the atlas pages it uploaded back to the
+   * shared GL blitter — the one resource here that outlives the instance, so
+   * the one that has to be given back explicitly (GPU memory, and no garbage
+   * collector feels pressure from it). The pages are reference-counted there:
+   * a page another live renderer still draws stays uploaded, and the texture
+   * is deleted only when the last user of it is disposed.
+   *
+   * The region bitmaps are deliberately untouched: the map is the caller's,
+   * and one map is normally shared by many renderers (disposing one instance
+   * must not blind the others). Free the unpacked blob URLs with
+   * revokeRegions() once no renderer needs them.
+   *
+   * Idempotent: the retained-page ledger is cleared here, so a second call
+   * releases nothing a second time.
    */
   dispose(): void {
     for (const view of this.views.values()) view.el.remove();
     this.views.clear();
     this.tintDefs?.remove();
     this.tintDefs = null;
+    if (this.glPages) {
+      const blitter = getMeshGlBlitter();
+      if (blitter) for (const page of this.glPages) blitter.release(page);
+      this.glPages = null;
+    }
   }
 
   // --- rigid tier -----------------------------------------------------------
@@ -506,6 +527,7 @@ export class SpineHtmlRenderer {
           height: Math.min(view.canvasH, Math.ceil(h * ratio)),
         });
         this.pendingViews.push(view);
+        this.retainPage(page);
       } else {
         this.rasterizeMesh2d(canvas, page, rel, uvs, triangles, ratio);
       }
@@ -514,6 +536,24 @@ export class SpineHtmlRenderer {
     }
 
     this.applyCommon(view, slot, pose, attachment.color, skeleton, zIndex);
+  }
+
+  /**
+   * Declares this renderer a user of `page` with the shared blitter, once per
+   * page — the counterpart of the release in dispose(). The set is this
+   * renderer's own ledger, so sharing one page across renderers works by
+   * counting rather than by guessing. On the render path this costs one
+   * Set.has per queued mesh job and allocates nothing after the first page.
+   */
+  private retainPage(page: HTMLImageElement): void {
+    const pages = (this.glPages ??= new Set<HTMLImageElement>());
+    if (pages.has(page)) return;
+    // Null only if the context died between the backend pick and here; the
+    // flush then fails too and the batch falls back to canvas2d.
+    const blitter = getMeshGlBlitter();
+    if (!blitter) return;
+    pages.add(page);
+    blitter.retain(page);
   }
 
   /** The canvas2d raster path: clear the backing, map each triangle. */

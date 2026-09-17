@@ -15,6 +15,7 @@ import {
   SpineHtmlRenderer,
   unpackRegions,
 } from '../src/index';
+import { getMeshGlBlitter } from '../src/MeshGlBlitter';
 
 /**
  * Browser-side test harness (see harness.html).
@@ -154,6 +155,7 @@ export interface SpineHtmlHarness {
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
   loaderProbe(): Promise<LoaderProbeResult>;
   loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
+  glTextureProbe(): Promise<GlTextureProbeResult>;
   backingProbe(): Promise<BackingProbeResult>;
   scaledStageProbe(): Promise<ScaledStageProbeResult>;
   loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult>;
@@ -938,12 +940,304 @@ async function scaledStageProbe(): Promise<ScaledStageProbeResult> {
   };
 }
 
+// --- webgl page-texture lifetime -------------------------------------------
+
+/**
+ * The shared GL blitter outlives every renderer, so its page textures are the
+ * one thing a consumer cannot free by dropping objects. They are
+ * reference-counted per page instead, and this probe drives the lifetime from
+ * the outside: load, render, dispose, and read the blitter's live-texture
+ * count at each step. The count is the oracle because GPU memory is not
+ * observable from script — see tests/gl-textures.spec.ts for the assertions.
+ */
+
+const GL_SKELETON = {
+  atlasUrl: '/spineboy/spineboy.atlas',
+  skeletonUrl: '/spineboy/spineboy-pro.json',
+};
+
+type LoadedAssets = Awaited<ReturnType<typeof loadSkeletonAssets>>;
+
+export interface GlCycleSample {
+  before: number;
+  afterRender: number;
+  afterRendererDispose: number;
+  afterAssetsDispose: number;
+  backendActive: string;
+  meshPixels: number;
+}
+
+export interface GlSharingSample {
+  afterBothRendered: number;
+  /** Read before the survivor redraws: the page must still be uploaded. */
+  afterFirstDispose: number;
+  afterSecondRender: number;
+  afterSecondDispose: number;
+  pixelsBeforeFirstDispose: number;
+  pixelsAfterFirstDispose: number;
+  /** Meshes the survivor re-rasterized — 0 would mean the redraw was skipped. */
+  meshesRedrawn: number;
+}
+
+export interface GlIdempotenceSample {
+  afterBothRendered: number;
+  afterFirstDispose: number;
+  afterFirstDisposedTwice: number;
+  afterSecondDispose: number;
+  loneAfterRender: number;
+  loneAfterDisposedTwice: number;
+}
+
+export interface GlCanvas2dSample {
+  before: number;
+  afterRender: number;
+  afterDispose: number;
+  backendActive: string;
+  meshPixels: number;
+}
+
+export interface GlReuseSample {
+  beforeNewRenderer: number;
+  afterNewRendererRender: number;
+  afterDispose: number;
+  backendActive: string;
+  meshPixels: number;
+}
+
+export interface GlTextureProbeResult {
+  /** False when this engine has no WebGL at all — the spec then skips loudly. */
+  webglAvailable: boolean;
+  /** Live page textures before the probe ran (0 on a fresh page). */
+  baseline: number;
+  cycles: GlCycleSample[];
+  sharing: GlSharingSample | null;
+  idempotence: GlIdempotenceSample | null;
+  canvas2dOnly: GlCanvas2dSample | null;
+  reuse: GlReuseSample | null;
+  /** Live page textures once every renderer above is disposed. */
+  final: number;
+}
+
+/** Live GL page textures, or -1 if the shared context died mid-probe. */
+function liveGlTextures(): number {
+  return getMeshGlBlitter()?.liveTextureCount ?? -1;
+}
+
+/** One deterministic pose — the same one the loader probe renders. */
+function posedSkeleton(assets: LoadedAssets): Skeleton {
+  const skeleton = new Skeleton(assets.data);
+  const state = new AnimationState(new AnimationStateData(assets.data));
+  state.setAnimation(0, 'walk', true);
+  state.update(1.2);
+  state.apply(skeleton);
+  skeleton.update(1.2);
+  skeleton.updateWorldTransform(Physics.update);
+  return skeleton;
+}
+
+/** A root per renderer: several are alive at once here, unlike #root. */
+function makeGlRoot(): HTMLElement {
+  const root = document.createElement('div');
+  root.style.position = 'absolute';
+  root.style.left = '0';
+  root.style.top = '0';
+  document.body.appendChild(root);
+  return root;
+}
+
+/**
+ * Non-transparent pixels across a root's mesh canvases. "The renderer still
+ * draws" has no counter, so this is its oracle: a released-too-early page
+ * texture would blank (or change) the raster.
+ */
+function meshPixels(root: HTMLElement): number {
+  let count = 0;
+  for (const canvas of root.querySelectorAll('canvas')) {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) continue;
+    const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    for (let i = 3; i < data.length; i += 4) if (data[i] !== 0) count++;
+  }
+  return count;
+}
+
+async function glTextureProbe(): Promise<GlTextureProbeResult> {
+  if (!getMeshGlBlitter()) {
+    return {
+      webglAvailable: false,
+      baseline: 0,
+      cycles: [],
+      sharing: null,
+      idempotence: null,
+      canvas2dOnly: null,
+      reuse: null,
+      final: 0,
+    };
+  }
+  const baseline = liveGlTextures();
+
+  // Load → render → dispose, three times, each with its own page image: on a
+  // blitter that never releases, the count climbs by one per cycle.
+  const cycles: GlCycleSample[] = [];
+  for (let cycle = 0; cycle < 3; cycle++) {
+    const before = liveGlTextures();
+    const assets = await loadSkeletonAssets(GL_SKELETON);
+    const root = makeGlRoot();
+    const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+    renderer.meshBackend = 'webgl';
+    renderer.render(posedSkeleton(assets));
+    const afterRender = liveGlTextures();
+    const backendActive = renderer.meshBackendActive;
+    const pixels = meshPixels(root);
+    renderer.dispose();
+    const afterRendererDispose = liveGlTextures();
+    assets.dispose();
+    const afterAssetsDispose = liveGlTextures();
+    root.remove();
+    cycles.push({
+      before,
+      afterRender,
+      afterRendererDispose,
+      afterAssetsDispose,
+      backendActive,
+      meshPixels: pixels,
+    });
+  }
+
+  // One load for everything below: sharing, idempotence and re-use all turn
+  // on several renderers meeting on the same page image.
+  const assets = await loadSkeletonAssets(GL_SKELETON);
+
+  // Sharing: disposing one user must not take the page from the other.
+  const rootA = makeGlRoot();
+  const rootB = makeGlRoot();
+  const rendererA = new SpineHtmlRenderer(rootA, assets.regionImages);
+  const rendererB = new SpineHtmlRenderer(rootB, assets.regionImages);
+  rendererA.meshBackend = 'webgl';
+  rendererB.meshBackend = 'webgl';
+  const skeletonB = posedSkeleton(assets);
+  rendererA.render(posedSkeleton(assets));
+  rendererB.render(skeletonB);
+  const sharingAfterBoth = liveGlTextures();
+  const pixelsBeforeFirstDispose = meshPixels(rootB);
+  rendererA.dispose();
+  const sharingAfterFirstDispose = liveGlTextures();
+  // Re-dirty every mesh first: reusing last frame's raster would prove
+  // nothing about the texture still being there.
+  rendererB.triangleExpand = 0;
+  rendererB.render(skeletonB);
+  const meshesRedrawn = rendererB.meshCount;
+  const pixelsAfterFirstDispose = meshPixels(rootB);
+  const sharingAfterSecondRender = liveGlTextures();
+  rendererB.dispose();
+  const sharingAfterSecondDispose = liveGlTextures();
+  rootA.remove();
+  rootB.remove();
+
+  // Idempotence, with a second user present so a double release is visible:
+  // without one, the second decrement would find nothing to delete anyway.
+  const rootC = makeGlRoot();
+  const rootD = makeGlRoot();
+  const rendererC = new SpineHtmlRenderer(rootC, assets.regionImages);
+  const rendererD = new SpineHtmlRenderer(rootD, assets.regionImages);
+  rendererC.meshBackend = 'webgl';
+  rendererD.meshBackend = 'webgl';
+  rendererC.render(posedSkeleton(assets));
+  rendererD.render(posedSkeleton(assets));
+  const idemAfterBoth = liveGlTextures();
+  rendererC.dispose();
+  const idemAfterFirstDispose = liveGlTextures();
+  rendererC.dispose();
+  const idemAfterFirstDisposedTwice = liveGlTextures();
+  rendererD.dispose();
+  const idemAfterSecondDispose = liveGlTextures();
+  rootC.remove();
+  rootD.remove();
+
+  const rootE = makeGlRoot();
+  const rendererE = new SpineHtmlRenderer(rootE, assets.regionImages);
+  rendererE.meshBackend = 'webgl';
+  rendererE.render(posedSkeleton(assets));
+  const loneAfterRender = liveGlTextures();
+  rendererE.dispose();
+  rendererE.dispose();
+  const loneAfterDisposedTwice = liveGlTextures();
+  rootE.remove();
+
+  // A renderer that never leaves canvas2d retains and releases nothing.
+  const canvas2dBefore = liveGlTextures();
+  const rootF = makeGlRoot();
+  const rendererF = new SpineHtmlRenderer(rootF, assets.regionImages);
+  rendererF.render(posedSkeleton(assets));
+  const canvas2dAfterRender = liveGlTextures();
+  const canvas2dBackend = rendererF.meshBackendActive;
+  const canvas2dPixels = meshPixels(rootF);
+  rendererF.dispose();
+  const canvas2dAfterDispose = liveGlTextures();
+  rootF.remove();
+
+  // Re-use after release: the page image is still alive, so a new renderer
+  // must simply upload it again and draw.
+  const reuseBefore = liveGlTextures();
+  const rootG = makeGlRoot();
+  const rendererG = new SpineHtmlRenderer(rootG, assets.regionImages);
+  rendererG.meshBackend = 'webgl';
+  rendererG.render(posedSkeleton(assets));
+  const reuseAfterRender = liveGlTextures();
+  const reuseBackend = rendererG.meshBackendActive;
+  const reusePixels = meshPixels(rootG);
+  rendererG.dispose();
+  const reuseAfterDispose = liveGlTextures();
+  rootG.remove();
+
+  assets.dispose();
+
+  return {
+    webglAvailable: true,
+    baseline,
+    cycles,
+    sharing: {
+      afterBothRendered: sharingAfterBoth,
+      afterFirstDispose: sharingAfterFirstDispose,
+      afterSecondRender: sharingAfterSecondRender,
+      afterSecondDispose: sharingAfterSecondDispose,
+      pixelsBeforeFirstDispose,
+      pixelsAfterFirstDispose,
+      meshesRedrawn,
+    },
+    idempotence: {
+      afterBothRendered: idemAfterBoth,
+      afterFirstDispose: idemAfterFirstDispose,
+      afterFirstDisposedTwice: idemAfterFirstDisposedTwice,
+      afterSecondDispose: idemAfterSecondDispose,
+      loneAfterRender,
+      loneAfterDisposedTwice,
+    },
+    canvas2dOnly: {
+      before: canvas2dBefore,
+      afterRender: canvas2dAfterRender,
+      afterDispose: canvas2dAfterDispose,
+      backendActive: canvas2dBackend,
+      meshPixels: canvas2dPixels,
+    },
+    reuse: {
+      beforeNewRenderer: reuseBefore,
+      afterNewRendererRender: reuseAfterRender,
+      afterDispose: reuseAfterDispose,
+      backendActive: reuseBackend,
+      meshPixels: reusePixels,
+    },
+    final: liveGlTextures(),
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
   unpackFailureProbe,
   loaderProbe,
   loaderFailureProbe,
+  glTextureProbe,
   backingProbe,
   scaledStageProbe,
   loaderHttpFailureProbe,
