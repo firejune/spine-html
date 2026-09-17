@@ -119,12 +119,40 @@ export interface LoaderFailureProbeResult {
   revokedUrls: string[];
 }
 
+/** Mesh-canvas backing sizes and counters read right after one render(). */
+export interface BackingSnapshot {
+  /** Backing store of each mesh canvas, in root child (draw) order. */
+  backing: Array<{ width: number; height: number }>;
+  /** CSS size written alongside it, same order. */
+  css: Array<{ width: string; height: string }>;
+  /** canvasReallocCount / meshCount of the render that produced this. */
+  reallocCount: number;
+  meshDrawnCount: number;
+}
+
+export interface BackingProbeResult {
+  meshCanvasCount: number;
+  /** Live renderer: ratio 2, then 0.5 written on it, then the same pose again. */
+  liveHigh: BackingSnapshot;
+  liveShrunk: BackingSnapshot;
+  liveShrunkAgain: BackingSnapshot;
+  /** Fresh renderer given 0.5 before its first render — the oracle. */
+  freshLow: BackingSnapshot;
+  /** Other direction: a live 0.5 → 2 switch, against a fresh renderer at 2. */
+  liveGrown: BackingSnapshot;
+  freshHigh: BackingSnapshot;
+  /** Grow-only control: ratio held, every mesh bbox shrunk instead. */
+  holdBefore: BackingSnapshot;
+  holdAfter: BackingSnapshot;
+}
+
 export interface SpineHtmlHarness {
   unpackProbe(): Promise<UnpackProbeResult>;
   passThroughProbe(): Promise<PassThroughProbeResult>;
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
   loaderProbe(): Promise<LoaderProbeResult>;
   loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
+  backingProbe(): Promise<BackingProbeResult>;
 }
 
 declare global {
@@ -361,10 +389,120 @@ async function loaderFailureProbe(): Promise<LoaderFailureProbeResult> {
   };
 }
 
+/**
+ * Mesh-canvas backing sizing across a pixelRatio change.
+ *
+ * Not observable from a rendered frame either: the picture stays correct
+ * whatever the backing size is (the CSS size mirrors it, so the mapping stays
+ * 1:1) — only the allocated pixels differ. The oracle is A/B inside one run:
+ * a renderer whose ratio changed on the fly must end up with exactly the
+ * backing a renderer freshly given that ratio allocates, canvas by canvas. It
+ * is an equality, so it needs no threshold and no platform-dependent number.
+ *
+ * The pose is the deterministic one loaderProbe uses (walk, t = 1.2), and the
+ * counters are read right after the render they describe — render() resets
+ * them on entry.
+ */
+async function backingProbe(): Promise<BackingProbeResult> {
+  const assets = await loadSkeletonAssets({
+    atlasUrl: '/spineboy/spineboy.atlas',
+    skeletonUrl: '/spineboy/spineboy-pro.json',
+  });
+  const skeleton = new Skeleton(assets.data);
+  const state = new AnimationState(new AnimationStateData(assets.data));
+  state.setAnimation(0, 'walk', true);
+  state.update(1.2);
+  state.apply(skeleton);
+  skeleton.update(1.2);
+  skeleton.updateWorldTransform(Physics.update);
+
+  const roots: HTMLElement[] = [];
+  const renderers: SpineHtmlRenderer[] = [];
+
+  /** A renderer with its own root element, ratio set before the first render. */
+  function open(ratio: number): { renderer: SpineHtmlRenderer; root: HTMLElement } {
+    const root = document.createElement('div');
+    root.style.position = 'absolute';
+    root.style.left = '0';
+    root.style.top = '0';
+    document.body.appendChild(root);
+    const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+    renderer.pixelRatio = ratio;
+    roots.push(root);
+    renderers.push(renderer);
+    return { renderer, root };
+  }
+
+  function snapshot(renderer: SpineHtmlRenderer, root: HTMLElement): BackingSnapshot {
+    const canvases = [...root.querySelectorAll('canvas')];
+    return {
+      backing: canvases.map((canvas) => ({ width: canvas.width, height: canvas.height })),
+      css: canvases.map((canvas) => ({ width: canvas.style.width, height: canvas.style.height })),
+      reallocCount: renderer.canvasReallocCount,
+      meshDrawnCount: renderer.meshCount,
+    };
+  }
+
+  // A ratio drop on a live renderer, then the same pose once more (the switch
+  // must settle: no second reallocation).
+  const live = open(2);
+  live.renderer.render(skeleton);
+  const liveHigh = snapshot(live.renderer, live.root);
+  live.renderer.pixelRatio = 0.5;
+  live.renderer.render(skeleton);
+  const liveShrunk = snapshot(live.renderer, live.root);
+  live.renderer.render(skeleton);
+  const liveShrunkAgain = snapshot(live.renderer, live.root);
+
+  // The oracle: a renderer that never saw the high ratio.
+  const fresh = open(0.5);
+  fresh.renderer.render(skeleton);
+  const freshLow = snapshot(fresh.renderer, fresh.root);
+
+  // The other direction, against its own fresh oracle.
+  const grown = open(0.5);
+  grown.renderer.render(skeleton);
+  grown.renderer.pixelRatio = 2;
+  grown.renderer.render(skeleton);
+  const liveGrown = snapshot(grown.renderer, grown.root);
+  const freshTwo = open(2);
+  freshTwo.renderer.render(skeleton);
+  const freshHigh = snapshot(freshTwo.renderer, freshTwo.root);
+
+  // Grow-only control, last because it re-poses the skeleton: the ratio never
+  // moves and every mesh bbox shrinks, so the backing must not follow it down.
+  const hold = open(1);
+  hold.renderer.render(skeleton);
+  const holdBefore = snapshot(hold.renderer, hold.root);
+  skeleton.scaleX = 0.5;
+  skeleton.scaleY = 0.5;
+  skeleton.updateWorldTransform(Physics.update);
+  hold.renderer.render(skeleton);
+  const holdAfter = snapshot(hold.renderer, hold.root);
+
+  const meshCanvasCount = live.root.querySelectorAll('canvas').length;
+  for (const renderer of renderers) renderer.dispose();
+  for (const root of roots) root.remove();
+  assets.dispose();
+
+  return {
+    meshCanvasCount,
+    liveHigh,
+    liveShrunk,
+    liveShrunkAgain,
+    freshLow,
+    liveGrown,
+    freshHigh,
+    holdBefore,
+    holdAfter,
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
   unpackFailureProbe,
   loaderProbe,
   loaderFailureProbe,
+  backingProbe,
 };
