@@ -7,9 +7,10 @@ import { DomTexture, type RegionImage, revokeRegions, unpackRegions } from './Do
  *
  * It is deliberately the *only* thing this module does, and it deliberately
  * knows nothing about skeleton exports: it must not drag a skeleton reader
- * (SkeletonJson, and one day SkeletonBinary) into the bundle of a consumer
- * that only wanted the atlas. Reading a skeleton against these assets is
- * `loadSkeletonJson` in loadSkeletonAssets.ts, which sits on this seam.
+ * (SkeletonJson or SkeletonBinary) into the bundle of a consumer that only
+ * wanted the atlas. Reading a skeleton against these assets is
+ * `loadSkeletonJson` in loadSkeletonAssets.ts or `loadSkeletonBinary` in
+ * binary.ts, both of which sit on this seam.
  *
  * Nothing on the renderer's path imports this file, so a bundler drops it when
  * it is unused.
@@ -56,6 +57,19 @@ export async function fetchText(fetchImpl: typeof globalThis.fetch, url: string)
   const response = await fetchImpl(url);
   if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
   return response.text();
+}
+
+/**
+ * @internal Shared with binary.ts; not part of the package API. Same HTTP
+ * failure message as fetchText, so both skeleton readers reject alike.
+ */
+export async function fetchBytes(
+  fetchImpl: typeof globalThis.fetch,
+  url: string,
+): Promise<Uint8Array> {
+  const response = await fetchImpl(url);
+  if (!response.ok) throw new Error(`Failed to fetch ${url}: ${response.status}`);
+  return new Uint8Array(await response.arrayBuffer());
 }
 
 function loadImage(url: string, crossOrigin?: string): Promise<HTMLImageElement> {

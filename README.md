@@ -184,12 +184,42 @@ still use it for the read. `loadSkeletonAssets` is these two calls with the
 atlas half kept private: use it for one atlas and one skeleton, this for the
 rest.
 
+### Binary exports (`.skel`)
+
+Binary exports are read by a second parser, `SkeletonBinary`, which is as big as
+the JSON one. It lives behind its own entry point so that consumers who only
+ever read `.json` never carry it:
+
+```ts
+import { loadAtlasAssets, SpineHtmlRenderer } from 'spine-html';
+import { loadSkeletonBinary } from 'spine-html/binary';
+
+const shared = await loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' });
+const data = await loadSkeletonBinary(shared, '/spineboy/spineboy-pro.skel');
+
+const renderer = new SpineHtmlRenderer(rootElement, shared.regionImages);
+// Unloading, as above: renderer.dispose(); shared.dispose();
+```
+
+`loadSkeletonBinary` is `loadSkeletonJson` with the parser swapped: same
+arguments, the same `{ scale, fetch }` options, the same ownership rule — it
+never frees `assets`, whichever way it ends. Those two calls are the binary path
+in full. There is no one-call `loadSkeletonAssetsBinary`, because the atlas half
+is precisely what a caller reading binary usually wants kept in hand, and hiding
+it again would only earn back a line.
+
+The subpath is the whole mechanism, so import it as written: pulling
+`loadSkeletonBinary` out of `'spine-html'` is not possible, by design. Worth
+knowing about the format itself: binary exports are version-locked to the
+runtime that reads them, so a `.skel` written by an editor newer than your
+installed `@esotericsoftware/spine-core` fails in the read, not in the fetch.
+
 ### Loading it yourself
 
 `loadSkeletonAssets` is optional sugar over five `spine-core` calls, and the
 package works without it. Drop to the low-level path whenever you need
-something neither loader does — a binary export, images that are already in
-memory, an atlas that is not fetched from a URL at all:
+something no loader does — images that are already in memory, an atlas that is
+not fetched from a URL at all:
 
 ```ts
 import { TextureAtlas, AtlasAttachmentLoader, SkeletonJson }

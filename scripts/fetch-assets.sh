@@ -10,7 +10,7 @@ DEST="$(cd "$(dirname "$0")/.." && pwd)/public/spineboy"
 # Idempotent: already-downloaded files are kept, so this is safe to run as a
 # predev/prebuild hook (a fresh clone has no assets — they are gitignored).
 mkdir -p "$DEST"
-for f in spineboy-ess.json spineboy-pro.json spineboy.atlas spineboy.png; do
+for f in spineboy-ess.json spineboy-pro.json spineboy-pro.skel spineboy.atlas spineboy.png; do
   if [ -s "$DEST/$f" ]; then
     echo "have $f"
   else
