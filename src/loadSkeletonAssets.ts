@@ -15,8 +15,10 @@ import { fetchText, type LoadAtlasAssetsOptions, loadAtlasAssets } from './loadA
  * deliberately the *only* thing this module does — it owns no frame loop, no
  * AnimationState, no layout, and it is not on the renderer's path, so the
  * low-level route (TextureAtlas + DomTexture + unpackRegions by hand) stays
- * the way to do anything this does not cover: binary (.skel) exports, images
- * that come from somewhere other than a URL. Sharing one atlas across several
+ * the way to do anything this does not cover: images that come from somewhere
+ * other than a URL, an atlas that is not fetched at all. Binary (.skel) exports
+ * are read by `loadSkeletonBinary`, from the separate `spine-html/binary` entry,
+ * on the same seam. Sharing one atlas across several
  * skeletons has its own seam: `loadAtlasAssets` (loadAtlasAssets.ts) plus one
  * `loadSkeletonJson` per skeleton, which is what this function is built on.
  * Nothing else in the package imports this file, so a bundler drops it when it
