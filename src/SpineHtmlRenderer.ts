@@ -19,6 +19,17 @@ const regionVertices = new Float32Array(8);
 const SVG_NS = 'http://www.w3.org/2000/svg';
 /** Unique tint-filter ids across renderer instances (ids are document-global). */
 let tintFilterSeq = 0;
+/** Edge length of the throwaway box syncPixelRatio() measures the root with. */
+const SCALE_PROBE_PX = 100;
+/**
+ * Relative change below which syncPixelRatio() leaves `pixelRatio` alone.
+ * Layout reads are quantized (1/64 px in Blink), so a 100 px probe carries
+ * ~0.016% of measurement noise — 6× under this band, which in turn is 10×
+ * under the smallest zoom step a UI realistically takes (1%). Inside the band
+ * the sampling error is worth ~0.2% of backing pixels; outside it, a rewrite
+ * of `pixelRatio` recreates every mesh canvas's GPU surface.
+ */
+const PIXEL_RATIO_DEADBAND = 1e-3;
 
 /** Push a point away from (cx, cy) by `amount` pixels. */
 function expandPoint(x: number, y: number, cx: number, cy: number, amount: number): [number, number] {
@@ -129,7 +140,8 @@ export class SpineHtmlRenderer {
    * Mesh-canvas backing-store pixels per CSS pixel. Defaults to the device
    * pixel ratio. If the caller scales the root element, fold that scale in
    * (e.g. devicePixelRatio * rootScale) so the raster matches the on-screen
-   * resolution instead of over- or under-sampling.
+   * resolution instead of over- or under-sampling — syncPixelRatio() measures
+   * that scale and folds it in for you.
    */
   pixelRatio = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1;
   /**
@@ -166,6 +178,95 @@ export class SpineHtmlRenderer {
     private readonly root: HTMLElement,
     private readonly regionImages: Map<string, RegionImage>,
   ) {}
+
+  /**
+   * Backing-store pixels currently allocated across the mesh canvases
+   * (Σ width × height). Computed on demand from the views — nothing is
+   * tracked per frame — so reading it is cheap but not free; the demo reads it
+   * with the other counters, twice a second.
+   *
+   * This is the quantity `pixelRatio` moves quadratically, and the one that
+   * makes an oversampling stage visible before the frame rate does: a root
+   * scaled down by CSS without that scale folded into `pixelRatio` holds
+   * 1/scale² of the backing it needs. Hidden slots are included — their
+   * canvases keep their allocation.
+   */
+  get meshBackingPixels(): number {
+    let total = 0;
+    for (const view of this.views.values()) {
+      if (view.kind === 'canvas') total += view.canvasW * view.canvasH;
+    }
+    return total;
+  }
+
+  /**
+   * Re-derives `pixelRatio` from the root's effective on-screen scale, so the
+   * mesh tier rasters at the resolution the screen actually shows.
+   *
+   * Mesh canvases are sized in the root's own coordinates, and a CSS transform
+   * anywhere above the root — the natural way to build a pan/zoom stage is
+   * `transform: scale(zoom)` on an ancestor — rescales them on screen without
+   * the renderer seeing it. At zoom z the raster is then oversampled by 1/z per
+   * axis, 1/z² in backing pixels: GPU memory and fill rate, not correctness.
+   * This folds the measured scale in, `devicePixelRatio × scale`.
+   *
+   * One layout read per call. The root itself is usually 0×0 (slot elements are
+   * absolutely positioned and posed by transforms), so there is no box to
+   * measure: a hidden 100×100 px child is appended, measured once with
+   * getBoundingClientRect(), and removed again — nothing of it is left behind.
+   * It cannot disturb the slot elements either: they interleave by z-index,
+   * which applyCommon() writes explicitly on every visible one, so DOM order is
+   * not what orders them; and the probe is `visibility: hidden` and gone before
+   * anything can paint.
+   *
+   * The scale is the larger axis of the measured box. An ancestor rotation
+   * inflates that axis-aligned box, so the ratio errs high — the safe side:
+   * oversampling costs pixels, undersampling costs picture.
+   *
+   * A move smaller than 0.1% (see PIXEL_RATIO_DEADBAND) changes nothing, and a
+   * root that is not laid out (a `display: none` ancestor — the probe measures
+   * 0) changes nothing either. Both matter because writing `pixelRatio`
+   * reallocates every mesh canvas on the next frame.
+   *
+   * The renderer never calls this itself. It is a forced synchronous layout,
+   * which has no business in a render path — and there is no per-frame layout
+   * read anywhere in this class. Call it when a zoom or a layout settles: after
+   * a wheel/pinch gesture ends, on a debounced resize, not during the drag.
+   *
+   * @returns the pixel ratio now in effect (the current one if nothing moved).
+   */
+  syncPixelRatio(): number {
+    const probe = document.createElement('div');
+    probe.style.position = 'absolute';
+    probe.style.left = '0';
+    probe.style.top = '0';
+    probe.style.width = `${SCALE_PROBE_PX}px`;
+    probe.style.height = `${SCALE_PROBE_PX}px`;
+    probe.style.visibility = 'hidden';
+    probe.style.pointerEvents = 'none';
+    this.root.appendChild(probe);
+    let width = 0;
+    let height = 0;
+    try {
+      const rect = probe.getBoundingClientRect();
+      width = rect.width;
+      height = rect.height;
+    } finally {
+      probe.remove();
+    }
+
+    const scale = Math.max(width, height) / SCALE_PROBE_PX;
+    // Not laid out (display:none ancestor, detached root): no measurement, so
+    // no decision — keep whatever the caller has.
+    if (!(scale > 0)) return this.pixelRatio;
+
+    const dpr = typeof devicePixelRatio === 'number' ? devicePixelRatio : 1;
+    const next = dpr * scale;
+    const current = this.pixelRatio;
+    if (current > 0 && Math.abs(next - current) < current * PIXEL_RATIO_DEADBAND) return current;
+    this.pixelRatio = next;
+    return next;
+  }
 
   render(skeleton: Skeleton): void {
     this.clipSkipCount = 0;

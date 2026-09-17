@@ -155,6 +155,7 @@ export interface SpineHtmlHarness {
   loaderProbe(): Promise<LoaderProbeResult>;
   loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
   backingProbe(): Promise<BackingProbeResult>;
+  scaledStageProbe(): Promise<ScaledStageProbeResult>;
   loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult>;
   sharedAtlasProbe(): Promise<SharedAtlasProbeResult>;
 }
@@ -702,6 +703,241 @@ async function sharedAtlasProbe(): Promise<SharedAtlasProbeResult> {
   };
 }
 
+/** Mesh-canvas backing and ratio state read right after one render(). */
+export interface ScaledStageSnapshot {
+  /** Backing store of each mesh canvas, in root child (draw) order. */
+  backing: Array<{ width: number; height: number }>;
+  /** Σ width × height read back from the DOM. */
+  domBackingPixels: number;
+  /** What renderer.meshBackingPixels reported at the same moment. */
+  reportedBackingPixels: number;
+  reallocCount: number;
+  meshDrawnCount: number;
+  pixelRatio: number;
+}
+
+/** What one syncPixelRatio() call did to the root's children. */
+export interface SyncResidue {
+  childCountBefore: number;
+  childCountAfter: number;
+  /** Slot element tags in root child order, before and after. */
+  tagsBefore: string[];
+  tagsAfter: string[];
+  /** Element-by-element identity (===), in order — a left-behind probe breaks it. */
+  sameElements: boolean;
+}
+
+/** A syncPixelRatio() call that must change nothing, plus the render after it. */
+export interface HeldRatioCase {
+  ratioBefore: number;
+  returned: number;
+  ratioAfter: number;
+  /** The harness's own 100 px probe of that root, in CSS px (0 = not laid out). */
+  measuredPx: number;
+  after: ScaledStageSnapshot;
+}
+
+export interface ScaledStageProbeResult {
+  devicePixelRatio: number;
+  zoom: number;
+  meshCanvasCount: number;
+  /** The harness's own probe of the scaled root: 100 px × zoom. */
+  scaledMeasuredPx: number;
+  /** Default ratio under the scaled wrapper — the oversampling state. */
+  scaledDefault: ScaledStageSnapshot;
+  syncedRatio: number;
+  syncedRatioAgain: number;
+  /** Right after the sync, before the render that acts on it. */
+  afterSync: ScaledStageSnapshot;
+  /** The render after the sync, and the render after the second sync. */
+  scaledSynced: ScaledStageSnapshot;
+  scaledSyncedAgain: ScaledStageSnapshot;
+  /** Oracle: a fresh renderer given the synced ratio before its first render. */
+  freshScaled: ScaledStageSnapshot;
+  residue: SyncResidue;
+  /** display:none wrapper: nothing to measure, so nothing may move. */
+  hidden: HeldRatioCase;
+  /** Negative control: an unscaled root must come back to devicePixelRatio. */
+  unscaled: HeldRatioCase;
+  /** A ratio a hair off the measured one — inside the deadband, so it holds. */
+  deadband: HeldRatioCase;
+}
+
+/**
+ * syncPixelRatio() against a CSS-scaled stage.
+ *
+ * Invisible in a rendered frame, like the backing probe above and for the same
+ * reason: the picture is correct at any ratio — only the allocated pixels
+ * differ. So the oracle is A/B inside one run again. A renderer that synced its
+ * ratio under a `scale(z)` wrapper must hold exactly the backing a renderer
+ * freshly given that ratio allocates, canvas by canvas; an equality, no
+ * threshold, nothing platform-dependent. The residue and the not-laid-out and
+ * unscaled controls are what stop that equality from passing vacuously.
+ *
+ * Pose: the deterministic one the other probes use (walk, t = 1.2).
+ */
+async function scaledStageProbe(): Promise<ScaledStageProbeResult> {
+  const assets = await loadSkeletonAssets({
+    atlasUrl: '/spineboy/spineboy.atlas',
+    skeletonUrl: '/spineboy/spineboy-pro.json',
+  });
+  const skeleton = new Skeleton(assets.data);
+  const state = new AnimationState(new AnimationStateData(assets.data));
+  state.setAnimation(0, 'walk', true);
+  state.update(1.2);
+  state.apply(skeleton);
+  skeleton.update(1.2);
+  skeleton.updateWorldTransform(Physics.update);
+
+  const ZOOM = 0.25;
+  const PROBE_PX = 100;
+  const wrappers: HTMLElement[] = [];
+  const renderers: SpineHtmlRenderer[] = [];
+
+  /**
+   * A renderer on its own root, inside a wrapper carrying the CSS transform —
+   * the shape a pan/zoom stage has: the renderer is handed the inner element
+   * and never sees the scale.
+   */
+  function open(transform: string, display = ''): { renderer: SpineHtmlRenderer; root: HTMLElement } {
+    const wrapper = document.createElement('div');
+    wrapper.style.position = 'absolute';
+    wrapper.style.left = '0';
+    wrapper.style.top = '0';
+    wrapper.style.transformOrigin = '0 0';
+    wrapper.style.transform = transform;
+    wrapper.style.display = display;
+    const root = document.createElement('div');
+    root.style.position = 'absolute';
+    root.style.left = '0';
+    root.style.top = '0';
+    wrapper.appendChild(root);
+    document.body.appendChild(wrapper);
+    const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+    wrappers.push(wrapper);
+    renderers.push(renderer);
+    return { renderer, root };
+  }
+
+  /**
+   * The harness's own copy of the measurement, independent of the renderer's:
+   * it says what the root's on-screen scale really is, which is what keeps the
+   * scaled and not-laid-out cases from passing for the wrong reason.
+   */
+  function measurePx(root: HTMLElement): number {
+    const box = document.createElement('div');
+    box.style.position = 'absolute';
+    box.style.left = '0';
+    box.style.top = '0';
+    box.style.width = `${PROBE_PX}px`;
+    box.style.height = `${PROBE_PX}px`;
+    box.style.visibility = 'hidden';
+    root.appendChild(box);
+    const rect = box.getBoundingClientRect();
+    box.remove();
+    return Math.max(rect.width, rect.height);
+  }
+
+  function snapshot(renderer: SpineHtmlRenderer, root: HTMLElement): ScaledStageSnapshot {
+    const canvases = [...root.querySelectorAll('canvas')];
+    const backing = canvases.map((canvas) => ({ width: canvas.width, height: canvas.height }));
+    return {
+      backing,
+      domBackingPixels: backing.reduce((sum, size) => sum + size.width * size.height, 0),
+      reportedBackingPixels: renderer.meshBackingPixels,
+      reallocCount: renderer.canvasReallocCount,
+      meshDrawnCount: renderer.meshCount,
+      pixelRatio: renderer.pixelRatio,
+    };
+  }
+
+  /** Sync a ratio that must not move, then render once more. */
+  function held(renderer: SpineHtmlRenderer, root: HTMLElement): HeldRatioCase {
+    const ratioBefore = renderer.pixelRatio;
+    const measuredPx = measurePx(root);
+    const returned = renderer.syncPixelRatio();
+    const ratioAfter = renderer.pixelRatio;
+    renderer.render(skeleton);
+    return { ratioBefore, returned, ratioAfter, measuredPx, after: snapshot(renderer, root) };
+  }
+
+  // The stage: a renderer that knows nothing about the wrapper's scale, so its
+  // first frame rasters at devicePixelRatio and oversamples by 1/ZOOM.
+  const live = open(`scale(${ZOOM})`);
+  live.renderer.render(skeleton);
+  const scaledDefault = snapshot(live.renderer, live.root);
+  const scaledMeasuredPx = measurePx(live.root);
+
+  // Residue: the slot elements must be the same elements, in the same order,
+  // on both sides of the call.
+  const before = [...live.root.children];
+  const syncedRatio = live.renderer.syncPixelRatio();
+  const after = [...live.root.children];
+  const residue: SyncResidue = {
+    childCountBefore: before.length,
+    childCountAfter: after.length,
+    tagsBefore: before.map((el) => el.tagName.toLowerCase()),
+    tagsAfter: after.map((el) => el.tagName.toLowerCase()),
+    sameElements:
+      before.length === after.length && before.every((el, index) => el === after[index]),
+  };
+  const afterSync = snapshot(live.renderer, live.root);
+
+  live.renderer.render(skeleton);
+  const scaledSynced = snapshot(live.renderer, live.root);
+  const syncedRatioAgain = live.renderer.syncPixelRatio();
+  live.renderer.render(skeleton);
+  const scaledSyncedAgain = snapshot(live.renderer, live.root);
+
+  // The oracle: same scale, same pose, that ratio from the start.
+  const fresh = open(`scale(${ZOOM})`);
+  fresh.renderer.pixelRatio = syncedRatio;
+  fresh.renderer.render(skeleton);
+  const freshScaled = snapshot(fresh.renderer, fresh.root);
+
+  // Not laid out: the marker ratio is one nothing could measure, so a sync that
+  // "measured" anything at all would overwrite it.
+  const hiddenStage = open(`scale(${ZOOM})`, 'none');
+  hiddenStage.renderer.pixelRatio = 3;
+  hiddenStage.renderer.render(skeleton);
+  const hidden = held(hiddenStage.renderer, hiddenStage.root);
+
+  // Negative control: no transform above the root at all.
+  const plain = open('');
+  plain.renderer.render(skeleton);
+  const unscaled = held(plain.renderer, plain.root);
+
+  // Deadband: 0.04% off the measured ratio — a real difference, too small to
+  // be worth recreating every GPU surface for.
+  const near = open(`scale(${ZOOM})`);
+  near.renderer.pixelRatio = syncedRatio * 1.0004;
+  near.renderer.render(skeleton);
+  const deadband = held(near.renderer, near.root);
+
+  const meshCanvasCount = live.root.querySelectorAll('canvas').length;
+  for (const renderer of renderers) renderer.dispose();
+  for (const wrapper of wrappers) wrapper.remove();
+  assets.dispose();
+
+  return {
+    devicePixelRatio: window.devicePixelRatio,
+    zoom: ZOOM,
+    meshCanvasCount,
+    scaledMeasuredPx,
+    scaledDefault,
+    syncedRatio,
+    syncedRatioAgain,
+    afterSync,
+    scaledSynced,
+    scaledSyncedAgain,
+    freshScaled,
+    residue,
+    hidden,
+    unscaled,
+    deadband,
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -709,6 +945,7 @@ window.spineHtmlHarness = {
   loaderProbe,
   loaderFailureProbe,
   backingProbe,
+  scaledStageProbe,
   loaderHttpFailureProbe,
   sharedAtlasProbe,
 };

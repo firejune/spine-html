@@ -59,6 +59,11 @@ README.md for architecture and measured numbers.
   real Safari to ~3 fps — except on a `pixelRatio` change, which reallocates
   every canvas anyway and therefore re-sizes from the new need alone, so a
   lowered ratio actually shrinks.
+- **`syncPixelRatio()` is caller-invoked only.** It is a forced layout (a hidden
+  probe box appended to the root, measured, removed), and the renderer performs
+  no layout read per frame — keep it that way. Automatic re-measurement would
+  mean one per frame, which is why `pixelRatio: 'auto'` was dropped rather than
+  built.
 - Element-level features (z-index draw order, SVG-filter tint, mix-blend-mode,
   dirty-skip, backing policy) are backend-agnostic. Keep them out of the raster
   backends.
