@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/firejune/spine-html/compare/v0.5.2...v0.6.0) (2026-09-18)
+
+
+### Features
+
+* **renderer:** clipping attachments as element-level clip-paths ([#41](https://github.com/firejune/spine-html/issues/41)) ([3d7c73d](https://github.com/firejune/spine-html/commit/3d7c73ddde67fedbf428eb5b0d2213508fe88ac4)), closes [#36](https://github.com/firejune/spine-html/issues/36)
+
+
+### Bug Fixes
+
+* **render:** honour pma atlas pages in every tier ([#43](https://github.com/firejune/spine-html/issues/43)) ([0c441c3](https://github.com/firejune/spine-html/commit/0c441c330cf2fe3f254387b0a6a1e5f3dc776d36))
+
 ## [0.5.2](https://github.com/firejune/spine-html/compare/v0.5.1...v0.5.2) (2026-09-18)
 
 
