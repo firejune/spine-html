@@ -23,23 +23,41 @@ import { expect, type Page, test } from '@playwright/test';
  *
  * The twin's PNG is encoded byte by byte in the harness rather than through
  * `canvas.toBlob`, because a 2D canvas stores premultiplied colour and would
- * quantize the values on the way out — by up to ~12 of 255 around alpha 11,
- * which is the same order as the residue being measured. See `pmaFixtureProbe`,
- * which measures that the fixture is exact where a canvas can see it at all.
+ * quantize the values on the way out — by the same order as the residue being
+ * measured, and by *more* than that on a coarser rasterizer. The fixture would
+ * then be carrying the error it exists to detect, in a platform-dependent
+ * amount. See `pmaFixtureProbe`, which measures that the twin is exact where a
+ * canvas can see it at all (every opaque texel) and reports what the canvas
+ * costs everywhere else as the control the rest is judged against.
  *
  * ## What the residue is
  *
  * The DOM and canvas2d tiers read a straight-alpha derivation of the page,
  * produced with `rgb = round(rgb * 255 / a)`. That division happens in 8 bits
- * and starts from a canvas read, which has already quantized a premultiplied
- * texel: the ceiling is `min(a, 127.5/a + 0.5)` — nothing at a = 255 or a = 0,
- * ≤ 1 above a = 128, worst ~12 around a = 11. The GL backend has no such cost
- * (a `pma` page is uploaded unconverted, which is lossless), so cell (b) below
- * — canvas2d against webgl on the twin — is the direct measurement of what the
- * 8-bit un-premultiply loses.
+ * and starts from a canvas read, which has already quantized the premultiplied
+ * texel — and **how coarsely it quantized is the rasterizer's business, not
+ * this package's**: Linux WebKit round-trips premultiplied storage several
+ * times more coarsely than macOS does.
  *
- * DIRECTIONAL_TOLERANCE is therefore what separates the two: it sits above the
- * derivation's analytic ceiling and far below the defect's amplitude.
+ * So the per-texel precision tests assert nothing absolute. Each measures that
+ * platform's own round trip in the same run, on the same fixture, as a
+ * *control* — the premultiplied texels drawn into a canvas and read back, with
+ * no un-premultiply by us — and then bounds this package's numbers relative to
+ * it, plus the rounding of `round(rgb * 255 / a)` stated exactly at each site.
+ * What remains asserted absolutely is only what is true on any rasterizer:
+ * opaque texels untouched, alpha never divided, alpha 0 with no colour, and the
+ * direction of the error.
+ *
+ * (An absolute ceiling stood here first, calibrated on macOS. Linux WebKit
+ * reddened it in CI with the repair working perfectly — every tier cell green
+ * on that same run. A precision number read off one platform is that
+ * platform's, however carefully it was derived.)
+ *
+ * The GL backend has none of this cost — a `pma` page is uploaded unconverted,
+ * which is lossless — so cell (b) below, canvas2d against webgl on the twin, is
+ * the direct measurement of what the 8-bit un-premultiply loses. It is budgeted
+ * against the parity suite's own ratio-of-content limit, which is platform
+ * independent by construction.
  */
 
 const POSE = { animation: 'walk', time: 1.2 } as const;
@@ -241,6 +259,38 @@ async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<Diff> {
   );
 }
 
+/** One line per band: the control, which is reported and never bounded. */
+function controlLine(bands: ReadonlyArray<{
+  label: string;
+  pixels: number;
+  maxError: number;
+  meanError: number;
+}>): string {
+  return bands
+    .map((band) => `${band.label} n=${band.pixels} max=${band.maxError} mean=${band.meanError}`)
+    .join(' | ');
+}
+
+/** The same, for a measurement that is bounded relative to that control. */
+function boundedLine(bands: ReadonlyArray<{
+  label: string;
+  pixels: number;
+  maxError: number;
+  meanError: number;
+  overBound: number;
+  worstExcess: number;
+  vacuous: number;
+}>): string {
+  return bands
+    .map(
+      (band) =>
+        `${band.label} n=${band.pixels} max=${band.maxError} mean=${band.meanError} ` +
+        `over=${band.overBound} headroom=${(-band.worstExcess).toFixed(2)}` +
+        (band.vacuous ? ` unbounded=${band.vacuous}` : ''),
+    )
+    .join(' | ');
+}
+
 async function openHarness(page: Page): Promise<void> {
   await page.goto('/tests/harness.html');
   await page.waitForFunction(() => Boolean(window.spineHtmlHarness));
@@ -329,14 +379,10 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
 }, testInfo) => {
   await openHarness(page);
   const result = await page.evaluate(() => window.spineHtmlHarness.pmaFixtureProbe());
-  const bandLine = (bands: typeof result.readBack): string =>
-    bands
-      .map((band) => `${band.label} n=${band.pixels} max=${band.maxError} mean=${band.meanError}`)
-      .join(' | ');
   console.log(
     `[pma] ${testInfo.project.name} fixture: ${result.pngBytes} B PNG\n` +
-      `      read-back  ${bandLine(result.readBack)}\n` +
-      `      composite  ${bandLine(result.composite)}\n` +
+      `      control    ${controlLine(result.control)}\n` +
+      `      composite  ${boundedLine(result.composite)}\n` +
       `      derived drift: ${result.derivedMismatches} channels, max ${result.derivedMaxDrift}; ` +
       `composite maxErr=${result.compositeMaxError}\n` +
       `      worst: ${result.compositeWorst.join(' ; ')}`,
@@ -349,25 +395,34 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
   // artwork premultiplied, and not an artefact of some canvas round trip.
   expect(result.opaquePixels).toBeGreaterThan(10000);
   expect(result.opaqueMismatches).toBe(0);
-  // Everywhere else the read is quantized, and every pixel must stay inside the
-  // analytic ceiling for its alpha — the statement that the loss is 8-bit
-  // rounding at low alpha and nothing else.
-  for (const band of result.readBack) {
-    expect(band.overBound, `${band.label} past the canvas round-trip ceiling`).toBe(0);
+  // The control is reported, never bounded: how coarsely a 2D canvas round-trips
+  // premultiplied storage is the platform's business, and it differs by
+  // rasterizer. What is asserted is only what this package adds to it.
+  expect(result.control[0].maxError, 'opaque texels round-trip exactly').toBe(0);
+  for (const band of result.control) {
+    expect(band.pixels, `${band.label} is empty`).toBeGreaterThan(0);
   }
-  expect(result.readBack[0].maxError, 'opaque texels are exact').toBe(0);
+  // Alpha 0 keeps no colour, on any platform: there is nothing to divide by.
+  expect(result.zeroAlphaNonBlack).toBe(0);
   // putImageData stored the un-premultiplied values; it did not multiply them
-  // back in. Verified by reading the derivation's pixels, not by assuming: the
-  // canvas's own 8-bit conversion may land a step off this arithmetic, and a
-  // step is all it may be.
+  // back in. Verified by reading the derivation's pixels, not by assuming.
+  //
+  // This one is absolute, deliberately: it is not a claim about how precise the
+  // output is, it is the premise of DERIVATION_SLACK's "+1" — that a single
+  // 8-bit conversion agrees with `round(v * a / 255)` to within one step. A
+  // platform where it did not would make the slack above understated, and this
+  // is what would say so, loudly, instead of the bound quietly going soft.
+  // (Measured: 1 on chromium, 0 on macOS webkit, and green on Linux WebKit.)
   expect(result.derivedMaxDrift).toBeLessThanOrEqual(1);
   // And composited — the premultiplied product the screen gets — it reproduces
-  // what the page holds. Above a = 128 a second premultiply would move a texel
-  // by up to half its value, so ±2 there is the assertion that carries this.
+  // what the page holds, to within what the control already cost *that texel*
+  // plus DERIVATION_SLACK (0.5 for `round(rgb * 255 / a)` arriving back through
+  // × a/255, plus 1 for the canvas's own premultiply on the way in; see the
+  // harness). A second premultiply moves a mid-alpha texel by up to half its
+  // value, which no control excuses.
   expect(result.composite[0].maxError, 'opaque texels composite exactly').toBe(0);
-  expect(result.composite[1].maxError, 'a 128–254 composites within ±2').toBeLessThanOrEqual(2);
   for (const band of result.composite) {
-    expect(band.overBound, `${band.label} past the round-trip ceiling`).toBe(0);
+    expect(band.overBound, `${band.label}: the derivation added more than rounding`).toBe(0);
   }
 });
 
@@ -377,28 +432,42 @@ test('rigid cuts from a premultiplied page decode to straight alpha', async ({
   await openHarness(page);
   const result = await page.evaluate(() => window.spineHtmlHarness.pmaCutProbe());
   console.log(
-    `[pma] ${testInfo.project.name} cuts: ` +
-      result.bands
-        .map((band) => `${band.label} n=${band.pixels} max=${band.maxError} mean=${band.meanError}`)
-        .join(' | ') +
-      `, alpha maxErr=${result.maxAlphaError}, ` +
+    `[pma] ${testInfo.project.name} cuts\n` +
+      `      control  ${controlLine(result.control)}\n` +
+      `      cuts     ${boundedLine(result.bands)}\n` +
+      `      alpha maxErr=${result.maxAlphaError}, ` +
       `pass-through straight=${result.straight.wholePassedThrough} pma=${result.pma.wholePassedThrough}, ` +
       `minted straight=${result.straight.mintedCount} pma=${result.pma.mintedCount}`,
   );
 
-  // A cut of a premultiplied page comes back straight: at mid alpha the two
-  // readings agree within the 8-bit round trip. At very low alpha they need
-  // not, and the band below says so rather than hiding it — dividing by a small
-  // alpha multiplies the read's own quantization by 255/a, so a barely-visible
-  // texel's *stored* colour can be far off (measured: mean ~112, max 223 of 255
-  // under alpha 32). What that texel composites to is the bounded quantity, and
-  // it is the one on screen: ≤ ~11 of 255, see the fixture test above.
+  // A cut of a premultiplied page comes back straight. How *close* to the
+  // straight page's own cut it comes is not a number to write down: both sides
+  // are read through this platform's canvas, and the un-premultiply then
+  // multiplies whatever that read already cost by 255/a. So the bound is the
+  // control for that very texel, carried through the same division, plus the
+  // rounding of the conversions (see `cutBound` in the harness) — and the
+  // amplification is why a barely-visible texel's *stored* colour may be far
+  // off while what it composites to stays within a few levels of 255 (the
+  // fixture test above measures that end).
+  //
+  // An absolute ±2 stood here and was calibrated on macOS; Linux WebKit, whose
+  // canvas round trip is several times coarser, read 6 and turned it red
+  // without anything being wrong with the repair. A number read off one
+  // platform fails on the next one.
   expect(result.bands[0].maxError, 'opaque texels are exact').toBe(0);
-  expect(result.bands[1].maxError, 'a 128–254 within ±2').toBeLessThanOrEqual(2);
   for (const band of result.bands) {
     // Every band has to be populated, or its limit is a statement about nothing.
     expect(band.pixels, `${band.label} is empty`).toBeGreaterThan(0);
-    expect(band.overBound, `${band.label} past the round-trip ceiling`).toBe(0);
+    expect(band.overBound, `${band.label}: the cut added more than rounding`).toBe(0);
+  }
+  // Where that bound bites: everywhere above alpha ~10. Below it the 255/a
+  // amplification carries the bound past 255 and no 8-bit error could fail it
+  // (`unbounded=` in the line above counts exactly those texels). They are not
+  // unmeasured — the fixture test bounds what they composite to, at every
+  // alpha — but this comparison is not what holds them, and the three upper
+  // bands must stay fully bounded or this test has quietly stopped asserting.
+  for (const band of result.bands.slice(0, 3)) {
+    expect(band.vacuous, `${band.label}: the bound stopped biting`).toBe(0);
   }
   // Alpha is carried, never divided.
   expect(result.maxAlphaError).toBe(0);

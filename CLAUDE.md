@@ -67,11 +67,22 @@ README.md for architecture and measured numbers.
   image is never mutated, and the derivation is weak, so it needs no free.
   The un-premultiply is 8-bit and starts from a canvas read that has already
   quantized the texel, so it carries a residue no rewrite of the arithmetic
-  removes: `min(a, 127.5/a + 0.5)` of 255 — zero at alpha 0 and 255, ≤ 1 above
-  128, worst ~12 around alpha 11. `tests/pma.spec.ts` holds that ceiling per
-  alpha band and holds the direction, which is the part that matters: a doubled
-  premultiply can only darken, so the tests count darker and lighter pixels
-  separately rather than totalling them.
+  removes — and **how big that residue is belongs to the rasterizer, not to
+  this package**: Linux WebKit round-trips premultiplied storage several times
+  more coarsely than macOS does. So `tests/pma.spec.ts` asserts nothing
+  absolute about it. It measures the platform's own round trip in the same run
+  as a **control** (the fixture's texels drawn into a canvas and read back, no
+  un-premultiply by us) and bounds our numbers *relative to it*: the derivation
+  may add `control + 2` (0.5 for `round(rgb * 255 / a)` arriving back through
+  × a/255, plus 1 for the canvas's own premultiply), and a cut the same carried
+  through the division's `× 255/a`. An absolute ceiling stood there first,
+  calibrated on macOS, and Linux WebKit reddened it in CI without anything
+  being wrong with the repair — **a per-texel precision number read off one
+  platform is a platform's number, whatever it is derived from.** What is still
+  asserted exactly, because it holds anywhere: opaque texels are untouched,
+  alpha is never divided, alpha 0 keeps no colour, and the direction — a
+  doubled premultiply can only darken, so the tiers count darker and lighter
+  pixels separately rather than totalling them.
 - **The canvas2d path draws a per-triangle source sub-rect, never the whole
   page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
   affines — measured (displaced texture on head/goggles/foot triangles while

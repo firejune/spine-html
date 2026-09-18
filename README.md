@@ -326,11 +326,14 @@ What it costs: **one page-sized canvas per premultiplied page image**
 one), alive as long as you hold the page image and released with it; the cache
 is weak, so there is nothing to free by hand. A page with no `pma:` line derives
 nothing and takes exactly the path it always did. The division is 8-bit and
-starts from
-a canvas read, which has itself quantized a premultiplied texel, so a very
-transparent texel can land a few levels off — exact at alpha 0 and 255, within
-one level of 255 above alpha 128, worst ~12 around alpha 11, where the texel is
-~4% opaque. The `webgl` backend, having no such step, is exact.
+starts from a canvas read, which has itself quantized a premultiplied texel, so
+a very transparent texel can land a few levels off — exact at alpha 0 and 255,
+within one level of 255 above alpha 128, and a little more below that, by an
+amount that belongs to the browser's canvas rather than to this package (some
+rasterizers round premultiplied storage several times more coarsely than
+others). It is bounded by what that canvas already costs, and it is invisible
+wherever the texel is: a texel at alpha 11 is ~4% opaque. The `webgl` backend,
+having no such step, is exact.
 
 One consequence worth knowing if your atlas is one part per page: a whole-page
 region on a premultiplied page is **cut** rather than handed through, because

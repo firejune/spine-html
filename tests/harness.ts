@@ -3387,14 +3387,108 @@ function pmaTwinPage(scale: number): Promise<{ image: HTMLImageElement; url: str
   return built;
 }
 
+/**
+ * What this browser's own 2D canvas does to a known premultiplied texel set
+ * that is merely drawn and read back — no un-premultiply by us.
+ *
+ * This is the control, and it is measured in the same run, on the same
+ * platform, from the same fixture as everything it is compared against. It is
+ * reported and never bounded: the canvas's 8-bit premultiplied storage is the
+ * platform's behaviour, not this package's, and it differs by rasterizer
+ * (Linux WebKit round-trips several times more coarsely than macOS). An
+ * absolute ceiling here was a macOS number in disguise, and CI on another
+ * rasterizer is what proved it.
+ */
+export interface PmaControlBand {
+  label: string;
+  pixels: number;
+  /** Worst |read-back − written| in the band, in the premultiplied domain. */
+  maxError: number;
+  meanError: number;
+}
+
 export interface PmaBand {
   label: string;
   pixels: number;
   maxError: number;
   meanError: number;
-  /** Pixels past the analytic ceiling for their alpha — must be 0. */
+  /**
+   * Texels whose error exceeds the control's error *for that same texel* plus
+   * the stated rounding term — must be 0. Relative, so it carries over to any
+   * rasterizer: it says what this package adds, not what the platform costs.
+   */
   overBound: number;
+  /**
+   * Worst (error − bound) in the band. Negative is headroom, so this is what
+   * says whether the bound is doing any work.
+   */
+  worstExcess: number;
+  /**
+   * Texels whose bound came out at 255 or more — where no 8-bit error could
+   * exceed it, so the assertion says nothing about them. Reported rather than
+   * hidden: it is the honest measure of where a bound stops biting.
+   */
+  vacuous: number;
 }
+
+/** Alpha bands every pma measurement is reported in. */
+const PMA_BANDS = [
+  { label: 'a = 255 (opaque)', min: 255, max: 255 },
+  { label: 'a 128–254', min: 128, max: 254 },
+  { label: 'a 32–127', min: 32, max: 127 },
+  { label: 'a 1–31', min: 1, max: 31 },
+] as const;
+
+/** Index of the band `a` falls in, or -1 (only alpha 0, which has no colour). */
+function pmaBandOf(a: number): number {
+  for (let b = 0; b < PMA_BANDS.length; b++) {
+    if (a >= PMA_BANDS[b].min && a <= PMA_BANDS[b].max) return b;
+  }
+  return -1;
+}
+
+function newPmaBands(): PmaBand[] {
+  return PMA_BANDS.map((band) => ({
+    label: band.label,
+    pixels: 0,
+    maxError: 0,
+    meanError: 0,
+    overBound: 0,
+    // Nothing measured yet, so any excess is worse than this.
+    worstExcess: Number.NEGATIVE_INFINITY,
+    vacuous: 0,
+  }));
+}
+
+function finishPmaBands(bands: PmaBand[], sums: number[]): void {
+  for (let b = 0; b < bands.length; b++) {
+    const band = bands[b];
+    band.meanError = band.pixels ? Math.round((sums[b] / band.pixels) * 1000) / 1000 : 0;
+    // An empty band has no headroom to report, and -Infinity does not survive
+    // the trip out of the page (JSON turns it into null).
+    band.worstExcess = Number.isFinite(band.worstExcess)
+      ? Math.round(band.worstExcess * 1000) / 1000
+      : 0;
+  }
+}
+
+/**
+ * How far this package's own arithmetic may move a texel *on top of* the
+ * control, in the premultiplied domain — the "plus rounding" term, stated
+ * exactly:
+ *
+ * - **0.5** from `round(rgb * 255 / a)`. The rounded straight value is put back
+ *   and multiplied by a/255 again to reach the screen, so half a straight step
+ *   arrives as `0.5 × a/255` ≤ 0.5 of 255, for any alpha.
+ * - **1** from the canvas's own 8-bit premultiply when `putImageData` stores
+ *   that value: its conversion need not agree with `round(v * a / 255)` to the
+ *   unit (measured: chromium differs by exactly one step on 1,674 of ~370k
+ *   channels, macOS webkit on none).
+ *
+ * Integers, so 2. Nothing platform-shaped is in it: the platform's cost is the
+ * control this is added to.
+ */
+const DERIVATION_SLACK = 2;
 
 export interface PmaFixtureProbeResult {
   pageSize: { width: number; height: number };
@@ -3405,10 +3499,13 @@ export interface PmaFixtureProbeResult {
   opaquePixels: number;
   opaqueMismatches: number;
   /**
-   * |read-back − written| over the twin, per alpha band. This *is* the
-   * un-premultiply's precision loss: the derivation starts from this read.
+   * The control: |read-back − written| over the twin, per alpha band. This *is*
+   * the un-premultiply's precision floor — the derivation starts from this read
+   * and cannot undo it — so it is what everything below is measured against.
    */
-  readBack: PmaBand[];
+  control: PmaControlBand[];
+  /** Derived texels at alpha 0 that are not (0,0,0,0). Must be 0, anywhere. */
+  zeroAlphaNonBlack: number;
   /**
    * The derived straight-alpha source, read back against
    * `round(read-back * 255 / a)`: how often, and how far, the canvas's own
@@ -3419,8 +3516,9 @@ export interface PmaFixtureProbeResult {
   /**
    * The derivation composited over black — the premultiplied product the screen
    * actually gets — against what the page holds. This is the end-to-end
-   * fidelity of the un-premultiply. A second premultiply would show here as a
-   * large, one-directional error at mid alpha.
+   * fidelity of the un-premultiply, bounded per texel by the control plus
+   * DERIVATION_SLACK. A second premultiply would show here as a large,
+   * one-directional error at mid alpha, far outside that.
    */
   compositeMaxError: number;
   composite: PmaBand[];
@@ -3442,22 +3540,16 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
   const twin = await loadImage(url);
   const readBack = readImagePixels(twin).data;
 
-  // Bands by alpha: the ceiling on a canvas round trip at alpha a is
-  // min(a, 127.5 / a + 0.5), and it is what limits the repair at low alpha.
-  const bands = [
-    { label: 'a = 255 (opaque)', min: 255, max: 255 },
-    { label: 'a 128–254', min: 128, max: 254 },
-    { label: 'a 32–127', min: 32, max: 127 },
-    { label: 'a 1–31', min: 1, max: 31 },
-  ];
-  const measured: PmaBand[] = bands.map((band) => ({
+  // The control, per texel: what this canvas did to the premultiplied values on
+  // the way in and out again, before any arithmetic of ours.
+  const control: PmaControlBand[] = PMA_BANDS.map((band) => ({
     label: band.label,
     pixels: 0,
     maxError: 0,
     meanError: 0,
-    overBound: 0,
   }));
-  const sums = new Array<number>(bands.length).fill(0);
+  const controlSums = new Array<number>(PMA_BANDS.length).fill(0);
+  const controlError = new Uint8Array(written.length / 4);
   let opaquePixels = 0;
   let opaqueMismatches = 0;
   for (let i = 0; i < written.length; i += 4) {
@@ -3468,24 +3560,21 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
       Math.abs(readBack[i + 1] - written[i + 1]),
       Math.abs(readBack[i + 2] - written[i + 2]),
     );
+    controlError[i / 4] = error;
     if (a === 255) {
       opaquePixels++;
       if (error !== 0) opaqueMismatches++;
     }
-    const bound = Math.min(a, 127.5 / a + 0.5);
-    for (let b = 0; b < bands.length; b++) {
-      if (a < bands[b].min || a > bands[b].max) continue;
-      const band = measured[b];
-      band.pixels++;
-      sums[b] += error;
-      if (error > band.maxError) band.maxError = error;
-      if (error > bound) band.overBound++;
-      break;
-    }
+    const b = pmaBandOf(a);
+    if (b === -1) continue;
+    control[b].pixels++;
+    controlSums[b] += error;
+    if (error > control[b].maxError) control[b].maxError = error;
   }
-  for (let b = 0; b < measured.length; b++) {
-    const band = measured[b];
-    band.meanError = band.pixels ? Math.round((sums[b] / band.pixels) * 1000) / 1000 : 0;
+  for (let b = 0; b < control.length; b++) {
+    control[b].meanError = control[b].pixels
+      ? Math.round((controlSums[b] / control[b].pixels) * 1000) / 1000
+      : 0;
   }
 
   // The library's own derivation, read back and composited.
@@ -3506,18 +3595,20 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
   let derivedMismatches = 0;
   let derivedMaxDrift = 0;
   let compositeMaxError = 0;
-  const compositeBands: PmaBand[] = bands.map((band) => ({
-    label: band.label,
-    pixels: 0,
-    maxError: 0,
-    meanError: 0,
-    overBound: 0,
-  }));
-  const compositeSums = new Array<number>(bands.length).fill(0);
+  let zeroAlphaNonBlack = 0;
+  const compositeBands: PmaBand[] = newPmaBands();
+  const compositeSums = new Array<number>(PMA_BANDS.length).fill(0);
   const worst: string[] = [];
   for (let i = 0; i < readBack.length; i += 4) {
     const a = readBack[i + 3];
-    if (a === 0) continue;
+    if (a === 0) {
+      // Nothing to divide by, so the derivation zeroes it; there is no colour
+      // to recover from a fully transparent texel on any platform.
+      if (derivedPixels[i] || derivedPixels[i + 1] || derivedPixels[i + 2] || derivedPixels[i + 3]) {
+        zeroAlphaNonBlack++;
+      }
+      continue;
+    }
     let pixelError = 0;
     for (let c = 0; c < 3; c++) {
       const expected = Math.min(255, Math.round((readBack[i + c] * 255) / a));
@@ -3541,21 +3632,21 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
         );
       }
     }
-    const bound = Math.min(a, 127.5 / a + 0.5);
-    for (let b = 0; b < bands.length; b++) {
-      if (a < bands[b].min || a > bands[b].max) continue;
-      const band = compositeBands[b];
-      band.pixels++;
-      compositeSums[b] += pixelError;
-      if (pixelError > band.maxError) band.maxError = pixelError;
-      if (pixelError > bound + 1) band.overBound++;
-      break;
-    }
-  }
-  for (let b = 0; b < compositeBands.length; b++) {
+    // Relative to this platform's own round trip on this very texel: whatever
+    // the canvas already cost (controlError), the derivation may add only
+    // DERIVATION_SLACK on top of it.
+    const bound = controlError[i / 4] + DERIVATION_SLACK;
+    const b = pmaBandOf(a);
+    if (b === -1) continue;
     const band = compositeBands[b];
-    band.meanError = band.pixels ? Math.round((compositeSums[b] / band.pixels) * 1000) / 1000 : 0;
+    if (bound >= 255) band.vacuous++;
+    band.pixels++;
+    compositeSums[b] += pixelError;
+    if (pixelError > band.maxError) band.maxError = pixelError;
+    if (pixelError > bound) band.overBound++;
+    if (pixelError - bound > band.worstExcess) band.worstExcess = pixelError - bound;
   }
+  finishPmaBands(compositeBands, compositeSums);
 
   URL.revokeObjectURL(url);
   return {
@@ -3564,7 +3655,8 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
     decodedSize: { width: twin.naturalWidth, height: twin.naturalHeight },
     opaquePixels,
     opaqueMismatches,
-    readBack: measured,
+    control,
+    zeroAlphaNonBlack,
     derivedMismatches,
     derivedMaxDrift,
     compositeMaxError,
@@ -3616,10 +3708,40 @@ export interface PmaCutSample {
 export interface PmaCutProbeResult {
   straight: PmaCutSample;
   pma: PmaCutSample;
-  /** |straight cut − pma cut| over the `sub` region, by alpha band. */
+  /**
+   * The control, over the same texels: what this canvas does to the
+   * premultiplied page when it is merely drawn and read back. In the
+   * premultiplied domain, like the fixture's.
+   */
+  control: PmaControlBand[];
+  /**
+   * |straight cut − pma cut| over the `sub` region, by alpha band, bounded per
+   * texel by the control carried through the division (see cutBound).
+   */
   bands: PmaBand[];
   /** Alpha is never divided, so it must come through untouched. */
   maxAlphaError: number;
+}
+
+/**
+ * What the cut of a premultiplied texel may differ from the straight page's cut
+ * by, given what this platform's canvas already did to that texel.
+ *
+ * Both cuts are read in the **straight** domain, and the un-premultiply is a
+ * multiply by `255 / a` — so it multiplies the control's error by exactly that.
+ * Everything inside the parenthesis is premultiplied-domain rounding:
+ *
+ * - `controlError` — this platform's round trip, measured in-run.
+ * - **1** — the reference side: the exporter's `round(rgb * a / 255)` against
+ *   the canvas's own premultiply of the straight page, which need not agree to
+ *   the unit.
+ * - **DERIVATION_SLACK** (2) — this package's side, as derived above.
+ *
+ * The trailing **+1** is the last conversion, which lands the straight value in
+ * 8 bits when the cut is encoded and read.
+ */
+function cutBound(controlError: number, a: number): number {
+  return (controlError + 1 + DERIVATION_SLACK) * (255 / a) + 1;
 }
 
 /**
@@ -3673,20 +3795,48 @@ async function pmaCutProbe(): Promise<PmaCutProbeResult> {
   const straight = await run('straight');
   const pma = await run('pma');
 
-  const bands = [
-    { label: 'a = 255 (opaque)', min: 255, max: 255 },
-    { label: 'a 128–254', min: 128, max: 254 },
-    { label: 'a 32–127', min: 32, max: 127 },
-    { label: 'a 1–31', min: 1, max: 31 },
-  ];
-  const measured: PmaBand[] = bands.map((band) => ({
+  // The control, on the very texels the cuts are compared over: the
+  // premultiplied page drawn into a canvas and read back, nothing else. The
+  // `sub` region is unrotated at x = 8 on a 1:1 page, so cut texel (x, y) is
+  // page texel (x + 8, y).
+  const pmaPageRead = readImagePixels(await loadImage(sources.pma)).data;
+  const pmaPageWritten = premultiplied(straightPixels);
+  const subX = 8;
+  const subW = 32;
+  const controlError = new Uint8Array((straight.sub.length / 4) | 0);
+  const control: PmaControlBand[] = PMA_BANDS.map((band) => ({
     label: band.label,
     pixels: 0,
     maxError: 0,
     meanError: 0,
-    overBound: 0,
   }));
-  const sums = new Array<number>(bands.length).fill(0);
+  const controlSums = new Array<number>(PMA_BANDS.length).fill(0);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < subW; x++) {
+      const page = (y * width + (x + subX)) * 4;
+      const a = pmaPageWritten[page + 3];
+      const error = Math.max(
+        Math.abs(pmaPageRead[page] - pmaPageWritten[page]),
+        Math.abs(pmaPageRead[page + 1] - pmaPageWritten[page + 1]),
+        Math.abs(pmaPageRead[page + 2] - pmaPageWritten[page + 2]),
+      );
+      controlError[y * subW + x] = error;
+      if (a === 0) continue;
+      const b = pmaBandOf(a);
+      if (b === -1) continue;
+      control[b].pixels++;
+      controlSums[b] += error;
+      if (error > control[b].maxError) control[b].maxError = error;
+    }
+  }
+  for (let b = 0; b < control.length; b++) {
+    control[b].meanError = control[b].pixels
+      ? Math.round((controlSums[b] / control[b].pixels) * 1000) / 1000
+      : 0;
+  }
+
+  const measured: PmaBand[] = newPmaBands();
+  const sums = new Array<number>(PMA_BANDS.length).fill(0);
   let maxAlphaError = 0;
   for (let i = 0; i < straight.sub.length; i += 4) {
     const a = straight.sub[i + 3];
@@ -3697,26 +3847,32 @@ async function pmaCutProbe(): Promise<PmaCutProbeResult> {
       Math.abs(pma.sub[i + 1] - straight.sub[i + 1]),
       Math.abs(pma.sub[i + 2] - straight.sub[i + 2]),
     );
-    // Both sides are straight-alpha readings, so the ceiling is the canvas
-    // round trip's, carried up by the 255/a the un-premultiply applies.
-    const bound = Math.min(255, (127.5 / a + 0.5) * (255 / a) + 1);
-    for (let b = 0; b < bands.length; b++) {
-      if (a < bands[b].min || a > bands[b].max) continue;
-      const band = measured[b];
-      band.pixels++;
-      sums[b] += error;
-      if (error > band.maxError) band.maxError = error;
-      if (error > bound) band.overBound++;
-      break;
-    }
-  }
-  for (let b = 0; b < measured.length; b++) {
+    const bound = cutBound(controlError[i / 4], a);
+    const b = pmaBandOf(a);
+    if (b === -1) continue;
     const band = measured[b];
-    band.meanError = band.pixels ? Math.round((sums[b] / band.pixels) * 1000) / 1000 : 0;
+    // The division multiplies the control by 255/a, so below roughly alpha 10
+    // the bound leaves the 8-bit range and stops constraining anything. That is
+    // a property of the quantity, not a threshold to pick: what holds those
+    // texels is the *composited* measurement in pmaFixtureProbe, which is
+    // bounded at control + DERIVATION_SLACK at every alpha.
+    if (bound >= 255) band.vacuous++;
+    band.pixels++;
+    sums[b] += error;
+    if (error > band.maxError) band.maxError = error;
+    if (error > bound) band.overBound++;
+    if (error - bound > band.worstExcess) band.worstExcess = error - bound;
   }
+  finishPmaBands(measured, sums);
 
   for (const url of Object.values(sources)) URL.revokeObjectURL(url);
-  return { straight: straight.sample, pma: pma.sample, bands: measured, maxAlphaError };
+  return {
+    straight: straight.sample,
+    pma: pma.sample,
+    control,
+    bands: measured,
+    maxAlphaError,
+  };
 }
 
 export interface PmaDerivationProbeResult {
