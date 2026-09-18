@@ -53,6 +53,52 @@ README.md for architecture and measured numbers.
   page. The page's declared size missing or zero still means "the image is its
   own declared size". `tests/regions.spec.ts` holds it, on artwork painted
   three times at 0.5×/1×/2× rather than resampled.
+- **Alpha convention is per tier, keyed off `page.pma`** (#37). The exporter
+  premultiplies by default, so most consumer atlases carry `pma: true` and the
+  file's RGB is already multiplied by its alpha. GL then uploads it *without*
+  `UNPACK_PREMULTIPLY_ALPHA_WEBGL` (its blend already wants premultiplied
+  source — lossless); the DOM and canvas2d tiers cannot take it at all, since
+  an `<img>` and `drawImage` composite straight alpha by definition, so they
+  read one weakly-cached un-premultiplied derivation per page image, shared by
+  the region cuts and the canvas2d mesh raster (`straightAlphaSource` in
+  DomTexture.ts). Deriving per consumer, or per frame, is the thing to not do.
+  The whole-page pass-through never fires for a `pma` page — its URL holds
+  premultiplied pixels and would go straight into an `<img>`. The caller's
+  image is never mutated, and the derivation is weak, so it needs no free.
+  The un-premultiply is 8-bit and starts from a canvas read that has already
+  quantized the texel, so it carries a residue no rewrite of the arithmetic
+  removes — and **how big that residue is belongs to the rasterizer, not to
+  this package**: Linux WebKit reads a premultiplied page several times more
+  coarsely than macOS does, and it does not even hold the same numbers in two
+  kinds of canvas — the same decoded image read through a `willReadFrequently`
+  context and through a plain one differed by one level on 561 channels on the
+  CI runner, which the un-premultiply's `× 255/a` carries to 8 (identical on
+  Chromium). So `tests/pma.spec.ts` asserts nothing absolute about it, and
+  whatever it compares with the derived canvas is made on the library's kind of
+  canvas (`libraryKindContext` in the harness), never the harness's usual one.
+  It measures that platform's own storage in the same run as **controls** — the
+  read side (texels drawn in and read back) and the write side (`putImageData`
+  of the value class the un-premultiply produces, read back) — and bounds our
+  numbers *relative to them*: the derivation may add `read control + 2` (0.5
+  for `round(rgb * 255 / a)` arriving back through × a/255, plus 1 for the
+  canvas's own premultiply), may drift no more than the write control at that
+  alpha (arithmetic term zero), and a cut the same carried through the
+  division's `× 255/a`. **Linux WebKit reddened this spec in CI three runs in a
+  row with the repair working perfectly**: twice on an absolute ceiling
+  calibrated on macOS — a per-texel precision number read off one platform is
+  a platform's number, whatever it is derived from, and the first sweep had
+  converted the numbers that had already failed rather than every number of
+  that kind — and once on the relative bound that replaced them, because its
+  control sat on the other kind of canvas. That platform exists on the CI
+  runner only, so what settled it was a one-variable dispatch there, not a
+  fourth argument. What is asserted exactly, because it holds anywhere: opaque
+  texels are untouched (premultiplying by 255/255 is the identity), alpha is
+  never divided, alpha 0 keeps no colour, the derived canvas reads back the
+  same as a scratch canvas of its own kind given the same values, and the
+  direction — a doubled premultiply can only darken, so the tiers count darker
+  and lighter pixels separately, assert that the darker side does not outweigh
+  the lighter one, and budget each as a ratio of drawn content, the way the
+  parity suite budgets a diff.
 - **The canvas2d path draws a per-triangle source sub-rect, never the whole
   page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
   affines — measured (displaced texture on head/goggles/foot triangles while

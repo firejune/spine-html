@@ -7,6 +7,8 @@
  * shelf-packed into a rect of the offscreen canvas, its triangles are drawn
  * textured (atlas page texture, premultiplied alpha), and each rect is blitted
  * onto the mesh's per-part 2d canvas with an unclipped drawImage rect copy.
+ * The texture is premultiplied either by the upload or by the exporter — a
+ * `pma: true` page arrives that way, so it is uploaded unconverted (textureFor).
  *
  * Why this exists: Safari antialiases canvas2d clip paths, so the standard
  * per-triangle clip+transform+drawImage mapping pays a per-triangle AA-mask
@@ -34,6 +36,13 @@ export interface MeshBlitJob {
   canvas: HTMLCanvasElement;
   /** Atlas page image the mesh samples (cached as a GL texture on first use). */
   page: HTMLImageElement;
+  /**
+   * `page.pma` — whether the page's texels are already premultiplied, which
+   * decides whether the upload premultiplies them again (see textureFor). It
+   * travels with the page because it describes the page's *pixels*, and the
+   * blend below wants them premultiplied exactly once.
+   */
+  pma: boolean;
   /** Bbox-relative vertices in CSS px, x/y interleaved (indexed via `triangles`). */
   vertices: Float64Array;
   /** Normalized page UVs aligned with `vertices`. */
@@ -79,6 +88,8 @@ interface PageTexture {
   texture: WebGLTexture | null;
   /** Live retain() calls outstanding — one per renderer drawing this page. */
   users: number;
+  /** The alpha convention `texture` was uploaded under; meaningless without it. */
+  pma: boolean;
 }
 
 class MeshGlBlitter {
@@ -234,7 +245,7 @@ class MeshGlBlitter {
     for (let i = 0; i < jobs.length; i++) {
       const job = jobs[i];
       if (job.page !== boundPage) {
-        gl.bindTexture(gl.TEXTURE_2D, this.textureFor(job.page));
+        gl.bindTexture(gl.TEXTURE_2D, this.textureFor(job.page, job.pma));
         boundPage = job.page;
       }
       // Scissor is bottom-left origin; pack coords are top-left origin.
@@ -275,7 +286,7 @@ class MeshGlBlitter {
   retain(page: HTMLImageElement): void {
     const entry = this.textures.get(page);
     if (entry) entry.users++;
-    else this.textures.set(page, { texture: null, users: 1 });
+    else this.textures.set(page, { texture: null, users: 1, pma: false });
   }
 
   /**
@@ -322,15 +333,35 @@ class MeshGlBlitter {
     return shader;
   }
 
-  private textureFor(page: HTMLImageElement): WebGLTexture {
+  /**
+   * The page's GL texture, uploaded on demand.
+   *
+   * `pma` is a property of the page's *pixels*, so one image cannot honestly be
+   * both: two atlases naming the same image with different `pma:` lines are not
+   * a mixed page, one of them is simply wrong about the file. The cache is keyed
+   * by the image, so rather than trusting that, a flag that disagrees with the
+   * live upload re-uploads under the new one — the pathological case stays
+   * correct (at the price of re-uploading while it lasts) instead of silently
+   * drawing one of the two atlases wrong.
+   */
+  private textureFor(page: HTMLImageElement, pma: boolean): WebGLTexture {
     let entry = this.textures.get(page);
-    if (entry?.texture) return entry.texture;
+    if (entry?.texture) {
+      if (entry.pma === pma) return entry.texture;
+      this.gl.deleteTexture(entry.texture);
+      entry.texture = null;
+      this.liveTextureCount--;
+    }
     const gl = this.gl;
     const texture = gl.createTexture();
     if (!texture) throw new Error('createTexture failed');
     gl.bindTexture(gl.TEXTURE_2D, texture);
-    // Premultiply at upload so blending and the premultiplied canvas agree.
-    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, 1);
+    // Premultiply at upload so blending and the premultiplied canvas agree —
+    // unless the page is already premultiplied (`pma: true`), where doing it
+    // again is the second multiply that darkens every semi-transparent texel
+    // (#37). The blend below is premultiplied source-over either way, so a pma
+    // page is simply uploaded as it is: no conversion, nothing lost.
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, pma ? 0 : 1);
     gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, 0);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, page);
     // Linear, no mips, clamped — NPOT-safe in WebGL1.
@@ -344,9 +375,10 @@ class MeshGlBlitter {
       // does not re-upload per flush; with no users only a context loss (or
       // the image being collected, which takes the weak entry with it) clears
       // it, which is exactly the old behavior for a caller that opts out.
-      entry = { texture: null, users: 0 };
+      entry = { texture: null, users: 0, pma };
       this.textures.set(page, entry);
     }
+    entry.pma = pma;
     entry.texture = texture;
     this.liveTextureCount++;
     return texture;

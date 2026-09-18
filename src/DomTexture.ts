@@ -56,6 +56,143 @@ function revokeOwned(url: string): void {
 }
 
 /**
+ * Page pixels in the alpha convention a DOM/canvas2d consumer needs: the page
+ * image itself, or the derived canvas below when the page is premultiplied.
+ */
+export type PageSource = HTMLImageElement | HTMLCanvasElement;
+
+/**
+ * Straight-alpha derivations of `pma: true` page images, one per image.
+ *
+ * Spine's texture packer premultiplies by default, and an atlas says so with a
+ * `pma: true` page line: the file's RGB is already multiplied by its alpha. The
+ * DOM and canvas 2D have no such mode — an <img> and `drawImage` composite
+ * straight alpha by definition, so they multiply by alpha again and every
+ * semi-transparent texel comes out darker than it was authored (#37). Both
+ * consumers of that convention here — the region cuts below and the canvas2d
+ * mesh raster in SpineHtmlRenderer — therefore read this derivation instead of
+ * the page, and it is *shared*: deriving per consumer would pay for the same
+ * page once per renderer and once again for the load.
+ *
+ * (The GL mesh backend needs no derivation. It consumes premultiplied texels by
+ * construction, so it just skips `UNPACK_PREMULTIPLY_ALPHA_WEBGL` at upload —
+ * lossless, and the reason the two backends differ at all on such a page.)
+ *
+ * Weak by the page image, exactly like the GL texture cache: this package never
+ * pins the caller's image, and a page the caller drops takes its derivation
+ * with it. So nothing has to be freed by hand and `dispose()` stays out of it —
+ * the ownership boundary is the same one `revokeRegions` respects.
+ *
+ * **What it costs while alive:** one page-sized canvas per `pma` page image
+ * (4 bytes/px — 1 MiB for a 1024×256 page, 16 MiB for a 2048×2048 one), held
+ * for as long as the caller holds the page. It is deliberately *not* charged to
+ * the cut-backing budget below: that budget bounds the canvases in flight
+ * during a load, a peak that appears and drains, while this sits alongside the
+ * decoded page itself for the page's whole life — the same category as the
+ * decoded pages the budget already documents as resident throughout.
+ */
+const straightAlphaPages = new WeakMap<HTMLImageElement, PageSource>();
+
+/** Derivations performed since load — see straightAlphaDerivations(). */
+let derivationCount = 0;
+
+/**
+ * How many straight-alpha page derivations have been built in this document.
+ *
+ * Deterministic (no GC in the path) and monotonic, so a test reads it before
+ * and after and asserts the *difference*. Exported for the tests only — it is
+ * not re-exported from index.ts and the `exports` map denies deep imports, so
+ * it is not package API. (The same arrangement as `liveTextureCount` on the GL
+ * blitter, and for the same reason: a cache that works is invisible.)
+ */
+export function straightAlphaDerivations(): number {
+  return derivationCount;
+}
+
+/**
+ * The page as a straight-alpha source: the image itself when `pma` is false,
+ * otherwise its (cached) un-premultiplied derivation.
+ *
+ * `rgb = round(rgb * 255 / a)`, clamped, with `a === 0` left at (0,0,0,0) —
+ * there is no colour to recover from a fully transparent texel.
+ *
+ * **Precision.** The division is done in 8 bits and cannot be done anywhere
+ * else: a 2D canvas stores premultiplied colour, so `getImageData` hands back
+ * `round(round(u * a / 255) * 255 / a)` for a file value `u`, already quantized
+ * by the read (measured on both engines: put→get moves a value by up to 127 at
+ * a = 1). The colour a low-alpha texel composites to is therefore off by at
+ * most ~min(a, 127.5/a + 0.5) of 255 — nothing at a = 255 or a = 0, ≤ 1 above
+ * a = 128, worst ~12 around a = 11, and bounded by `a` below that. Writing the
+ * values back is exact, not a second premultiply: the canvas quantizer is
+ * idempotent, so putting a value that came out of it stores it unchanged
+ * (measured: a second round trip moves nothing on either engine). The remaining
+ * error is one-way rounding on near-invisible texels, against a defect that
+ * darkened every semi-transparent texel by up to 59 luma.
+ *
+ * A page image that cannot be read — no 2D context, or a cross-origin image
+ * without CORS, where `getImageData` throws — falls back to the page itself and
+ * caches *that*: the colour is then as wrong as it is today, but it happens
+ * once per image instead of once per frame, and no frame throws. (The cut path
+ * already fails on such an image at `toBlob`, so only the mesh tier can get
+ * here.) An image that has not decoded yet is left uncached, so the derivation
+ * happens once it has.
+ */
+export function straightAlphaSource(page: HTMLImageElement, pma: boolean): PageSource {
+  if (!pma) return page;
+  const cached = straightAlphaPages.get(page);
+  if (cached) return cached;
+
+  const width = page.naturalWidth;
+  const height = page.naturalHeight;
+  // Nothing to read yet: decide later rather than caching an empty canvas.
+  if (!(width > 0) || !(height > 0)) return page;
+
+  const derived = unpremultiply(page, width, height);
+  straightAlphaPages.set(page, derived);
+  if (derived !== page) derivationCount++;
+  return derived;
+}
+
+/** The pixel pass behind straightAlphaSource; `page` back on any read failure. */
+function unpremultiply(page: HTMLImageElement, width: number, height: number): PageSource {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  // No willReadFrequently: this reads once and is then a drawImage *source*
+  // for the rest of its life, which wants the accelerated surface.
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return page;
+  ctx.drawImage(page, 0, 0);
+  let pixels: ImageData;
+  try {
+    pixels = ctx.getImageData(0, 0, width, height);
+  } catch {
+    // Tainted canvas (cross-origin page image, no CORS).
+    return page;
+  }
+  const data = pixels.data;
+  for (let i = 0; i < data.length; i += 4) {
+    const a = data[i + 3];
+    if (a === 255) continue;
+    if (a === 0) {
+      // Nothing to divide by, and nothing there to see.
+      data[i] = 0;
+      data[i + 1] = 0;
+      data[i + 2] = 0;
+      continue;
+    }
+    const scale = 255 / a;
+    // Rounded explicitly: assigning a fraction to a Uint8ClampedArray rounds
+    // half-to-even, which is not the rule stated above.
+    data[i] = Math.min(255, Math.round(data[i] * scale));
+    data[i + 1] = Math.min(255, Math.round(data[i + 1] * scale));
+    data[i + 2] = Math.min(255, Math.round(data[i + 2] * scale));
+  }
+  ctx.putImageData(pixels, 0, 0);
+  return canvas;
+}
+
+/**
  * Backing pixels the cuts still waiting for their PNG encode may hold at once.
  *
  * A started cut keeps its canvas alive until `toBlob` calls back, so starting
@@ -167,7 +304,21 @@ function planCut(region: TextureAtlasRegion, image: HTMLImageElement): CutPlan {
   // whole page is a whole page whether it ships at 1×, half or double, and the
   // cut would copy the image either way. (It used to be tested against the
   // image, which was the same rule as long as the two always agreed.)
-  if (!rotated && region.x === 0 && region.y === 0 && packedW === pageW && packedH === pageH) {
+  //
+  // Except on a premultiplied page, where the page URL is exactly what must not
+  // be handed through: those pixels are premultiplied and an <img> composites
+  // straight alpha, so passing the URL along would ship the defect to the one
+  // atlas shape that never even allocates a canvas (one part per page). Such a
+  // region is cut like any other — from the straight-alpha derivation — and the
+  // blob it mints is owned and revoked like any other.
+  if (
+    !region.page.pma &&
+    !rotated &&
+    region.x === 0 &&
+    region.y === 0 &&
+    packedW === pageW &&
+    packedH === pageH
+  ) {
     return { passThrough: true, sx: 0, sy: 0, sw: iw, sh: ih, cw: iw, ch: ih };
   }
 
@@ -241,7 +392,12 @@ async function cutRegion(
     ctx.translate(0, plan.ch);
     ctx.rotate(-Math.PI / 2);
   }
-  ctx.drawImage(image, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.sw, plan.sh);
+  // Straight alpha on a premultiplied page, since the cut is encoded to a PNG
+  // and shown in an <img>. The rect was planned against the image, and the
+  // derivation is that image's own size, so the coordinates carry over
+  // unchanged — including on a page that ships at another resolution.
+  const source = straightAlphaSource(image, region.page.pma);
+  ctx.drawImage(source, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.sw, plan.sh);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
