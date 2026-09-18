@@ -166,6 +166,8 @@ export interface SpineHtmlHarness {
   cutConcurrencyProbe(): Promise<CutConcurrencyProbeResult>;
   cutOrderProbe(): Promise<CutOrderProbeResult>;
   cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult>;
+  scaledPageProbe(): Promise<ScaledPageProbeResult>;
+  halfResRenderProbe(): Promise<HalfResRenderProbeResult>;
 }
 
 declare global {
@@ -1884,6 +1886,335 @@ async function cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult> {
   };
 }
 
+/**
+ * Pages that ship at a resolution their atlas does not declare.
+ *
+ * Half-resolution texture builds and @2x variants leave the `size:` line
+ * alone, so the declared page size and the image's pixel size disagree. The
+ * mesh tier never noticed — spine-core's UVs are normalized against the
+ * declared size and both raster backends address texels as `uv * size` off the
+ * actual image — while the rigid cut used to take the region's bounds as image
+ * pixels, so every rigid part of such a skeleton came out of the wrong
+ * rectangle. Pixels are the oracle here: each region is a distinct flat
+ * colour, so a cut from the wrong rect mixes colours and a rotation read the
+ * wrong way is the wrong aspect or transparent.
+ */
+
+/**
+ * Four regions tiling one page (one of them packed rotated), one whole-page
+ * page for the pass-through, and one page whose interior boundary lands
+ * mid-pixel at half resolution.
+ */
+const SCALED_PAGE_ATLAS = `art.png
+size: 64, 32
+tl
+bounds: 0, 0, 32, 16
+tr
+bounds: 32, 0, 32, 16
+rot
+bounds: 0, 16, 16, 32
+rotate: true
+br
+bounds: 32, 16, 32, 16
+
+whole.png
+size: 24, 16
+whole
+bounds: 0, 0, 24, 16
+
+odd.png
+size: 64, 32
+odd-left
+bounds: 0, 0, 31, 32
+odd-right
+bounds: 31, 0, 33, 32
+`;
+
+/** One flat colour per region of SCALED_PAGE_ATLAS. */
+const SCALED_PAGE_COLORS: Record<string, string> = {
+  tl: '#ff0000',
+  tr: '#00ff00',
+  rot: '#0000ff',
+  br: '#ffff00',
+  whole: '#ff00ff',
+  'odd-left': '#00ffff',
+  'odd-right': '#ffffff',
+};
+
+export interface ScaledCutEntry {
+  name: string;
+  /** RegionImage.width/height: atlas units, whatever the page ships at. */
+  width: number;
+  height: number;
+  /** Natural size of the bitmap behind RegionImage.url. */
+  pixelWidth: number;
+  pixelHeight: number;
+  /** '#rrggbbaa' of the bitmap's first pixel. */
+  color: string;
+  /** Whether every other pixel of it matches that one. */
+  uniform: boolean;
+  /** True when the URL is the page image's own — the whole-page pass-through. */
+  passedThrough: boolean;
+}
+
+export interface ScaledPageSample {
+  /** Pixel size each page image was actually painted at, by page name. */
+  pageSizes: Record<string, { width: number; height: number }>;
+  /** URLs unpackRegions minted for this resolution. */
+  mintedCount: number;
+  regions: ScaledCutEntry[];
+}
+
+export interface ScaledPageProbeResult {
+  /** The declared page sizes, straight off the parsed atlas. */
+  declared: Record<string, { width: number; height: number }>;
+  half: ScaledPageSample;
+  natural: ScaledPageSample;
+  double: ScaledPageSample;
+}
+
+/**
+ * Paints one page of SCALED_PAGE_ATLAS at `scale` × its declared size.
+ *
+ * Each region's *packed* rect is filled with its own colour, snapped to whole
+ * pixels the way a packer exporting at this scale would have to. Every
+ * resolution is painted from the region table, never resampled from another
+ * one, so a bitmap that came out of the wrong rectangle cannot be excused as a
+ * filtering artefact.
+ */
+async function paintScaledPage(
+  page: {
+    width: number;
+    height: number;
+    regions: ReadonlyArray<{
+      name: string;
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      degrees: number;
+    }>;
+  },
+  scale: number,
+): Promise<{ image: HTMLImageElement; url: string; width: number; height: number }> {
+  const width = Math.round(page.width * scale);
+  const height = Math.round(page.height * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2d context unavailable');
+  for (const region of page.regions) {
+    const rotated = region.degrees === 90;
+    const packedW = rotated ? region.height : region.width;
+    const packedH = rotated ? region.width : region.height;
+    const x0 = Math.round(region.x * scale);
+    const y0 = Math.round(region.y * scale);
+    ctx.fillStyle = SCALED_PAGE_COLORS[region.name] ?? '#000000';
+    ctx.fillRect(
+      x0,
+      y0,
+      Math.round((region.x + packedW) * scale) - x0,
+      Math.round((region.y + packedH) * scale) - y0,
+    );
+  }
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+  });
+  const url = URL.createObjectURL(blob);
+  return { image: await loadImage(url), url, width, height };
+}
+
+/** Reads a bitmap back: its natural size, its first pixel, and whether it is flat. */
+async function readBitmap(
+  url: string,
+): Promise<{ width: number; height: number; color: string; uniform: boolean }> {
+  const image = await loadImage(url);
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2d context unavailable');
+  ctx.drawImage(image, 0, 0);
+  const { data } = ctx.getImageData(0, 0, width, height);
+  const hex = (offset: number): string =>
+    [...data.slice(offset, offset + 4)]
+      .map((channel) => channel.toString(16).padStart(2, '0'))
+      .join('');
+  let uniform = true;
+  for (let offset = 4; offset < data.length; offset += 4) {
+    if (
+      data[offset] !== data[0] ||
+      data[offset + 1] !== data[1] ||
+      data[offset + 2] !== data[2] ||
+      data[offset + 3] !== data[3]
+    ) {
+      uniform = false;
+      break;
+    }
+  }
+  return { width, height, color: `#${hex(0)}`, uniform };
+}
+
+async function scaledPageProbe(): Promise<ScaledPageProbeResult> {
+  async function measure(scale: number): Promise<ScaledPageSample> {
+    const atlas = new TextureAtlas(SCALED_PAGE_ATLAS);
+    const pageImages = new Map<string, HTMLImageElement>();
+    const pageUrls: string[] = [];
+    const pageSizes: Record<string, { width: number; height: number }> = {};
+    for (const page of atlas.pages) {
+      const painted = await paintScaledPage(page, scale);
+      page.setTexture(new DomTexture(painted.image));
+      pageImages.set(page.name, painted.image);
+      pageUrls.push(painted.url);
+      pageSizes[page.name] = { width: painted.width, height: painted.height };
+    }
+
+    const unpacked = await trackObjectUrls(() => unpackRegions(atlas, pageImages));
+    const pageUrlSet = new Set(pageUrls);
+    const regions: ScaledCutEntry[] = [];
+    for (const [name, region] of unpacked.result) {
+      const bitmap = await readBitmap(region.url);
+      regions.push({
+        name,
+        width: region.width,
+        height: region.height,
+        pixelWidth: bitmap.width,
+        pixelHeight: bitmap.height,
+        color: bitmap.color,
+        uniform: bitmap.uniform,
+        passedThrough: pageUrlSet.has(region.url),
+      });
+    }
+
+    revokeRegions(unpacked.result);
+    for (const url of pageUrls) URL.revokeObjectURL(url);
+    return { pageSizes, mintedCount: unpacked.created.length, regions };
+  }
+
+  const declared: Record<string, { width: number; height: number }> = {};
+  for (const page of new TextureAtlas(SCALED_PAGE_ATLAS).pages) {
+    declared[page.name] = { width: page.width, height: page.height };
+  }
+
+  return {
+    declared,
+    half: await measure(0.5),
+    natural: await measure(1),
+    double: await measure(2),
+  };
+}
+
+export interface RigidBox {
+  /** The <img> width/height content attributes — its layout box. */
+  attrWidth: number;
+  attrHeight: number;
+  /** The bitmap actually behind it. */
+  naturalWidth: number;
+  naturalHeight: number;
+  /** Its on-screen box, in the root's own coordinates. */
+  rect: { x: number; y: number; width: number; height: number };
+}
+
+export interface HalfResRenderProbeResult {
+  /** Declared page size, and the pixel size each run's page image shipped at. */
+  declared: { width: number; height: number };
+  fullPage: { width: number; height: number };
+  halfPage: { width: number; height: number };
+  full: RigidBox[];
+  half: RigidBox[];
+}
+
+/**
+ * The rigid tier through the public render path, against a page image shipped
+ * at half the declared size.
+ *
+ * The demo's own atlas, its page repainted at 0.5× — the shape a project ships
+ * when it exports textures at half resolution and leaves the atlas untouched.
+ * `renderRegion` writes `RegionImage.width/height` onto the <img> and divides
+ * the world corners by them, so as long as those stay in atlas units the
+ * layout box and the CSS matrix cannot move; only the bitmap inside them gets
+ * smaller. That is the claim this measures, rather than assuming it.
+ */
+async function halfResRenderProbe(): Promise<HalfResRenderProbeResult> {
+  const fullPage = await loadImage('/spineboy/spineboy.png');
+  const halfCanvas = document.createElement('canvas');
+  halfCanvas.width = Math.round(fullPage.naturalWidth / 2);
+  halfCanvas.height = Math.round(fullPage.naturalHeight / 2);
+  const halfCtx = halfCanvas.getContext('2d');
+  if (!halfCtx) throw new Error('2d context unavailable');
+  halfCtx.drawImage(fullPage, 0, 0, halfCanvas.width, halfCanvas.height);
+  const halfBlob = await new Promise<Blob>((resolve, reject) => {
+    halfCanvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+  });
+  const halfPageUrl = URL.createObjectURL(halfBlob);
+
+  const root = document.createElement('div');
+  root.style.cssText = 'position: absolute; left: 0; top: 0';
+  document.body.append(root);
+
+  async function run(resolvePage?: () => string): Promise<RigidBox[]> {
+    const assets = await loadAtlasAssets({
+      atlasUrl: '/spineboy/spineboy.atlas',
+      ...(resolvePage ? { resolvePage } : {}),
+    });
+    const data = await loadSkeletonJson(assets, '/spineboy/spineboy-ess.json');
+    const skeleton = new Skeleton(data);
+    const state = new AnimationState(new AnimationStateData(data));
+    state.setAnimation(0, 'walk', true);
+    state.update(1.2);
+    state.apply(skeleton);
+    skeleton.update(1.2);
+    skeleton.updateWorldTransform(Physics.update);
+    const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+    renderer.render(skeleton);
+
+    const images = [...root.querySelectorAll('img')];
+    // naturalWidth is 0 until the blob decodes, and it is half of the point.
+    await Promise.all(images.map((image) => image.decode().catch(() => {})));
+    const rootBox = root.getBoundingClientRect();
+    const round = (value: number): number => Math.round(value * 1000) / 1000;
+    const boxes = images.map((image) => {
+      const box = image.getBoundingClientRect();
+      return {
+        attrWidth: image.width,
+        attrHeight: image.height,
+        naturalWidth: image.naturalWidth,
+        naturalHeight: image.naturalHeight,
+        rect: {
+          x: round(box.x - rootBox.x),
+          y: round(box.y - rootBox.y),
+          width: round(box.width),
+          height: round(box.height),
+        },
+      };
+    });
+
+    renderer.dispose();
+    root.replaceChildren();
+    assets.dispose();
+    return boxes;
+  }
+
+  const full = await run();
+  const half = await run(() => halfPageUrl);
+  root.remove();
+  URL.revokeObjectURL(halfPageUrl);
+
+  const atlasPage = new TextureAtlas(await (await fetch('/spineboy/spineboy.atlas')).text())
+    .pages[0];
+
+  return {
+    declared: { width: atlasPage?.width ?? 0, height: atlasPage?.height ?? 0 },
+    fullPage: { width: fullPage.naturalWidth, height: fullPage.naturalHeight },
+    halfPage: { width: halfCanvas.width, height: halfCanvas.height },
+    full,
+    half,
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -1899,4 +2230,6 @@ window.spineHtmlHarness = {
   cutConcurrencyProbe,
   cutOrderProbe,
   cutFlightFailureProbe,
+  scaledPageProbe,
+  halfResRenderProbe,
 };

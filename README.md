@@ -247,6 +247,37 @@ it — and calling it twice is a no-op. Load once for the page's lifetime and yo
 can ignore it; load and unload repeatedly without it and you leak an atlas per
 cycle.
 
+### Pages that ship at another resolution
+
+A page image may ship at a resolution its atlas does not declare — a
+half-resolution texture build, or an @2x variant, with the `size:` line left as
+the packer wrote it. Nothing here needs a flag for that. A region's bounds are
+read **relative to the declared page size** and scaled onto the image's natural
+size, which is exactly how `spine-core` derives the UVs the mesh tier samples
+with (`region.u = region.x / page.width`), so both tiers land on the same
+pixels at any resolution:
+
+```
+hero.png
+size: 4096, 4096     # what the packer wrote
+                     # hero.png itself ships 2048×2048
+```
+
+Each unpacked bitmap comes out at the **native resolution of the pixels it was
+cut from** — half-resolution pages cost a quarter of the cut pixels, and
+nothing is upscaled back — while `RegionImage.width`/`height` stay in **atlas
+units**. Those two numbers are the `<img>` layout box and the denominator of
+its CSS matrix, so the skeleton poses identically and the browser scales the
+smaller bitmap into the same box, the way a GPU samples a smaller texture
+through the same UVs. Ship one atlas and swap the images per device if you
+like.
+
+The corollary: a `size:` line that is simply **wrong** is now wrong for the
+whole renderer rather than for the mesh tier alone. Bounds are read against
+what the atlas declares, so a page declared at a size its artwork was not
+packed at reads every region from the wrong place in both tiers — correct the
+`size:` line, which is what every other Spine runtime needs too.
+
 ### What unloading frees
 
 `revokeRegions()` — and `assets.dispose()`, which just calls it — frees the blob
@@ -297,12 +328,16 @@ bounds: 0, 0, 640, 480
 `spine-core` parses this as a normal multi-page atlas and nothing here needs a
 flag. Two things to know:
 
-- **`size:` must be the PNG's real pixel size.** UVs are derived from it
-  (`region.x / page.width`), and a wrong value skews the mesh tier while the
-  rigid tier still looks fine — a confusing failure to chase.
+- **`size:` is the frame every coordinate is read in**, so each page's
+  `bounds` must be written against the `size:` above them. The two need not be
+  the PNG's pixel size — that is the point of the section above, and a
+  half-resolution `head.png` under `size: 512, 512` works — but a `size:` that
+  matches neither the bounds nor the artwork reads every region from the wrong
+  place, in both tiers.
 - Regions like these cover their whole page, so `unpackRegions` hands the page
-  image straight through instead of cutting and re-encoding it. Load cost for
-  this atlas shape is just the image loads.
+  image straight through instead of cutting and re-encoding it — at any image
+  resolution, since covering the page is a statement about the declared size.
+  Load cost for this atlas shape is just the image loads.
 
 For a **rigid-only** skeleton you can skip atlas unpacking altogether and hand
 the renderer a map you build yourself — meshes cannot, because the deform tier

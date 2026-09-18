@@ -38,6 +38,20 @@ README.md for architecture and measured numbers.
   pixel-index frame) is the bug fixed in #1; it was worth 15–250× in parity
   residue, depending on the scene. No half-texel term: the per-triangle affine
   maps corners, it does not sample.
+- **The rigid cut reads the page in that same frame** — the region's bounds
+  relative to the declared page size (`region.page.width/height`), times the
+  image's natural size, rounded per *edge* so neighbouring cuts keep tiling
+  exactly. That is what lets a page ship at a resolution its `size:` line does
+  not mention (half-res builds, @2x): spine-core normalizes UVs against the
+  declared size and a sampler does not care what resolution the texture has, so
+  the mesh tier never noticed, and cutting in declared pixels was the rigid
+  tier's private bug (#32). A cut bitmap is therefore the **native resolution**
+  of its rect, never upscaled, while `RegionImage.width`/`height` are **atlas
+  units whatever the bitmap's resolution** — they are the `<img>` layout box
+  and the matrix denominator, so `renderRegion` needs to know nothing about the
+  page. The page's declared size missing or zero still means "the image is its
+  own declared size". `tests/regions.spec.ts` holds it, on artwork painted
+  three times at 0.5×/1×/2× rather than resampled.
 - **The canvas2d path draws a per-triangle source sub-rect, never the whole
   page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
   affines — measured (displaced texture on head/goggles/foot triangles while

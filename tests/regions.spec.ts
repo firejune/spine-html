@@ -167,6 +167,219 @@ test('a duplicate name resolves to the last region in atlas order', async ({ pag
   expect([...live].sort()).toEqual([...probe.dupRegions.map((region) => region.url)].sort());
 });
 
+/**
+ * Pages shipped at a resolution their atlas does not declare (#32).
+ *
+ * The same synthetic artwork is painted at 0.5×, 1× and 2× of the declared
+ * page size — painted at each resolution, never resampled from another — and
+ * cut at all three. What must hold: the sizes a caller sees stay in atlas
+ * units, each bitmap is the native size of the rect it came from, and every
+ * cut is exactly its own flat colour. A source rect taken in declared pixels
+ * (the defect) reads the wrong rectangle at 0.5× and 2× and mixes colours in.
+ */
+
+/** RegionImage.width/height: the same at every page resolution. */
+const ATLAS_UNITS: Record<string, [number, number]> = {
+  tl: [32, 16],
+  tr: [32, 16],
+  rot: [16, 32],
+  br: [32, 16],
+  whole: [24, 16],
+  'odd-left': [31, 32],
+  'odd-right': [33, 32],
+};
+
+/** One flat colour per region, mirroring SCALED_PAGE_COLORS in the harness. */
+const REGION_COLORS: Record<string, string> = {
+  tl: '#ff0000ff',
+  tr: '#00ff00ff',
+  rot: '#0000ffff',
+  br: '#ffff00ff',
+  whole: '#ff00ffff',
+  'odd-left': '#00ffffff',
+  'odd-right': '#ffffffff',
+};
+
+/**
+ * Bitmap pixels each cut must decode to, per page resolution.
+ *
+ * Every one of these is the region's packed rect scaled onto the image — the
+ * declared size never appears. `rot` is listed in artwork orientation, which
+ * is the transpose of the 32×16 rect it occupies on the page.
+ */
+const CUT_PIXELS: Record<string, Record<string, [number, number]>> = {
+  half: {
+    tl: [16, 8],
+    tr: [16, 8],
+    rot: [8, 16],
+    br: [16, 8],
+    whole: [12, 8],
+    'odd-left': [16, 16],
+    'odd-right': [16, 16],
+  },
+  natural: {
+    tl: [32, 16],
+    tr: [32, 16],
+    rot: [16, 32],
+    br: [32, 16],
+    whole: [24, 16],
+    'odd-left': [31, 32],
+    'odd-right': [33, 32],
+  },
+  double: {
+    tl: [64, 32],
+    tr: [64, 32],
+    rot: [32, 64],
+    br: [64, 32],
+    whole: [48, 32],
+    'odd-left': [62, 64],
+    'odd-right': [66, 64],
+  },
+};
+
+const RESOLUTIONS = ['half', 'natural', 'double'] as const;
+
+test('a page may ship at a resolution the atlas does not declare', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.scaledPageProbe());
+
+  // The premise: one declared size, three different images painted for it.
+  expect(probe.declared).toEqual({
+    'art.png': { width: 64, height: 32 },
+    'whole.png': { width: 24, height: 16 },
+    'odd.png': { width: 64, height: 32 },
+  });
+  expect(probe.half.pageSizes['art.png']).toEqual({ width: 32, height: 16 });
+  expect(probe.natural.pageSizes['art.png']).toEqual({ width: 64, height: 32 });
+  expect(probe.double.pageSizes['art.png']).toEqual({ width: 128, height: 64 });
+
+  for (const resolution of RESOLUTIONS) {
+    const sample = probe[resolution];
+    const names = sample.regions.map((region) => region.name);
+    expect(names, resolution).toEqual(Object.keys(ATLAS_UNITS));
+
+    for (const region of sample.regions) {
+      const where = `${resolution}/${region.name}`;
+
+      // The sizes a caller sees are atlas units at every resolution: the rigid
+      // tier writes them onto the <img> and divides the world corners by them,
+      // so a bitmap's own resolution must not reach them.
+      expect([region.width, region.height], where).toEqual(ATLAS_UNITS[region.name]);
+
+      // Right pixels, asserted before the bookkeeping because this is the
+      // oracle: each region is one flat colour and they tile their page, so a
+      // cut taken from the wrong rectangle is not uniform (it carries a
+      // neighbour's colour), is transparent (it ran off the image), or is not
+      // its own colour at all.
+      expect(region.uniform, where).toBe(true);
+      expect(region.color, where).toBe(REGION_COLORS[region.name]);
+
+      // And the bitmap is the native size of the rect it was cut from — half
+      // the pixels per axis at 0.5×, double at 2×. Upscaling every cut back to
+      // declared size (what a consumer's fork of unpackRegions did) keeps the
+      // colours right and fails here, which is the point of asserting both.
+      expect([region.pixelWidth, region.pixelHeight], where).toEqual(
+        CUT_PIXELS[resolution][region.name],
+      );
+    }
+  }
+});
+
+test('a rotated region comes out upright at every page resolution', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.scaledPageProbe());
+
+  // (d) `rot` is packed on its side: a 32×16 rect on the page holding 16×32 of
+  // artwork. The cut has to be the transpose of the rect, scaled — swapping
+  // the scaled width and height instead reads a rect that runs off the page,
+  // which lands as transparent rows rather than the region's colour.
+  for (const resolution of RESOLUTIONS) {
+    const rot = probe[resolution].regions.find((region) => region.name === 'rot');
+    expect(rot, resolution).toBeDefined();
+    expect([rot?.width, rot?.height], resolution).toEqual([16, 32]);
+    expect([rot?.pixelWidth, rot?.pixelHeight], resolution).toEqual(
+      CUT_PIXELS[resolution]['rot'],
+    );
+    // Portrait bitmap, one opaque colour: a cut that was never turned back
+    // upright is landscape, half transparent, or both.
+    expect((rot?.pixelHeight ?? 0) / (rot?.pixelWidth ?? 1), resolution).toBe(2);
+    expect(rot?.uniform, resolution).toBe(true);
+    expect(rot?.color, resolution).toBe(REGION_COLORS['rot']);
+  }
+});
+
+test('a whole-page region passes through at every page resolution', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.scaledPageProbe());
+
+  // (e) "Whole page" is a statement about the declared size, so it holds at
+  // any image resolution: the URL is the page's own and nothing is minted for
+  // it. Six of the seven regions are cut; `whole` is the one that is not.
+  for (const resolution of RESOLUTIONS) {
+    const sample = probe[resolution];
+    expect(sample.mintedCount, resolution).toBe(6);
+    const whole = sample.regions.find((region) => region.name === 'whole');
+    expect(whole?.passedThrough, resolution).toBe(true);
+    for (const region of sample.regions) {
+      if (region.name === 'whole') continue;
+      expect(region.passedThrough, `${resolution}/${region.name}`).toBe(false);
+    }
+  }
+});
+
+test('neighbouring cuts tile the image on a boundary that falls mid-pixel', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.scaledPageProbe());
+
+  // odd.png is split at x = 31 of 64 declared, which is x = 15.5 on the
+  // half-resolution image. Each edge is rounded to the nearest pixel, so the
+  // two cuts still tile the image exactly — 16 + 16 = 32. Rounding outward
+  // instead gives 16 + 17, and the extra column is the neighbour's colour;
+  // rounding inward leaves a column belonging to neither.
+  for (const resolution of RESOLUTIONS) {
+    const sample = probe[resolution];
+    const left = sample.regions.find((region) => region.name === 'odd-left');
+    const right = sample.regions.find((region) => region.name === 'odd-right');
+    const pageWidth = sample.pageSizes['odd.png']?.width;
+    expect((left?.pixelWidth ?? 0) + (right?.pixelWidth ?? 0), resolution).toBe(pageWidth);
+    expect(left?.pixelHeight, resolution).toBe(sample.pageSizes['odd.png']?.height);
+    // And neither cut carries the other's colour, which is the bleed itself.
+    expect(left?.uniform, resolution).toBe(true);
+    expect(right?.uniform, resolution).toBe(true);
+  }
+});
+
+test('a half-resolution page renders the same rigid boxes', async ({ page }) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.halfResRenderProbe());
+
+  // (f) The premise: one atlas declaring 1024×256, rendered once against the
+  // page image that ships at that size and once against a 512×128 build of it.
+  expect(probe.declared).toEqual({ width: 1024, height: 256 });
+  expect(probe.fullPage).toEqual({ width: 1024, height: 256 });
+  expect(probe.halfPage).toEqual({ width: 512, height: 128 });
+
+  expect(probe.full.length).toBeGreaterThan(0);
+  expect(probe.half.length).toBe(probe.full.length);
+
+  // The bitmaps really are smaller — otherwise the comparison below is vacuous.
+  // Half an axis to within a pixel, and not `round(size / 2)`: the cut rounds
+  // each *edge*, so a region of odd size sitting at an odd offset keeps the
+  // pixel its neighbour does not (21 px at y = 21 cuts to 10, not 11). That is
+  // the tiling rule, and 2 × half − full ∈ {−1, 0, 1} is exactly what it allows.
+  for (let i = 0; i < probe.full.length; i++) {
+    const full = probe.full[i];
+    const half = probe.half[i];
+    expect(Math.abs(half.naturalWidth * 2 - full.naturalWidth), `slot ${i}`).toBeLessThanOrEqual(1);
+    expect(Math.abs(half.naturalHeight * 2 - full.naturalHeight), `slot ${i}`).toBeLessThanOrEqual(
+      1,
+    );
+    expect(half.naturalWidth, `slot ${i}`).toBeLessThan(full.naturalWidth);
+    expect(half.naturalHeight, `slot ${i}`).toBeLessThan(full.naturalHeight);
+    // …and the layout box and the matrix that poses it are untouched, because
+    // RegionImage sizes are atlas units. renderRegion needs no change for any
+    // of this: it reads those two numbers and nothing else about the bitmap.
+    expect(half.attrWidth, `slot ${i}`).toBe(full.attrWidth);
+    expect(half.attrHeight, `slot ${i}`).toBe(full.attrHeight);
+    expect(half.rect, `slot ${i}`).toEqual(full.rect);
+  }
+});
+
 test('a cut that fails with others in flight strands none of them', async ({ page }) => {
   const probe = await page.evaluate(() => window.spineHtmlHarness.cutFlightFailureProbe());
 
