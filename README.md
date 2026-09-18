@@ -183,7 +183,7 @@ decision stays yours, and `spine-html` draws from either generation:
 | --- | --- |
 | **4.3.x** | ✅ supported |
 | **4.2.x** | ✅ supported |
-| 4.1.x and older | ❌ not supported |
+| 4.1.x and older | ❌ not supported — but see below for 4.1 / 4.0 *data* |
 
 *Supported* means one specific thing: a column of this repository's CI runs the
 **whole** test suite on that minor, against **that version's own** example
@@ -201,6 +201,21 @@ corpus of 267 skeletons (88% of them 4.2 exports): 40% failed to parse under
 4.3.13 outright, and across those that did parse, **0 of 7,065** constraints and
 **0 of 5,704** physics constraints were loaded. If a skeleton renders but goes
 limp, this is why — and installing the matching `spine-core` is the whole fix.
+
+**If your data was exported by 4.1 or 4.0**, install spine-core **4.2**. The
+table above is about *runtimes*, and the 4.1 and 4.0 runtimes are out for
+upstream packaging reasons (`Physics` is missing from 4.1's root entry, and both
+ship extensionless module specifiers that plain Node cannot resolve). Their
+*data* is another matter: the JSON format grew from 4.0 to 4.2 by addition, and
+measured over a real-world corpus of 1,454 shipped web skeletons — 916 exported
+by 4.2, 418 by 4.0, 101 by 4.1 — spine-core 4.2.120 parsed **every one** and
+loaded **all 14,022** of their constraints; a 60-rig sample of them (20 per
+export version) then loaded and rendered through this package on that core, on
+both mesh backends, without an error. What that does *not* establish is that a
+4.0 animation plays identically under the 4.2 runtime and under its own — that
+comparison was not made, and Esoteric Software's guidance remains to match
+versions. It is the difference between "loses every constraint, silently" (any
+of this data under 4.3) and "loads completely" (the same data under 4.2).
 
 Spine 3.8 and older are out of scope: they are not published under this package
 name.
