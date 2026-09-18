@@ -168,6 +168,7 @@ export interface SpineHtmlHarness {
   cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult>;
   scaledPageProbe(): Promise<ScaledPageProbeResult>;
   halfResRenderProbe(): Promise<HalfResRenderProbeResult>;
+  cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageResult>;
 }
 
 declare global {
@@ -2215,6 +2216,324 @@ async function halfResRenderProbe(): Promise<HalfResRenderProbeResult> {
   };
 }
 
+// --- how a cut locates its pixels on a rescaled page (#35) -----------------
+
+/**
+ * A capturable stage for comparing cut rules against the 1:1 page.
+ *
+ * When a page ships at a resolution its atlas does not declare, a region's
+ * rect on the image is fractional. `planCut` rounds each *edge* of it to a
+ * whole image pixel: every cut stays a lossless 1:1 copy and neighbours keep
+ * tiling exactly, at the price of up to half an image pixel of placement (and
+ * the matching slight stretch, since the bitmap is laid into an atlas-unit
+ * box). The other rule available is the one normalized UVs describe — sample
+ * the fractional rect with interpolation: exact placement, paid for with a
+ * resample of the whole bitmap.
+ *
+ * Which one lands closer to the truth is a measurement, and this is the
+ * instrument: the same frozen rigid-only pose, in the same stage, drawn from
+ * the page at 1:1 (the reference) and from a rescaled page under each rule, so
+ * the only variable is where the cut read its pixels. The DOM geometry is
+ * identical across all of them — `renderRegion` reads atlas units and nothing
+ * about the bitmap — so what a diff of two captures sees is texture placement
+ * and nothing else.
+ *
+ * `shifted` is the control: the shipped rule with every rect displaced one
+ * whole image pixel. It has to score clearly worse than both real rules, or
+ * the instrument cannot see placement at all and no verdict from it means
+ * anything.
+ *
+ * The specs screenshot `#cut-rule-stage` between calls, so each call opens by
+ * tearing down what the previous one left there.
+ */
+
+/** The shipped rule, the alternative, and the deliberately wrong control. */
+export type CutRule = 'edge' | 'fractional' | 'shifted';
+
+export interface CutRuleStageOptions {
+  /** Page image resolution, as a multiple of the declared size. 1 = as shipped. */
+  pageScale: number;
+  rule: CutRule;
+  /** Frozen pose: an animation of spineboy-ess, seeked to `time`. */
+  animation: string;
+  time: number;
+}
+
+export interface CutRuleStageResult {
+  /** The atlas `size:` line, which no page scale changes. */
+  declaredPage: { width: number; height: number };
+  /** What the page image this run cut from actually measures. */
+  pageSize: { width: number; height: number };
+  /** Slots drawn, and Σ of the natural pixels behind them. */
+  imageCount: number;
+  bitmapPixels: number;
+  /** Union of the slot boxes, in stage coordinates — the stage must contain it. */
+  contentBox: { x: number; y: number; width: number; height: number };
+}
+
+/** Stage geometry. The pose is drawn at half scale, so a 0.5× page maps ~1:1. */
+const CUT_RULE_STAGE = {
+  width: 400,
+  height: 440,
+  /** Skeleton origin (the feet) inside the stage. */
+  originX: 180,
+  originY: 420,
+  scale: 0.5,
+  background: '#14161a',
+};
+
+/** Fetched once: the atlas text and the page image as it ships. */
+let cutRuleSource: Promise<{ atlasText: string; page: HTMLImageElement }> | null = null;
+
+/**
+ * Page images by scale, minted once per document.
+ *
+ * Every rule at a given scale therefore cuts from the *same bytes* — a
+ * repainted page would put a second variable in the comparison — and the
+ * rescale itself is the one a project's texture build does: a high-quality
+ * draw of the whole page into a canvas of the target size.
+ */
+const cutRulePages = new Map<number, Promise<HTMLImageElement>>();
+
+/** What the stage is holding, to be torn down before the next render. */
+let cutRuleLive: { renderer: SpineHtmlRenderer; release: () => void } | null = null;
+let cutRuleStageEl: HTMLDivElement | null = null;
+
+function cutRuleAssets(): Promise<{ atlasText: string; page: HTMLImageElement }> {
+  if (!cutRuleSource) {
+    cutRuleSource = (async () => ({
+      atlasText: await (await fetch('/spineboy/spineboy.atlas')).text(),
+      page: await loadImage('/spineboy/spineboy.png'),
+    }))();
+  }
+  return cutRuleSource;
+}
+
+function cutRulePageImage(scale: number): Promise<HTMLImageElement> {
+  const cached = cutRulePages.get(scale);
+  if (cached) return cached;
+  const built = (async () => {
+    const { page } = await cutRuleAssets();
+    if (scale === 1) return page;
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(page.naturalWidth * scale);
+    canvas.height = Math.round(page.naturalHeight * scale);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('2d context unavailable');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(page, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+    });
+    // Kept for the document's lifetime on purpose: the image is the cache.
+    return await loadImage(URL.createObjectURL(blob));
+  })();
+  cutRulePages.set(scale, built);
+  return built;
+}
+
+/**
+ * One region's bitmap under a rule that is not the shipped one.
+ *
+ * Both variants start from the same fractional rect the shipped rule rounds —
+ * the region's bounds relative to the declared page size, times the image's
+ * natural size. `fractional` hands that rect to `drawImage` as it is and lets
+ * the rasterizer interpolate; `shifted` rounds it exactly as `planCut` does and
+ * then displaces the read by one whole image pixel (clamped to stay on the
+ * image, so it is a displacement and never a transparent margin).
+ *
+ * Canvas sizes stay at the rect's native resolution either way, and the
+ * rotation restore is the shipped one.
+ */
+async function cutRuleRegion(
+  region: TextureAtlas['regions'][number],
+  image: HTMLImageElement,
+  rule: 'fractional' | 'shifted',
+): Promise<string> {
+  const iw = image.naturalWidth;
+  const ih = image.naturalHeight;
+  const pageW = region.page.width > 0 ? region.page.width : iw;
+  const pageH = region.page.height > 0 ? region.page.height : ih;
+  const rotated = region.degrees === 90;
+  const packedW = rotated ? region.height : region.width;
+  const packedH = rotated ? region.width : region.height;
+  const scaleX = iw / pageW;
+  const scaleY = ih / pageH;
+
+  const fx = region.x * scaleX;
+  const fy = region.y * scaleY;
+  const fw = packedW * scaleX;
+  const fh = packedH * scaleY;
+
+  let sx = fx;
+  let sy = fy;
+  let sw = fw;
+  let sh = fh;
+  let dw = Math.max(1, Math.round(fw));
+  let dh = Math.max(1, Math.round(fh));
+  if (rule === 'shifted') {
+    const x0 = Math.round(fx);
+    const y0 = Math.round(fy);
+    sw = Math.max(1, Math.round(fx + fw) - x0);
+    sh = Math.max(1, Math.round(fy + fh) - y0);
+    dw = sw;
+    dh = sh;
+    sx = Math.min(x0 + 1, Math.max(0, iw - sw));
+    sy = Math.min(y0 + 1, Math.max(0, ih - sh));
+  }
+
+  const canvas = document.createElement('canvas');
+  canvas.width = rotated ? dh : dw;
+  canvas.height = rotated ? dw : dh;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2d context unavailable');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  if (rotated) {
+    ctx.translate(0, canvas.height);
+    ctx.rotate(-Math.PI / 2);
+  }
+  ctx.drawImage(image, sx, sy, sw, sh, 0, 0, dw, dh);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
+  });
+  return URL.createObjectURL(blob);
+}
+
+/** Every region of `atlas` under `rule`, plus the way to free what it minted. */
+async function cutRuleRegions(
+  atlas: TextureAtlas,
+  pageImages: Map<string, HTMLImageElement>,
+  rule: CutRule,
+): Promise<{ images: Map<string, RegionImage>; release: () => void }> {
+  if (rule === 'edge') {
+    const images = await unpackRegions(atlas, pageImages);
+    return { images, release: () => revokeRegions(images) };
+  }
+  const urls: string[] = [];
+  const images = new Map<string, RegionImage>();
+  const cuts = await Promise.all(
+    atlas.regions.map(async (region) => {
+      const image = pageImages.get(region.page.name);
+      if (!image) throw new Error(`Missing page image: ${region.page.name}`);
+      return { region, url: await cutRuleRegion(region, image, rule) };
+    }),
+  );
+  for (const cut of cuts) {
+    urls.push(cut.url);
+    images.set(cut.region.name, {
+      url: cut.url,
+      width: cut.region.width,
+      height: cut.region.height,
+    });
+  }
+  return {
+    images,
+    release: () => {
+      for (const url of urls) URL.revokeObjectURL(url);
+    },
+  };
+}
+
+function cutRuleStageElement(): HTMLDivElement {
+  if (cutRuleStageEl) return cutRuleStageEl;
+  const stage = document.createElement('div');
+  stage.id = 'cut-rule-stage';
+  stage.style.cssText =
+    `position: absolute; left: 0; top: 0; overflow: hidden;` +
+    `width: ${CUT_RULE_STAGE.width}px; height: ${CUT_RULE_STAGE.height}px;` +
+    `background: ${CUT_RULE_STAGE.background};`;
+  document.body.append(stage);
+  cutRuleStageEl = stage;
+  return stage;
+}
+
+async function cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageResult> {
+  // The screenshot of the previous render happens between two calls, so this
+  // is the only place its renderer and bitmaps can be let go of.
+  if (cutRuleLive) {
+    cutRuleLive.renderer.dispose();
+    cutRuleLive.release();
+    cutRuleLive = null;
+  }
+
+  const { atlasText } = await cutRuleAssets();
+  const image = await cutRulePageImage(options.pageScale);
+  const atlas = new TextureAtlas(atlasText);
+  const pageImages = new Map<string, HTMLImageElement>();
+  for (const page of atlas.pages) {
+    page.setTexture(new DomTexture(image));
+    pageImages.set(page.name, image);
+  }
+  const cut = await cutRuleRegions(atlas, pageImages, options.rule);
+  const data = await loadSkeletonJson({ atlas }, '/spineboy/spineboy-ess.json');
+
+  const stage = cutRuleStageElement();
+  stage.replaceChildren();
+  const root = document.createElement('div');
+  root.style.cssText =
+    `position: absolute; left: ${CUT_RULE_STAGE.originX}px; top: ${CUT_RULE_STAGE.originY}px;` +
+    `transform-origin: 0 0; transform: scale(${CUT_RULE_STAGE.scale});`;
+  stage.append(root);
+
+  const skeleton = new Skeleton(data);
+  const state = new AnimationState(new AnimationStateData(data));
+  state.setAnimation(0, options.animation, true);
+  state.update(options.time);
+  state.apply(skeleton);
+  skeleton.update(options.time);
+  skeleton.updateWorldTransform(Physics.update);
+  const renderer = new SpineHtmlRenderer(root, cut.images);
+  renderer.render(skeleton);
+  cutRuleLive = { renderer, release: cut.release };
+
+  const images = [...root.querySelectorAll('img')];
+  // The bitmap is the whole point, and naturalWidth is 0 until it decodes.
+  await Promise.all(images.map((img) => img.decode().catch(() => {})));
+  // …and a decoded bitmap is not yet a settled raster. Chromium paints the
+  // first frame of a freshly decoded image scaled down by more than ~2 with a
+  // cheaper filter and re-rasters it a frame or two later (measured: the first
+  // capture of a 1.5× page differed from the second and third by 23,612
+  // pixels, while the second and third were bit-identical). Whether a capture
+  // lands before or after that re-raster is a race, and a race in the
+  // instrument reads as a difference between rules. Several frames of settling
+  // is what closes it.
+  for (let frame = 0; frame < 8; frame++) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+
+  const stageBox = stage.getBoundingClientRect();
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let bitmapPixels = 0;
+  for (const img of images) {
+    const box = img.getBoundingClientRect();
+    minX = Math.min(minX, box.left - stageBox.left);
+    minY = Math.min(minY, box.top - stageBox.top);
+    maxX = Math.max(maxX, box.right - stageBox.left);
+    maxY = Math.max(maxY, box.bottom - stageBox.top);
+    bitmapPixels += img.naturalWidth * img.naturalHeight;
+  }
+  const round = (value: number): number => Math.round(value * 100) / 100;
+
+  const declaredPage = atlas.pages[0];
+  return {
+    declaredPage: { width: declaredPage?.width ?? 0, height: declaredPage?.height ?? 0 },
+    pageSize: { width: image.naturalWidth, height: image.naturalHeight },
+    imageCount: images.length,
+    bitmapPixels,
+    contentBox: {
+      x: round(minX),
+      y: round(minY),
+      width: round(maxX - minX),
+      height: round(maxY - minY),
+    },
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -2232,4 +2551,5 @@ window.spineHtmlHarness = {
   cutFlightFailureProbe,
   scaledPageProbe,
   halfResRenderProbe,
+  cutRuleStage,
 };

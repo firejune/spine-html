@@ -126,6 +126,22 @@ interface CutPlan {
  * neighbouring pixel into every cut on every side, which is bleed the caller
  * can see. A rect that scales down below one pixel still gets a 1×1 bitmap,
  * since a zero-sized canvas is not one.
+ *
+ * The alternative was measured, not argued away (#35): sampling the
+ * *fractional* rect with interpolation — what a GPU does with normalized UVs —
+ * buys exact placement with a resample of the whole bitmap. Both rules drew
+ * the same frozen rigid-only pose from a rescaled page, diffed against that
+ * pose drawn from the 1:1 page. The result is split, so the lossless copy
+ * stays: sampling lowers the raw difference and the peak channel delta, while
+ * rounding lowers the count of pixels with no in-tolerance match anywhere in
+ * the reference's 3×3 — rounding displaces the picture, which a shift-tolerant
+ * compare forgives, and sampling blurs it, which it does not. On that
+ * shift-tolerant count at 0.5×, the common case, rounding is ahead in every
+ * cell measured, by 1.3× to 2.2× (chromium 638 vs 1238, webkit 1443 vs 1888) —
+ * an ordering rather than a count, since the counts themselves move with the
+ * raster. At an integer page scale the two rules come out bit-identical, there
+ * being no fractional part to disagree about, so an @2x page never had a
+ * question to answer. `tests/cut-rule.spec.ts` holds the 0.5× half of this.
  */
 function planCut(region: TextureAtlasRegion, image: HTMLImageElement): CutPlan {
   const iw = image.naturalWidth;
