@@ -3491,15 +3491,42 @@ function finishPmaBands(bands: PmaBand[], sums: number[]): void {
 const DERIVATION_SLACK = 2;
 
 /**
+ * A 2D context created the way `unpremultiply` in DomTexture.ts creates the
+ * derivation's: **no context attributes**.
+ *
+ * The attribute is part of the storage. Everything else in this harness reads
+ * through `willReadFrequently: true`, and on Linux WebKit the two kinds of
+ * surface do not hold the same numbers: the same decoded image read back
+ * through one and through the other differed on 561 channels, by one level
+ * each, which the un-premultiply's `× 255/a` then carried to 8 (CI run
+ * 35365862520; on Chromium the two reads were identical). Anything that claims
+ * "same storage as the derived canvas" — the read its intended values start
+ * from, the scratch canvas it is compared with, the write-then-read control
+ * that bounds it — therefore has to come from here. With all three on this
+ * kind, that run measured the derived canvas equal to the scratch one on every
+ * channel; with any of them on the other kind, it did not.
+ */
+function libraryKindContext(width: number, height: number): CanvasRenderingContext2D {
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2d context unavailable');
+  return ctx;
+}
+
+/**
  * The **write-then-read** control: what this browser's 2D canvas does to a
  * straight-alpha value that is written with `putImageData` and read back again.
  *
  * The other control measures the read side (an image drawn in and read out);
  * this is the same premultiplied storage from the other direction, and it is
- * the one the derived canvas lives on. It is a property of the rasterizer:
- * macOS round-trips these values to within a step, Linux WebKit was measured at
- * 8 by CI (run 35362070508), which is what retired the absolute bound that used
- * to stand here.
+ * the one the derived canvas lives on. It is a property of the rasterizer, and
+ * of the kind of surface: every engine measured so far round-trips these values
+ * to within a step. (The 8 that Linux WebKit reported in CI run 35362070508 and
+ * that retired the absolute bound which used to stand here was *not* this — it
+ * was a one-level disagreement between two kinds of canvas, amplified by
+ * `× 255/a`; see `libraryKindContext`.)
  *
  * The texel set is the **value class the derivation can produce**, not an
  * arbitrary ramp: an un-premultiplied `round(k * 255 / a)` for every alpha and a
@@ -3510,20 +3537,17 @@ const DERIVATION_SLACK = 2;
  * superset of what the derivation writes. Returned per alpha, so the comparison
  * is per texel rather than per band.
  *
- * Measured on a canvas of the page's own dimensions: browsers may pick a
- * different raster path by surface size, and a control taken on a differently
- * sized canvas would be measuring a different thing from the one it bounds.
+ * Measured on a canvas of the page's own dimensions **and of the library's own
+ * kind** (`libraryKindContext`): browsers may pick a different raster path by
+ * surface size or by context attributes, and a control taken on a different
+ * surface would be measuring a different thing from the one it bounds.
  */
 function putGetControl(width: number, height: number): {
   perAlpha: Uint16Array;
   bands: PmaControlBand[];
 } {
   const size = 256;
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d', { willReadFrequently: true });
-  if (!ctx) throw new Error('2d context unavailable');
+  const ctx = libraryKindContext(width, height);
   const written = ctx.createImageData(width, height);
   const data = written.data;
   // Alpha down the rows, the value sweep across the columns; both wrap, so any
@@ -3675,7 +3699,9 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
 
   // The library's own derivation, read back and composited.
   const derived = straightAlphaSource(twin, true) as HTMLCanvasElement;
-  const derivedCtx = derived.getContext('2d', { willReadFrequently: true });
+  // The context the library already made: attributes passed to a second
+  // getContext call are ignored, so none are passed.
+  const derivedCtx = derived.getContext('2d');
   if (!derivedCtx) throw new Error('2d context unavailable');
   const derivedPixels = derivedCtx.getImageData(0, 0, derived.width, derived.height).data;
   const over = document.createElement('canvas');
@@ -3692,20 +3718,22 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
   // it started from — and then put through a scratch canvas of our own, so the
   // library's canvas can be compared against an identical round trip rather
   // than against the arithmetic it is allowed to be quantized away from.
-  const intended = new Uint8ClampedArray(readBack.length);
-  for (let i = 0; i < readBack.length; i += 4) {
-    const a = readBack[i + 3];
+  //
+  // "The same read" and "an identical round trip" both mean the library's kind
+  // of canvas, not this harness's usual one — see `libraryKindContext`.
+  const libraryReadCtx = libraryKindContext(source.width, source.height);
+  libraryReadCtx.drawImage(twin, 0, 0);
+  const libraryRead = libraryReadCtx.getImageData(0, 0, source.width, source.height).data;
+  const intended = new Uint8ClampedArray(libraryRead.length);
+  for (let i = 0; i < libraryRead.length; i += 4) {
+    const a = libraryRead[i + 3];
     intended[i + 3] = a;
     if (a === 0) continue;
     for (let c = 0; c < 3; c++) {
-      intended[i + c] = Math.min(255, Math.round((readBack[i + c] * 255) / a));
+      intended[i + c] = Math.min(255, Math.round((libraryRead[i + c] * 255) / a));
     }
   }
-  const scratch = document.createElement('canvas');
-  scratch.width = source.width;
-  scratch.height = source.height;
-  const scratchCtx = scratch.getContext('2d', { willReadFrequently: true });
-  if (!scratchCtx) throw new Error('2d context unavailable');
+  const scratchCtx = libraryKindContext(source.width, source.height);
   scratchCtx.putImageData(new ImageData(intended, source.width, source.height), 0, 0);
   const scratchBack = scratchCtx.getImageData(0, 0, source.width, source.height).data;
 
@@ -3732,8 +3760,9 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
     let pixelError = 0;
     let pixelDrift = 0;
     for (let c = 0; c < 3; c++) {
-      // The library's canvas against ours, both holding the same intended
-      // values: equal, or the library wrote something it did not compute.
+      // The library's canvas against ours, both of one kind and both holding
+      // the same intended values: equal, or the library wrote something it did
+      // not compute.
       if (derivedPixels[i + c] !== scratchBack[i + c]) derivedMismatches++;
       const drift = Math.abs(derivedPixels[i + c] - intended[i + c]);
       if (drift > pixelDrift) pixelDrift = drift;
@@ -3773,8 +3802,13 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
     // arithmetic term is **zero**: the derivation writes a value of exactly the
     // class the control was measured on, and nothing happens to it afterwards
     // but the storage the control just measured.
-    const driftBound = putGet.perAlpha[a];
-    const drift = driftBands[b];
+    // Banded and bounded by the alpha of the read the intended values came
+    // from, which is the one the derivation divided by.
+    const driftAlpha = libraryRead[i + 3];
+    const driftBand = pmaBandOf(driftAlpha);
+    if (driftBand === -1) continue;
+    const driftBound = putGet.perAlpha[driftAlpha];
+    const drift = driftBands[driftBand];
     if (driftBound >= 255) drift.vacuous++;
     drift.pixels++;
     driftSums[b] += pixelDrift;

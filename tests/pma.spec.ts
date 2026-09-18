@@ -444,9 +444,15 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
   //    the derivation writes a value of exactly the class the control was
   //    measured on, and nothing touches it afterwards but that same storage.
   //
-  // An absolute `≤ 1` stood here, taken from macOS; Linux WebKit reads 8 (CI run
-  // 35362070508). The magnitude is the rasterizer's, and it is why this is a
-  // comparison and not a constant.
+  // An absolute `≤ 1` stood here, taken from macOS, and Linux WebKit read 8 (CI
+  // run 35362070508). The comparison that replaced it went red there as well
+  // (run 35365368471), and that is what found the cause: the 8 was never the
+  // storage. The harness read the page through a `willReadFrequently` canvas,
+  // the library reads it through a plain one, and on that rasterizer the two
+  // disagree by one level on a few hundred channels — which `× 255/a` carries
+  // to 8 at alpha ~32. Both checks now start from the library's kind of canvas
+  // (`libraryKindContext` in the harness), where run 35365862520 measured the
+  // derived canvas equal to the scratch one on every channel.
   for (const band of result.derivedDrift) {
     expect(band.overBound, `${band.label}: the derivation drifted more than storage does`).toBe(0);
   }
