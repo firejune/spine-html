@@ -3490,6 +3490,91 @@ function finishPmaBands(bands: PmaBand[], sums: number[]): void {
  */
 const DERIVATION_SLACK = 2;
 
+/**
+ * The **write-then-read** control: what this browser's 2D canvas does to a
+ * straight-alpha value that is written with `putImageData` and read back again.
+ *
+ * The other control measures the read side (an image drawn in and read out);
+ * this is the same premultiplied storage from the other direction, and it is
+ * the one the derived canvas lives on. It is a property of the rasterizer:
+ * macOS round-trips these values to within a step, Linux WebKit was measured at
+ * 8 by CI (run 35362070508), which is what retired the absolute bound that used
+ * to stand here.
+ *
+ * The texel set is the **value class the derivation can produce**, not an
+ * arbitrary ramp: an un-premultiplied `round(k * 255 / a)` for every alpha and a
+ * dense sweep of k. A generic straight ramp would report a far larger round trip
+ * (a value that is not the un-premultiply of anything has no reason to survive)
+ * and would bound nothing useful. Since `x -> round(x * a / 255)` sweeps every
+ * k from 0 to a, the class is covered exactly, so the maximum below is over a
+ * superset of what the derivation writes. Returned per alpha, so the comparison
+ * is per texel rather than per band.
+ *
+ * Measured on a canvas of the page's own dimensions: browsers may pick a
+ * different raster path by surface size, and a control taken on a differently
+ * sized canvas would be measuring a different thing from the one it bounds.
+ */
+function putGetControl(width: number, height: number): {
+  perAlpha: Uint16Array;
+  bands: PmaControlBand[];
+} {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2d context unavailable');
+  const written = ctx.createImageData(width, height);
+  const data = written.data;
+  // Alpha down the rows, the value sweep across the columns; both wrap, so any
+  // page size ≥ 256×256 covers every (alpha, value) pair of the class.
+  for (let y = 0; y < height; y++) {
+    const a = y % size;
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      // k sweeps the premultiplied values available at this alpha; v is what an
+      // un-premultiply of one of them produces, which is what we ever write.
+      const k = Math.round(((x % size) * a) / 255);
+      const v = a === 0 ? 0 : Math.min(255, Math.round((k * 255) / a));
+      data[i] = v;
+      data[i + 1] = v;
+      data[i + 2] = v;
+      data[i + 3] = a;
+    }
+  }
+  ctx.putImageData(written, 0, 0);
+  const back = ctx.getImageData(0, 0, width, height).data;
+
+  const perAlpha = new Uint16Array(size);
+  const bands: PmaControlBand[] = PMA_BANDS.map((band) => ({
+    label: band.label,
+    pixels: 0,
+    maxError: 0,
+    meanError: 0,
+  }));
+  const sums = new Array<number>(PMA_BANDS.length).fill(0);
+  for (let y = 0; y < height; y++) {
+    const a = y % size;
+    if (a === 0) continue;
+    const b = pmaBandOf(a);
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const error = Math.abs(back[i] - data[i]);
+      if (error > perAlpha[a]) perAlpha[a] = error;
+      if (b === -1) continue;
+      bands[b].pixels++;
+      sums[b] += error;
+      if (error > bands[b].maxError) bands[b].maxError = error;
+    }
+  }
+  for (let b = 0; b < bands.length; b++) {
+    bands[b].meanError = bands[b].pixels
+      ? Math.round((sums[b] / bands[b].pixels) * 1000) / 1000
+      : 0;
+  }
+  return { perAlpha, bands };
+}
+
 export interface PmaFixtureProbeResult {
   pageSize: { width: number; height: number };
   /** Bytes of the hand-encoded twin, and whether it decoded at all. */
@@ -3506,12 +3591,23 @@ export interface PmaFixtureProbeResult {
   control: PmaControlBand[];
   /** Derived texels at alpha 0 that are not (0,0,0,0). Must be 0, anywhere. */
   zeroAlphaNonBlack: number;
+  /** The write-then-read control, per band — see putGetControl. */
+  putGet: PmaControlBand[];
   /**
-   * The derived straight-alpha source, read back against
-   * `round(read-back * 255 / a)`: how often, and how far, the canvas's own
-   * 8-bit conversion disagrees with that arithmetic.
+   * Channels where the derived canvas reads back differently from a scratch
+   * canvas this test filled with the values the derivation was *supposed* to
+   * write. Exact equality, no tolerance: both went through the same storage on
+   * the same platform, so any difference is the library writing something else.
+   * Must be 0 anywhere.
    */
   derivedMismatches: number;
+  /**
+   * |derived read-back − the intended value|, per band, bounded per texel by
+   * the write-then-read control at that alpha. This is the platform's storage
+   * showing through, not the derivation drifting.
+   */
+  derivedDrift: PmaBand[];
+  /** Worst of that drift over every band — reported, not bounded. */
   derivedMaxDrift: number;
   /**
    * The derivation composited over black — the premultiplied product the screen
@@ -3592,6 +3688,30 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
   overCtx.drawImage(derived, 0, 0);
   const composited = overCtx.getImageData(0, 0, over.width, over.height).data;
 
+  // What the derivation was supposed to write, computed here from the same read
+  // it started from — and then put through a scratch canvas of our own, so the
+  // library's canvas can be compared against an identical round trip rather
+  // than against the arithmetic it is allowed to be quantized away from.
+  const intended = new Uint8ClampedArray(readBack.length);
+  for (let i = 0; i < readBack.length; i += 4) {
+    const a = readBack[i + 3];
+    intended[i + 3] = a;
+    if (a === 0) continue;
+    for (let c = 0; c < 3; c++) {
+      intended[i + c] = Math.min(255, Math.round((readBack[i + c] * 255) / a));
+    }
+  }
+  const scratch = document.createElement('canvas');
+  scratch.width = source.width;
+  scratch.height = source.height;
+  const scratchCtx = scratch.getContext('2d', { willReadFrequently: true });
+  if (!scratchCtx) throw new Error('2d context unavailable');
+  scratchCtx.putImageData(new ImageData(intended, source.width, source.height), 0, 0);
+  const scratchBack = scratchCtx.getImageData(0, 0, source.width, source.height).data;
+
+  const putGet = putGetControl(source.width, source.height);
+  const driftBands: PmaBand[] = newPmaBands();
+  const driftSums = new Array<number>(PMA_BANDS.length).fill(0);
   let derivedMismatches = 0;
   let derivedMaxDrift = 0;
   let compositeMaxError = 0;
@@ -3610,10 +3730,13 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
       continue;
     }
     let pixelError = 0;
+    let pixelDrift = 0;
     for (let c = 0; c < 3; c++) {
-      const expected = Math.min(255, Math.round((readBack[i + c] * 255) / a));
-      const drift = Math.abs(derivedPixels[i + c] - expected);
-      if (drift !== 0) derivedMismatches++;
+      // The library's canvas against ours, both holding the same intended
+      // values: equal, or the library wrote something it did not compute.
+      if (derivedPixels[i + c] !== scratchBack[i + c]) derivedMismatches++;
+      const drift = Math.abs(derivedPixels[i + c] - intended[i + c]);
+      if (drift > pixelDrift) pixelDrift = drift;
       if (drift > derivedMaxDrift) derivedMaxDrift = drift;
       // Composited over opaque black, the premultiplied product is what lands —
       // and it is measured against what the page actually holds, not against
@@ -3645,8 +3768,22 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
     if (pixelError > band.maxError) band.maxError = pixelError;
     if (pixelError > bound) band.overBound++;
     if (pixelError - bound > band.worstExcess) band.worstExcess = pixelError - bound;
+
+    // The drift, against the write-then-read control at this alpha. The
+    // arithmetic term is **zero**: the derivation writes a value of exactly the
+    // class the control was measured on, and nothing happens to it afterwards
+    // but the storage the control just measured.
+    const driftBound = putGet.perAlpha[a];
+    const drift = driftBands[b];
+    if (driftBound >= 255) drift.vacuous++;
+    drift.pixels++;
+    driftSums[b] += pixelDrift;
+    if (pixelDrift > drift.maxError) drift.maxError = pixelDrift;
+    if (pixelDrift > driftBound) drift.overBound++;
+    if (pixelDrift - driftBound > drift.worstExcess) drift.worstExcess = pixelDrift - driftBound;
   }
   finishPmaBands(compositeBands, compositeSums);
+  finishPmaBands(driftBands, driftSums);
 
   URL.revokeObjectURL(url);
   return {
@@ -3657,7 +3794,9 @@ async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
     opaqueMismatches,
     control,
     zeroAlphaNonBlack,
+    putGet: putGet.bands,
     derivedMismatches,
+    derivedDrift: driftBands,
     derivedMaxDrift,
     compositeMaxError,
     composite: compositeBands,

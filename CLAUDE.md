@@ -69,20 +69,29 @@ README.md for architecture and measured numbers.
   quantized the texel, so it carries a residue no rewrite of the arithmetic
   removes — and **how big that residue is belongs to the rasterizer, not to
   this package**: Linux WebKit round-trips premultiplied storage several times
-  more coarsely than macOS does. So `tests/pma.spec.ts` asserts nothing
-  absolute about it. It measures the platform's own round trip in the same run
-  as a **control** (the fixture's texels drawn into a canvas and read back, no
-  un-premultiply by us) and bounds our numbers *relative to it*: the derivation
-  may add `control + 2` (0.5 for `round(rgb * 255 / a)` arriving back through
-  × a/255, plus 1 for the canvas's own premultiply), and a cut the same carried
-  through the division's `× 255/a`. An absolute ceiling stood there first,
-  calibrated on macOS, and Linux WebKit reddened it in CI without anything
-  being wrong with the repair — **a per-texel precision number read off one
-  platform is a platform's number, whatever it is derived from.** What is still
-  asserted exactly, because it holds anywhere: opaque texels are untouched,
-  alpha is never divided, alpha 0 keeps no colour, and the direction — a
-  doubled premultiply can only darken, so the tiers count darker and lighter
-  pixels separately rather than totalling them.
+  more coarsely than macOS does (measured on the CI runner: a read that costs
+  ≤ 1 there costs up to 8 on the write side). So `tests/pma.spec.ts` asserts
+  nothing absolute about it. It measures that platform's own storage in the
+  same run as **controls** — the read side (texels drawn in and read back) and
+  the write side (`putImageData` of the value class the un-premultiply
+  produces, read back) — and bounds our numbers *relative to them*: the
+  derivation may add `read control + 2` (0.5 for `round(rgb * 255 / a)`
+  arriving back through × a/255, plus 1 for the canvas's own premultiply), may
+  drift no more than the write control at that alpha (arithmetic term zero),
+  and a cut the same carried through the division's `× 255/a`.
+  **Two absolute ceilings stood there first, both calibrated on macOS, and
+  Linux WebKit reddened them in CI on two separate runs with the repair working
+  perfectly** — a per-texel precision number read off one platform is a
+  platform's number, whatever it is derived from, and the second one was still
+  there because the first sweep converted the numbers that had already failed
+  rather than every number of that kind. What is asserted exactly, because it
+  holds anywhere: opaque texels are untouched (premultiplying by 255/255 is the
+  identity), alpha is never divided, alpha 0 keeps no colour, the derived
+  canvas reads back the same as a scratch canvas given the same values, and the
+  direction — a doubled premultiply can only darken, so the tiers count darker
+  and lighter pixels separately, assert that the darker side does not outweigh
+  the lighter one, and budget each as a ratio of drawn content, the way the
+  parity suite budgets a diff.
 - **The canvas2d path draws a per-triangle source sub-rect, never the whole
   page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
   affines — measured (displaced texture on head/goggles/foot triangles while

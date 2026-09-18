@@ -48,10 +48,13 @@ import { expect, type Page, test } from '@playwright/test';
  * opaque texels untouched, alpha never divided, alpha 0 with no colour, and the
  * direction of the error.
  *
- * (An absolute ceiling stood here first, calibrated on macOS. Linux WebKit
- * reddened it in CI with the repair working perfectly — every tier cell green
- * on that same run. A precision number read off one platform is that
- * platform's, however carefully it was derived.)
+ * (Two absolute ceilings stood here first, both calibrated on macOS, and Linux
+ * WebKit reddened them on two separate CI runs with the repair working
+ * perfectly — every tier cell green on those same runs. A precision number read
+ * off one platform is that platform's, however carefully it was derived. The
+ * second one survived the first pass because that pass converted the numbers
+ * that had already failed rather than every number of the kind; hence the note
+ * above, and hence: no number here describes a browser this suite cannot run.)
  *
  * The GL backend has none of this cost — a `pma` page is uploaded unconverted,
  * which is lossless — so cell (b) below, canvas2d against webgl on the twin, is
@@ -68,11 +71,20 @@ const CHANNEL_TOLERANCE = 24;
 const BAD_RATIO_LIMIT = 0.005;
 /**
  * Above this per-channel move, a pixel counts as darker or lighter than the
- * reference. 16 clears the un-premultiply's analytic ceiling of ~12 (measured
- * peak across every cell here: 11) and sits well under the defect, which
- * darkens by ~38 luma on average and up to ~76.
+ * reference.
+ *
+ * It is the parity suite's tolerance, reused rather than calibrated: one
+ * constant for the file, and a threshold the repository already trusts across
+ * platforms. It is a *classification* knob, not a precision bound on anything
+ * this package produces — the assertions below are on which side the pixels
+ * fall and on ratios of drawn content.
+ *
+ * It sits above the derivation's residue with room to spare (the tier cells
+ * measure a peak channel move of 4–11 locally and 11–14 on the Linux WebKit CI
+ * runner) and far below the defect, which darkens by ~38 luma on average and
+ * up to ~76 — with the flag ignored, 2,229 pixels of one cell move past this.
  */
-const DIRECTIONAL_TOLERANCE = 16;
+const DIRECTIONAL_TOLERANCE = CHANNEL_TOLERANCE;
 /**
  * Directional pixels allowed, as a fraction of drawn content. Measured: the
  * repair leaves zero on either engine, at either page scale, on every tier;
@@ -339,8 +351,15 @@ for (const cell of CELLS) {
 
     expect(m.contentUnion).toBeGreaterThan(5000);
     expect(badRatio).toBeLessThanOrEqual(BAD_RATIO_LIMIT);
-    // The signature of a doubled premultiply: darker, never lighter. Both sides
-    // are asserted, so a repair that over-corrects reds out here too.
+    // The signature of a doubled premultiply is *asymmetry*: it can only darken.
+    // This form carries no magnitude at all, so it survives any rasterizer —
+    // symmetric rounding noise, however coarse, keeps the two sides level,
+    // while the defect puts thousands on one side and zero on the other.
+    expect(m.darker, 'darker pixels outnumber lighter ones').toBeLessThanOrEqual(
+      m.lighter + Math.ceil(DIRECTIONAL_LIMIT * m.contentUnion),
+    );
+    // And the magnitudes, as ratios of drawn content — the repository's own way
+    // of budgeting a diff. Both sides, so an over-correction reds out too.
     expect(darkerRatio).toBeLessThanOrEqual(DIRECTIONAL_LIMIT);
     expect(m.lighter / Math.max(1, m.contentUnion)).toBeLessThanOrEqual(DIRECTIONAL_LIMIT);
   });
@@ -382,8 +401,10 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
   console.log(
     `[pma] ${testInfo.project.name} fixture: ${result.pngBytes} B PNG\n` +
       `      control    ${controlLine(result.control)}\n` +
+      `      put/get    ${controlLine(result.putGet)}\n` +
       `      composite  ${boundedLine(result.composite)}\n` +
-      `      derived drift: ${result.derivedMismatches} channels, max ${result.derivedMaxDrift}; ` +
+      `      drift      ${boundedLine(result.derivedDrift)}\n` +
+      `      derived mismatches=${result.derivedMismatches}, drift max=${result.derivedMaxDrift}; ` +
       `composite maxErr=${result.compositeMaxError}\n` +
       `      worst: ${result.compositeWorst.join(' ; ')}`,
   );
@@ -393,6 +414,12 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
   // Where a canvas read is lossless — opaque texels — the twin holds exactly
   // what was written. That is the read-back proof that the fixture is the
   // artwork premultiplied, and not an artefact of some canvas round trip.
+  //
+  // Every exact `0` in this file is of that kind: at alpha 255 premultiplying
+  // and un-premultiplying are both the identity, and at alpha 0 there is no
+  // colour to carry, so these hold on any rasterizer however coarse its 8-bit
+  // storage is. The quantities that *do* depend on the rasterizer are bounded
+  // against a control measured on it, never against a number.
   expect(result.opaquePixels).toBeGreaterThan(10000);
   expect(result.opaqueMismatches).toBe(0);
   // The control is reported, never bounded: how coarsely a 2D canvas round-trips
@@ -405,15 +432,24 @@ test('the premultiplied fixture is exact, and the derivation does not re-premult
   // Alpha 0 keeps no colour, on any platform: there is nothing to divide by.
   expect(result.zeroAlphaNonBlack).toBe(0);
   // putImageData stored the un-premultiplied values; it did not multiply them
-  // back in. Verified by reading the derivation's pixels, not by assuming.
+  // back in. Two ways, neither of them a number about this browser:
   //
-  // This one is absolute, deliberately: it is not a claim about how precise the
-  // output is, it is the premise of DERIVATION_SLACK's "+1" — that a single
-  // 8-bit conversion agrees with `round(v * a / 255)` to within one step. A
-  // platform where it did not would make the slack above understated, and this
-  // is what would say so, loudly, instead of the bound quietly going soft.
-  // (Measured: 1 on chromium, 0 on macOS webkit, and green on Linux WebKit.)
-  expect(result.derivedMaxDrift).toBeLessThanOrEqual(1);
+  // 1. Exactly: the derived canvas must read back the same as a scratch canvas
+  //    this test filled with the values the derivation was supposed to write.
+  //    Same storage, same platform, so equality holds on any rasterizer — and a
+  //    library that wrote something it did not compute breaks it.
+  expect(result.derivedMismatches, 'the derivation wrote values it did not compute').toBe(0);
+  // 2. Relatively: what the canvas then did to those values is bounded by the
+  //    write-then-read control at that alpha, with an arithmetic term of zero —
+  //    the derivation writes a value of exactly the class the control was
+  //    measured on, and nothing touches it afterwards but that same storage.
+  //
+  // An absolute `≤ 1` stood here, taken from macOS; Linux WebKit reads 8 (CI run
+  // 35362070508). The magnitude is the rasterizer's, and it is why this is a
+  // comparison and not a constant.
+  for (const band of result.derivedDrift) {
+    expect(band.overBound, `${band.label}: the derivation drifted more than storage does`).toBe(0);
+  }
   // And composited — the premultiplied product the screen gets — it reproduces
   // what the page holds, to within what the control already cost *that texel*
   // plus DERIVATION_SLACK (0.5 for `round(rgb * 255 / a)` arriving back through
