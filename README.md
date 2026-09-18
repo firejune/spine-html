@@ -615,6 +615,75 @@ resolving, so blob ownership — every unpacked URL freed, nothing the caller
 owns touched, nothing stranded by a failed load — is asserted rather than
 assumed.
 
+### The pixel oracle: a reference that is not us
+
+Everything above compares this package against itself. That catches one mesh
+backend drifting from the other and, by construction, cannot catch a defect
+they **share** — which is what happened with `pma: true` pages, drawn one
+multiply too dark in every tier while the suite stayed green for months.
+
+So `tests/oracle.spec.ts` compares against the official runtime. The same
+export, the same frozen pose, the same size, the same atlas page, drawn by
+`@esotericsoftware/spine-webgl` into a canvas whose orthographic camera is
+solved to land world space on exactly the pixels the DOM stage lands it on —
+then both are screenshotted and diffed. Eleven cells: the rigid tier, the mesh
+tier on both backends, the exporter's own premultiplied page (`spineboy-pma`)
+on all three, a clipping pose, an additive-blend pose, a per-slot rgba/alpha
+pose, and a whole-skeleton tint.
+
+Two things make it evidence rather than decoration. The camera match is
+**derived** — solved against the DOM mapping, not fitted to a picture — and
+then **proved by driving it**: a deliberate one-world-unit offset of one side
+must change the diff, which it does by 3.3× and 6.5×. And what is forgiven is
+antialiasing and texture filtering and nothing else, so the stage sits where
+one atlas texel is one CSS pixel and neither runtime resamples. Limits are
+ratios of drawn content, plus a darker-minus-lighter excess on the
+premultiplied cells, because that defect class can only go one way — never an
+absolute per-pixel precision number, which is a platform's number and not a
+package's.
+
+spine-webgl is a **development dependency**. It is named by one file under
+`tests/`, it is in neither `dependencies` nor `peerDependencies`, and
+`tests/package.spec.ts` asserts that nothing the published package contains so
+much as mentions it.
+
+## Benchmark: side by side with the official runtime
+
+```bash
+bun run bench:dev     # the page, for a person to watch (and for Safari)
+bun run bench         # drives it in a headed Chromium and writes a report
+```
+
+`bench/` is a separate vite project — not part of the library, and not part of
+what `bun run build` emits — that runs the same skeleton in both runtimes side
+by side, each with its own stats line in the demo's style. Scenes by query
+string: `?scene=mesh` (the deform tier working every frame), `?scene=held` (a
+frozen pose, where unchanged meshes reuse their raster and the reference
+redraws regardless), `?scene=rigid`, and `?scene=many&count=N` independent
+players — which is also where the architectural difference shows, since the
+reference needs one WebGL context per player against browsers' cap of ~16 and
+this package shares a single one however many there are. The page reports
+reaching that cap rather than dying at it.
+
+`scripts/bench.mjs` walks `bench/scenes.json`, opens each scene in a **headed**
+Chromium (a hidden page throttles `requestAnimationFrame`, so a headless
+reading would be the browser's power policy rather than either runtime's cost),
+runs a fixed number of frames per runtime — one at a time, because rAF has a
+single cadence per document — and writes JSON plus a markdown table with the
+conditions attached: browser version, device pixel ratio, window size, GPU
+string, and the load average before and after. Over a threshold it stamps the
+whole report `INVALID: load average too high` and exits non-zero, because a
+benchmark on a busy machine measures the machine. `--corpus <dir>` points it at
+local rigs that never enter this repository.
+
+> **Numbers pending.** No comparison table is published yet, and one taken on a
+> loaded CI runner or in a headless browser would not be worth reading. The
+> table will be taken the way every other number in this README was: the two
+> stats lines read on a real device, on a quiet machine, per scene and per
+> engine — including Safari, which stays manual because no automation preserves
+> what is being measured there. Until then the instrument exists and the
+> measurement does not.
+
 The server is part of the test: a run tests whatever is being served on its
 port. Two checkouts of this repository on one machine (a worktree, a second
 clone) default to the same port 4321 and reuse an existing server, so the

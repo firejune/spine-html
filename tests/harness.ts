@@ -20,6 +20,14 @@ import { loadSkeletonBinary } from '../src/binary';
 import { getMeshGlBlitter } from '../src/MeshGlBlitter';
 import { type BonePoseView, coreCompatFor, type SlotPoseView } from '../src/coreCompat';
 import { straightAlphaDerivations, straightAlphaSource } from '../src/DomTexture';
+// The pixel oracle's reference runtime. It is a separate module because it is
+// the one place `@esotericsoftware/spine-webgl` is named — keeping that import
+// findable, and out of this file's 4,000 lines of loading-path probes.
+import {
+  oracleStage,
+  type OracleStageOptions,
+  type OracleStageResult,
+} from './oracleStage';
 
 /**
  * Browser-side test harness (see harness.html).
@@ -180,6 +188,7 @@ export interface SpineHtmlHarness {
   pmaCutProbe(): Promise<PmaCutProbeResult>;
   pmaDerivationProbe(): Promise<PmaDerivationProbeResult>;
   pmaStage(options: PmaStageOptions): Promise<PmaStageResult>;
+  oracleStage(options: OracleStageOptions): Promise<OracleStageResult>;
 }
 
 declare global {
@@ -4370,4 +4379,5 @@ window.spineHtmlHarness = {
   pmaCutProbe,
   pmaDerivationProbe,
   pmaStage,
+  oracleStage,
 };

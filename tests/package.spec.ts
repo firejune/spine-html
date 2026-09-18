@@ -234,6 +234,46 @@ test('the library build emits those modules and nothing else', () => {
   );
 });
 
+test('nothing the package ships names the pixel oracle\'s reference runtime', () => {
+  /**
+   * `@esotericsoftware/spine-webgl` is a **development** dependency: the pixel
+   * oracle draws the same skeleton with it and diffs the two pictures
+   * (tests/oracle.spec.ts), and the benchmark page puts them side by side. A
+   * consumer must never carry it — it is a second full runtime, under the Spine
+   * Runtimes License, and it is not in `dependencies` or `peerDependencies`.
+   *
+   * What makes that worth a machine rather than a review note is where the
+   * reference code sits: `tests/` imports from `src/`, and one import written
+   * the other way round would put a whole runtime into `dist/` with no other
+   * signature — `tsconfig.build.json` compiles all of `src/`, and the emitted
+   * file set above would not change, because the specifier would ride inside a
+   * file that is already on the list. So the assertion is on the shipped bytes
+   * themselves, every emitted module and every emitted `.d.ts`, comments
+   * stripped so a mention in prose is not a false red.
+   */
+  const emitted = readdirSync(pkgDist, { recursive: true })
+    .map((entry) => String(entry).split(sep).join('/'))
+    .filter((file) => file.endsWith('.js') || file.endsWith('.d.ts'));
+  const naming = emitted.filter((file) =>
+    /spine-webgl/.test(stripComments(readFileSync(resolve(pkgDist, file), 'utf8'))),
+  );
+  expect(naming).toEqual([]);
+
+  // Control: it is installed and resolvable here, so the assertion above means
+  // "kept out of the package", not "absent from the machine".
+  expect(existsSync(resolve(repoRoot, 'node_modules', '@esotericsoftware', 'spine-webgl'))).toBe(
+    true,
+  );
+
+  // And it is declared in neither of the two fields a consumer installs from.
+  const manifest = JSON.parse(readFileSync(resolve(repoRoot, 'package.json'), 'utf8'));
+  expect(Object.keys(manifest.dependencies ?? {})).not.toContain('@esotericsoftware/spine-webgl');
+  expect(Object.keys(manifest.peerDependencies ?? {})).not.toContain(
+    '@esotericsoftware/spine-webgl',
+  );
+  expect(Object.keys(manifest.devDependencies ?? {})).toContain('@esotericsoftware/spine-webgl');
+});
+
 /** Strips `//` and `/* *\/` comments without eating string or template contents. */
 function stripComments(source: string): string {
   let out = '';

@@ -1,7 +1,11 @@
 node_modules/
 dist/
+dist-bench/
 test-results/
 playwright-report/
+# Benchmark output: numbers belong in a PR with their conditions, never
+# committed as a file (scripts/bench.mjs).
+bench-results/
 # Spine example assets are fetched, not redistributed — see NOTICE.md
 public/spineboy/
 .DS_Store

@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>spine-html — side-by-side benchmark</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      * {
+        margin: 0;
+        box-sizing: border-box;
+      }
+      body {
+        font-family: ui-monospace, 'SF Mono', Menlo, monospace;
+        background: #14161a;
+        color: #d5d9e0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding: 8px 16px;
+        background: #1c1f26;
+        border-bottom: 1px solid #2a2e37;
+        font-size: 12px;
+        flex-wrap: wrap;
+      }
+      header h1 {
+        font-size: 13px;
+        font-weight: 600;
+      }
+      header .scene {
+        color: #9aa3b2;
+      }
+      header .warn {
+        color: #ffb4a2;
+      }
+      #panes {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        min-height: 0;
+      }
+      .pane {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        border-right: 1px solid #2a2e37;
+      }
+      .pane:last-child {
+        border-right: none;
+      }
+      .pane-head {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        padding: 6px 12px;
+        background: #191c22;
+        border-bottom: 1px solid #2a2e37;
+      }
+      .pane-head h2 {
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .pane-head .idle {
+        color: #7a8494;
+        font-weight: 400;
+      }
+      .stats {
+        font-size: 11px;
+        color: #8fd3a0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        cursor: pointer;
+      }
+      .stage {
+        position: relative;
+        flex: 1;
+        overflow: hidden;
+        background: linear-gradient(#14161a 96%, #2a2e37 96%) 0 0 / 100% 100%;
+      }
+      .skeleton-root {
+        position: absolute;
+        transform-origin: 0 0;
+      }
+      .stage canvas {
+        position: absolute;
+        left: 0;
+        top: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      Not the demo and not the library: a human-facing comparison page. It is a
+      separate vite project (bench/vite.config.ts) so `bun run build` keeps
+      emitting exactly what it emitted before — the reference runtime is a
+      development dependency and has no business in the demo's bundle.
+
+      Query string: ?scene=mesh|held|rigid|many &count=N &backend=canvas2d|webgl
+      &runtime=both|dom|reference &dpr=N. See bench/bench.ts.
+    -->
+    <header>
+      <h1>spine-html vs spine-webgl</h1>
+      <div class="scene" id="scene">loading…</div>
+      <div class="warn" id="warn"></div>
+    </header>
+    <div id="panes">
+      <div class="pane">
+        <div class="pane-head">
+          <h2 id="dom-title">spine-html (DOM)</h2>
+          <div class="stats" id="dom-stats">—</div>
+        </div>
+        <div class="stage" id="dom-stage"></div>
+      </div>
+      <div class="pane">
+        <div class="pane-head">
+          <h2 id="ref-title">spine-webgl (reference)</h2>
+          <div class="stats" id="ref-stats">—</div>
+        </div>
+        <div class="stage" id="ref-stage"></div>
+      </div>
+    </div>
+    <script type="module" src="./bench.ts"></script>
+  </body>
+</html>

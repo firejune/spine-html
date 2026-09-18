@@ -20,6 +20,17 @@
 # which writes node_modules and leaves package.json and bun.lock alone
 # (verified by the guard step). The repository keeps ONE spine-core
 # devDependency; nothing here commits a second.
+#
+# The pixel oracle (tests/oracle.spec.ts) draws the same skeleton with
+# `@esotericsoftware/spine-webgl` and diffs the two pictures, so a column needs
+# its reference of the *same* generation — a 4.3 reference over 4.2 data would
+# be comparing against a runtime that cannot read it. spine-webgl pins
+# spine-core to its own exact version, so the pair is installed in ONE command:
+# asking for `@4.2` twice in sequence could resolve a different patch each time
+# and leave a nested second copy of spine-core under spine-webgl, which is the
+# one shape that would quietly give the oracle's two sides different maths
+# while every version line still read correctly. The guard step checks for that
+# copy as well as for the versions.
 name: ci
 
 on:
@@ -70,21 +81,36 @@ jobs:
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
 
-      - name: Install this column's spine-core
+      - name: Install this column's spine-core and its matching reference runtime
         if: ${{ !matrix.typed }}
-        run: bun add --no-save "@esotericsoftware/spine-core@${{ matrix.core }}"
+        run: |
+          bun add --no-save \
+            "@esotericsoftware/spine-core@${{ matrix.core }}" \
+            "@esotericsoftware/spine-webgl@${{ matrix.core }}"
 
       # Two facts the column would otherwise only imply: that the swap took,
       # and that it left the repository's own manifest and lockfile alone. A
       # silently-unswapped column would test 4.3 twice and call it coverage.
-      - name: The installed core is the column's, and nothing was committed
+      - name: The installed core and reference are the column's, and nothing was committed
         run: |
           installed=$(node -p "require('./node_modules/@esotericsoftware/spine-core/package.json').version")
-          echo "spine-core $installed"
+          reference=$(node -p "require('./node_modules/@esotericsoftware/spine-webgl/package.json').version")
+          echo "spine-core $installed / spine-webgl $reference"
           case "$installed" in
             ${{ matrix.core }}.*) ;;
-            *) echo "expected ${{ matrix.core }}.x, got $installed"; exit 1 ;;
+            *) echo "expected spine-core ${{ matrix.core }}.x, got $installed"; exit 1 ;;
           esac
+          case "$reference" in
+            ${{ matrix.core }}.*) ;;
+            *) echo "expected spine-webgl ${{ matrix.core }}.x, got $reference"; exit 1 ;;
+          esac
+          # One spine-core, and it is the one above: a nested copy under
+          # spine-webgl would hand the oracle's two sides different runtimes.
+          if [ -d node_modules/@esotericsoftware/spine-webgl/node_modules ]; then
+            echo "spine-webgl brought its own spine-core:"
+            ls node_modules/@esotericsoftware/spine-webgl/node_modules
+            exit 1
+          fi
           git diff --exit-code -- package.json bun.lock
 
       - run: bunx playwright install --with-deps chromium webkit

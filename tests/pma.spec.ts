@@ -1,5 +1,7 @@
 import { expect, type Page, test } from '@playwright/test';
 
+import { CHANNEL_TOLERANCE, diffInPage } from './pixelDiff';
+
 /**
  * Premultiplied atlas pages (`pma: true`) — one picture, whatever the page's
  * alpha convention is.
@@ -65,8 +67,6 @@ import { expect, type Page, test } from '@playwright/test';
 
 const POSE = { animation: 'walk', time: 1.2 } as const;
 
-/** The parity suite's CHANNEL_TOLERANCE, so "bad" means here what it means there. */
-const CHANNEL_TOLERANCE = 24;
 /** The parity suite's BAD_RATIO_LIMIT — not to be tuned here, only measured against. */
 const BAD_RATIO_LIMIT = 0.005;
 /**
@@ -94,19 +94,13 @@ const DIRECTIONAL_TOLERANCE = CHANNEL_TOLERANCE;
  */
 const DIRECTIONAL_LIMIT = 0.002;
 
-interface Diff {
-  /** Shift-tolerant bad pixels and the content they are measured against. */
-  bad: number;
-  rawBad: number;
-  contentUnion: number;
-  maxDelta: number;
-  /** Content pixels that moved by more than DIRECTIONAL_TOLERANCE, by direction. */
-  darker: number;
-  lighter: number;
-  /** Mean and peak luma drop over the darker set — the defect's amplitude. */
-  darkerMean: number;
-  darkerMax: number;
-}
+/**
+ * What this suite asks of the shared differ (`tests/pixelDiff.ts`): the
+ * directional split. A doubled premultiply can only darken, so which *side*
+ * the differences fall on is the signature, not their count. The harness
+ * stage is one flat colour, so there is no floor strip to exclude.
+ */
+const PMA_DIFF = { directional: DIRECTIONAL_TOLERANCE } as const;
 
 /**
  * Screenshots the stage until two captures in a row are byte-identical (the
@@ -149,126 +143,6 @@ async function capture(
     expect(info.backendActive).toBe(options.backend);
   }
   return stableShot(page);
-}
-
-/**
- * The parity spec's in-page diff, plus the directional split this needs: a
- * doubled premultiply can only darken, so which *side* the differences fall on
- * is the signature, not their count.
- */
-async function diffInPage(page: Page, a: Buffer, b: Buffer): Promise<Diff> {
-  return page.evaluate(
-    async ({ aB64, bB64, tolerance, directional }): Promise<Diff> => {
-      const decode = async (b64: string): Promise<ImageData> => {
-        const img = new Image();
-        img.src = `data:image/png;base64,${b64}`;
-        await img.decode();
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth;
-        canvas.height = img.naturalHeight;
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (!ctx) throw new Error('2d context unavailable');
-        ctx.drawImage(img, 0, 0);
-        return ctx.getImageData(0, 0, canvas.width, canvas.height);
-      };
-      const [da, db] = await Promise.all([decode(aB64), decode(bB64)]);
-      if (da.width !== db.width || da.height !== db.height) {
-        throw new Error('screenshot size mismatch');
-      }
-      const pa = da.data;
-      const pb = db.data;
-      const w = da.width;
-      const h = da.height;
-      const bg = [pa[0], pa[1], pa[2]];
-      const isContent = (p: Uint8ClampedArray, i: number): boolean =>
-        !(
-          Math.abs(p[i] - bg[0]) <= 8 &&
-          Math.abs(p[i + 1] - bg[1]) <= 8 &&
-          Math.abs(p[i + 2] - bg[2]) <= 8
-        );
-      const matchesNear = (
-        from: Uint8ClampedArray,
-        i: number,
-        into: Uint8ClampedArray,
-      ): boolean => {
-        const px = (i / 4) % w;
-        const py = (i / 4 - px) / w;
-        for (let dy = -1; dy <= 1; dy++) {
-          const y = py + dy;
-          if (y < 0 || y >= h) continue;
-          for (let dx = -1; dx <= 1; dx++) {
-            const x = px + dx;
-            if (x < 0 || x >= w) continue;
-            const j = (y * w + x) * 4;
-            if (
-              Math.abs(from[i] - into[j]) <= tolerance &&
-              Math.abs(from[i + 1] - into[j + 1]) <= tolerance &&
-              Math.abs(from[i + 2] - into[j + 2]) <= tolerance
-            ) {
-              return true;
-            }
-          }
-        }
-        return false;
-      };
-      const luma = (p: Uint8ClampedArray, i: number): number =>
-        p[i] * 0.299 + p[i + 1] * 0.587 + p[i + 2] * 0.114;
-
-      let rawBad = 0;
-      let badAB = 0;
-      let badBA = 0;
-      let maxDelta = 0;
-      let contentUnion = 0;
-      let darker = 0;
-      let lighter = 0;
-      let darkerSum = 0;
-      let darkerMax = 0;
-      for (let i = 0; i < pa.length; i += 4) {
-        const delta = Math.max(
-          Math.abs(pa[i] - pb[i]),
-          Math.abs(pa[i + 1] - pb[i + 1]),
-          Math.abs(pa[i + 2] - pb[i + 2]),
-        );
-        if (delta > maxDelta) maxDelta = delta;
-        if (delta > tolerance) {
-          rawBad++;
-          if (!matchesNear(pa, i, pb)) badAB++;
-          if (!matchesNear(pb, i, pa)) badBA++;
-        }
-        const ca = isContent(pa, i);
-        const cb = isContent(pb, i);
-        if (ca || cb) contentUnion++;
-        // Direction is read on content only: B (the page under test) against A
-        // (the reference), per channel, so a tint cannot cancel itself out.
-        if ((ca || cb) && delta > directional) {
-          const drop = luma(pa, i) - luma(pb, i);
-          if (drop > 0) {
-            darker++;
-            darkerSum += drop;
-            if (drop > darkerMax) darkerMax = drop;
-          } else {
-            lighter++;
-          }
-        }
-      }
-      return {
-        bad: Math.max(badAB, badBA),
-        rawBad,
-        contentUnion,
-        maxDelta,
-        darker,
-        lighter,
-        darkerMean: darker ? Math.round((darkerSum / darker) * 100) / 100 : 0,
-        darkerMax: Math.round(darkerMax * 100) / 100,
-      };
-    },
-    {
-      aB64: a.toString('base64'),
-      bB64: b.toString('base64'),
-      tolerance: CHANNEL_TOLERANCE,
-      directional: DIRECTIONAL_TOLERANCE,
-    },
-  );
 }
 
 /** One line per band: the control, which is reported and never bounded. */
@@ -337,7 +211,7 @@ for (const cell of CELLS) {
 
     const straight = await capture(page, { ...options, page: 'straight' });
     const pma = await capture(page, { ...options, page: 'pma' });
-    const m = await diffInPage(page, straight, pma);
+    const m = await diffInPage(page, straight, pma, PMA_DIFF);
 
     const badRatio = m.bad / Math.max(1, m.contentUnion);
     const darkerRatio = m.darker / Math.max(1, m.contentUnion);
@@ -379,7 +253,7 @@ test('canvas2d and webgl agree on a premultiplied page', async ({ page }, testIn
 
   const canvas2d = await capture(page, { ...options, backend: 'canvas2d' });
   const webgl = await capture(page, { ...options, backend: 'webgl' });
-  const m = await diffInPage(page, canvas2d, webgl);
+  const m = await diffInPage(page, canvas2d, webgl, PMA_DIFF);
 
   const badRatio = m.bad / Math.max(1, m.contentUnion);
   console.log(
