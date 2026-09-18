@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/firejune/spine-html/compare/v0.7.0...v0.7.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **loader:** unpack rotated atlas regions the way spine-core's UVs say ([#50](https://github.com/firejune/spine-html/issues/50)) ([f10e7c5](https://github.com/firejune/spine-html/commit/f10e7c561c195df9884178ebd428c27b65a2d1b2)), closes [#49](https://github.com/firejune/spine-html/issues/49)
+
 ## [0.7.0](https://github.com/firejune/spine-html/compare/v0.6.0...v0.7.0) (2026-09-18)
 
 
