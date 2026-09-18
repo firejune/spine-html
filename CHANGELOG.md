@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.1](https://github.com/firejune/spine-html/compare/v0.5.0...v0.5.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **build:** keep the demo entry out of the published package ([#29](https://github.com/firejune/spine-html/issues/29)) ([cfcc255](https://github.com/firejune/spine-html/commit/cfcc255297f12bc5a062b6ce9e6a8e3ec3e17148)), closes [#24](https://github.com/firejune/spine-html/issues/24)
+
+
+### Performance Improvements
+
+* **loader:** cut atlas regions concurrently instead of one toBlob at a time ([#31](https://github.com/firejune/spine-html/issues/31)) ([8543977](https://github.com/firejune/spine-html/commit/8543977f5bb77ee8868f69d0ed64821d464ab903)), closes [#27](https://github.com/firejune/spine-html/issues/27)
+
 ## [0.5.0](https://github.com/firejune/spine-html/compare/v0.4.1...v0.5.0) (2026-09-17)
 
 
