@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/firejune/spine-html/compare/v0.5.1...v0.5.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* **loader:** cut rigid regions in the image's own frame so pages may ship at another resolution ([#33](https://github.com/firejune/spine-html/issues/33)) ([039ba85](https://github.com/firejune/spine-html/commit/039ba858899d0eb5136ebc21b5ce913e4216ce79)), closes [#32](https://github.com/firejune/spine-html/issues/32)
+
 ## [0.5.1](https://github.com/firejune/spine-html/compare/v0.5.0...v0.5.1) (2026-09-18)
 
 
