@@ -10,9 +10,10 @@ on:
   push:
     branches: [main]
   pull_request:
-  # A pull request opened by GITHUB_TOKEN — release-please's — starts no
-  # workflow, so the release branch can be tested on demand from the Actions
-  # tab instead. See RELEASING.md.
+  # A pull request opened by GITHUB_TOKEN — release-please's — gets its run
+  # created and then held at `action_required` (nothing executes until a
+  # maintainer approves it), so the release branch is tested on demand from
+  # here instead. See RELEASING.md.
   workflow_dispatch:
     inputs:
       parity_dump:
