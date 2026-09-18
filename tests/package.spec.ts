@@ -4,13 +4,14 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, relative, resolve } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
 
@@ -156,6 +157,61 @@ test('an unlisted subpath is refused by the exports map', () => {
   );
   expect(run.status, `probe crashed:\n${run.stderr}`).toBe(0);
   expect(JSON.parse(run.stdout).code).toBe('ERR_PACKAGE_PATH_NOT_EXPORTED');
+});
+
+/**
+ * The modules the library build is supposed to emit — the whole of `dist/`,
+ * which is the whole of what `files` ships apart from NOTICE.md.
+ */
+const EMITTED_MODULES = [
+  'DomTexture',
+  'MeshGlBlitter',
+  'SpineHtmlRenderer',
+  'binary',
+  'index',
+  'loadAtlasAssets',
+  'loadSkeletonAssets',
+];
+
+test('the library build emits those modules and nothing else', () => {
+  /**
+   * Issue #24: `tsconfig.build.json` compiles `src/**` and the demo's entry
+   * point lives there too, so `dist/main.js` (11 kB) + `.d.ts` + both maps
+   * rode into the published 0.4.1 and 0.5.0 tarballs. Nothing could reach
+   * them — `main` is not a key in the `exports` map and no shipped module
+   * imports it — which is exactly why every other assertion in this file
+   * stayed green over two releases while 11 kB of the 76 kB of JavaScript in
+   * the tarball was dead weight, and the one file in `dist/` whose top level
+   * touched the DOM. Unreachable is not a signature, so the guard has to be
+   * the emitted list itself, not anything a resolver or an import walk sees.
+   *
+   * Recursive, so a stray that lands in a subdirectory is caught too — `dist/`
+   * being flat is part of what ships.
+   */
+  const emitted = readdirSync(pkgDist, { recursive: true })
+    .map((entry) => String(entry).split(sep).join('/'))
+    .sort();
+
+  // The defect itself, named first, so its return reds out on the assertion
+  // that explains it rather than on the set comparison below.
+  expect(emitted.filter((file) => /(^|\/)main\./.test(file))).toEqual([]);
+
+  // The payload, as an explicit set: the next file to wander in fails here
+  // instead of shipping unnoticed for two more releases.
+  expect(emitted.filter((file) => file.endsWith('.js'))).toEqual(
+    EMITTED_MODULES.map((name) => `${name}.js`).sort(),
+  );
+
+  // And the rest of it — types and both map kinds accompany every module, so
+  // this also pins `declaration` / `declarationMap` / `sourceMap` staying on.
+  expect(emitted).toEqual(
+    EMITTED_MODULES.flatMap((name) => [
+      `${name}.d.ts`,
+      `${name}.d.ts.map`,
+      `${name}.js`,
+      `${name}.js.map`,
+    ]).sort(),
+  );
 });
 
 /** Strips `//` and `/* *\/` comments without eating string or template contents. */

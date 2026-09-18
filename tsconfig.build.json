@@ -8,5 +8,14 @@
     "outDir": "dist",
     "rootDir": "src"
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  // The demo entry lives in `src/` but is not part of the package: `index.html`
+  // loads it, nothing in the library imports it, and it is absent from the
+  // `exports` map. Left in this build it emitted anyway — `dist/main.*` shipped
+  // unreachable in 0.4.1 and 0.5.0. `exclude` only filters `include`, never a
+  // file that an included file imports, so this drops it from the package and
+  // from nothing else: `tsconfig.json` still typechecks it for `bun run build`,
+  // and vite still reads it from `index.html`. The emitted file list is pinned
+  // by `tests/package.spec.ts`.
+  "exclude": ["src/main.ts"]
 }
