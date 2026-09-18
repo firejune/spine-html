@@ -46,7 +46,17 @@ mkdir -p "$DEST"
 # next run resumes it instead of mixing a second branch into it.
 printf '%s' "$BRANCH" > "$STAMP"
 
-for f in spineboy-ess.json spineboy-pro.json spineboy-pro.skel spineboy.atlas spineboy.png; do
+# `spineboy-pma.atlas` / `spineboy-pma.png` are the same artwork exported with
+# the packer's default premultiply on: the atlas text differs from the plain one
+# by the page name and a `pma: true` line, and by nothing else — same regions,
+# same bounds — so the same skeleton export reads against either. That is what
+# makes them the pixel oracle's premultiplied cell (tests/oracle.spec.ts): a real
+# `pma` page from the exporter, not a fixture this repository paints. They are
+# listed as required rather than best-effort because both branches of the CI
+# matrix ship them (checked on 4.2 and 4.3), so a 404 is a fact worth a loud
+# failure and not something to render around.
+for f in spineboy-ess.json spineboy-pro.json spineboy-pro.skel spineboy.atlas spineboy.png \
+         spineboy-pma.atlas spineboy-pma.png; do
   if [ -s "$DEST/$f" ]; then
     echo "have $f"
   else

@@ -1,0 +1,44 @@
+{
+  "comment": [
+    "Scenes scripts/bench.mjs walks. Each becomes two page loads — one per",
+    "runtime — because requestAnimationFrame has a single cadence per document",
+    "and two panes animating together would report the page's fps rather than",
+    "either runtime's (bench/bench.ts explains it in full).",
+    "",
+    "`--corpus <dir>` points the script at a directory holding a file of this",
+    "shape plus the rigs it names, for real-world skeletons that never enter",
+    "this repository."
+  ],
+  "scenes": [
+    {
+      "name": "meshed rig animating",
+      "query": { "scene": "mesh", "count": 1, "backend": "webgl" },
+      "why": "the deform tier working every frame — the cost this approach was doubted on"
+    },
+    {
+      "name": "meshed rig animating (canvas2d)",
+      "query": { "scene": "mesh", "count": 1, "backend": "canvas2d" },
+      "why": "the default backend, and the one real Safari struggles with"
+    },
+    {
+      "name": "held pose",
+      "query": { "scene": "held", "count": 1, "backend": "webgl" },
+      "why": "dirty-skip home ground: unchanged meshes reuse their raster, the reference redraws regardless"
+    },
+    {
+      "name": "rigid rig animating",
+      "query": { "scene": "rigid", "count": 10, "backend": "webgl" },
+      "why": "region attachments only — pure <img> and one CSS matrix per slot on this side"
+    },
+    {
+      "name": "8 small players",
+      "query": { "scene": "many", "count": 8, "backend": "webgl" },
+      "why": "independent players, under the browser's WebGL context cap"
+    },
+    {
+      "name": "20 small players",
+      "query": { "scene": "many", "count": 20, "backend": "webgl" },
+      "why": "past the ~16-context cap: the reference needs one context per player, this package shares one"
+    }
+  ]
+}

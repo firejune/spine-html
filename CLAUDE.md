@@ -253,6 +253,42 @@ README.md for architecture and measured numbers.
   files** (goldens rot across platforms). Seam cracks get the deterministic
   `?expand=0` canary rather than a screenshot threshold — they score below any
   limit the statistical diff can carry.
+- **The one comparison that is not against ourselves is `tests/oracle.spec.ts`,
+  against `@esotericsoftware/spine-webgl`.** Every other visual test A/Bs this
+  package's own two backends, which catches one drifting from the other and
+  cannot, by construction, catch a defect they *share* — #37 was that shape
+  (`pma: true` pages one multiply too dark in every tier, green suite for
+  months, found by a consumer). So the official runtime draws the same export
+  in the same pose at the same size, and the two pictures are diffed: rigid
+  tier, mesh tier on both backends, the exporter's own premultiplied page on
+  all three, clipping, additive blend, per-slot rgba, whole-skeleton tint. The
+  camera match is **derived, not fitted** (the ortho mapping is solved against
+  the DOM stage's in `tests/oracleStage.ts`) and then **proved by driving it**:
+  the alignment canary offsets one side by a single world unit and requires the
+  diff to see it — on `rawBad`, never the shift-tolerant count, which forgives
+  a one-pixel shift by design. What is forgiven is antialiasing and texture
+  filtering and nothing else, so the stage sits at scale 0.5, where one atlas
+  texel is one CSS pixel for this export and neither runtime resamples. Limits
+  are **ratios of drawn content at the parity suite's channel tolerance, plus a
+  darker-minus-lighter excess on the premultiplied cells** — never an absolute
+  per-pixel precision number, for the reason the `pma` bullet above gives at
+  length. They carry 2.0–2.4× over the measured floor, which is thinner than
+  the parity suite's 10× because the defects are only ~2.3× above them; that
+  gap is what there is, and Linux is unmeasured. `ORACLE_DUMP=1` is the
+  instrument, exactly as `PARITY_DUMP=1` is for parity.
+- **spine-webgl is a devDependency and must stay unreachable from `src/`.** The
+  reference code is `tests/oracleStage.ts` — the only file that names it — and
+  the dependency runs one way: the harness imports from `src/`, never the
+  reverse. One import written backwards would put a second full runtime into
+  `dist/` with no other signature, since `tsconfig.build.json` compiles all of
+  `src/` and the emitted file *set* would not change. `tests/package.spec.ts`
+  asserts the shipped bytes never name it, and that it is in neither
+  `dependencies` nor `peerDependencies`. A column of the CI matrix installs the
+  **matching generation** of it alongside its core, in one `bun add --no-save`
+  so the pinned pair cannot resolve apart and strand a nested second spine-core
+  under spine-webgl. The reference's own 4.2/4.3 seam is four lines, read off
+  the live object like `src/coreCompat.ts` does: 4.2 takes the alpha convention
+  on `drawSkeleton` and 4.3 on `GLTexture`.
 - Rendering is tested through the demo; the **loading path is tested through
   `tests/harness.html`** (a second vite build entry that exposes the library on
   `window.spineHtmlHarness`). Blob-URL ownership has no visual signature, so
@@ -314,6 +350,22 @@ README.md for architecture and measured numbers.
   `npm publish` by hand — the publish happens in CI over OIDC.
 
 ## Known backlog
+
+- 🔴 **The rigid tier draws a `rotate: 90` atlas region differently from the
+  official runtime**, found by the oracle on its first run and deliberately not
+  fixed in the change that found it. The 4.3 branch's spineboy atlas rotates
+  nothing and the 4.2 branch's rotates ten regions, so this reads as "the 4.2
+  column" and is not: the trigger is the *packer*, which a consumer atlas can
+  do on any generation, and the skip is a feature test on the parsed atlas
+  (`rotatedRegions`) for exactly that reason. Measured: every oracle cell over
+  the limit, `bad` 3.4–13.7% of content against a 0.14–1.78% floor, with no
+  direction (darker ≈ lighter), no missing content (`contentMismatch` inside
+  the floor) and the mask on whole parts rather than edges. It is the rigid
+  tier: every rotated region is a region attachment, and the meshed cells score
+  *lower* because their mesh slots are correct and dilute it. Nothing in the
+  suite could have seen it — `tests/regions.spec.ts` exercises a rotated region
+  that covers its **whole page**, which takes the pass-through path, never the
+  cut path.
 
 - Linux WebKit is no longer a parity outlier — it was canvas2d drawing the
   whole atlas page per triangle, and the source sub-rect above retired both the
