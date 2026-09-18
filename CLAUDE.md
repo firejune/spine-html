@@ -29,10 +29,44 @@ README.md for architecture and measured numbers.
 ## Architecture invariants
 
 - `@esotericsoftware/spine-core` is the only math source; renderers only draw.
+- **Every spine-core member the renderer reads goes through `src/coreCompat.ts`,
+  and the package still compiles against one core.** A Spine runtime reads only
+  its own generation's data — 4.3 either refuses an older export or parses it and
+  loads **zero** constraints, since it reads one `constraints` array where 4.2
+  and older write `ik`/`transform`/`path`/`physics` (measured on a real-world
+  corpus: 40% unparseable, 0 of 7,065 constraints loaded across the rest). So
+  supporting 4.2 *data* means running on the 4.2 *runtime*, and the peer
+  dependency is how the consumer says which. The seam has two shapes: 4.3's pose
+  split (`drawOrder.appliedPose`, `slot.appliedPose`, `bone.appliedPose`,
+  `Sequence.resolveIndex`/`getUVs`, `RegionAttachment.getOffsets`, the `skeleton`
+  argument to `VertexAttachment.computeWorldVertices`, `ClippingAttachment.inverse`)
+  and the pre-4.3 one, where all of that sits on the slot, the bone and the
+  attachment. **The pre-4.3 shape therefore needs no wrapper object** — a `Slot`
+  *is* its own pose view, a `Bone` its own bone pose — which is what keeps the
+  seam out of the allocation path; do not "tidy" it into returning literals. The
+  shape is picked **once per renderer, from the live objects** (`drawOrder`
+  carrying an `appliedPose` array), never per slot by try/catch and never from a
+  version string, which a vendored copy need not carry. spine-core stays a single
+  4.3 devDependency and `dist/*.d.ts` keeps describing 4.3: the older shape is
+  typed by local structural interfaces reached through casts that never leave
+  that file, so `tsc --noEmit` is meaningful only in the typed column
+  (`SPINE_CORE_MINOR`, playwright.config.ts) while the *shipped* types are
+  checked against every column by `tests/package.spec.ts`. **Supported = a green
+  CI column against that version's own exports**, and `peerDependencies` is that
+  set and nothing wider — widening one without the other is the bug the matrix in
+  `.github/workflows/ci.yml` exists to prevent. Two upstream facts that are not
+  ours to fix and that decided the range: `Sequence` is absent from 4.2's root
+  entry (4.3 exports it), so a *value* import of it is a link error there — see
+  `tests/invariants.spec.ts`; and 4.1 and older ship extensionless relative
+  specifiers in their own `dist/`, so plain node cannot import 4.0 at all and
+  4.1's `.d.ts` fails a nodenext consumer typecheck — which is #16's defect, in
+  spine-core.
 - Rigid-tier corner order from `computeWorldVertices` is **BL, UL, UR, BR**
-  (verified by execution on 4.2.98 and 4.3.13; the br/bl/ul/ur comments inside
-  the upstream function are stale). A node-side test guards this against
-  upstream reorderings.
+  (verified by execution on 4.2.98, 4.2.120 and 4.3.13; the br/bl/ul/ur comments
+  inside the upstream function are stale). A node-side test guards this against
+  upstream reorderings, on both generations — it is the one place that has to
+  *construct* spine-core objects rather than read them, and the constructors
+  differ where the seam's reads do not, so it detects the shape itself.
 - **Both raster backends address texels as `uv * size`**, the continuous frame
   where the page spans `[0, size]` — `drawImage` under an affine and
   `texture2D()` read the same frame. `uv * (size - 1)` (a discrete
@@ -239,6 +273,23 @@ README.md for architecture and measured numbers.
   resolver, import walk or consumer ever noticing (#24).
 - Keep `@playwright/test` pinned to a version whose browser revisions match the
   machine's `~/Library/Caches/ms-playwright` before bumping it.
+- **CI runs the whole suite once per supported spine-core minor**, each column
+  installing that minor over the lockfile's (`bun add --no-save` — writes
+  node_modules, leaves `package.json` and `bun.lock` alone, and the column
+  asserts both) and fetching that spine-runtimes branch's exports
+  (`SPINE_ASSETS_BRANCH`, which also stamps `public/spineboy` so a branch switch
+  refetches from clean rather than mixing two generations). Locally:
+  `SPINE_ASSETS_BRANCH=4.2 bun run fetch-assets`, `bun add --no-save
+  '@esotericsoftware/spine-core@4.2'`, then `SPINE_CORE_MINOR=4.2 bun run test`
+  — and `bun install --frozen-lockfile` afterwards to put 4.3 back. **Do not
+  fork an expectation per version to make a column green.** The spineboy export
+  is structurally identical on all four branches (52 slots, 66 region + 12 mesh +
+  1 clipping attachment, the same 11 animations including `portal`), so slot
+  counts, mesh counts and animation names need no keying at all; what genuinely
+  moves is the *pose*, which is why the part-mask cell's non-vacuity guard is a
+  proportion of drawn content rather than a pixel count — it alone clips with the
+  asset's own polygon. An absent *feature* gets a feature test, not a version key
+  (`INVERSE_CLIPPING` in `tests/clipping.spec.ts`).
 
 ## Workflow
 

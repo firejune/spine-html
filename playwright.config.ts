@@ -26,8 +26,28 @@ import { defineConfig } from '@playwright/test';
  *   falling back to 4321 on a typo is exactly the failure this avoids.
  * - Unset, everything is as it was: port 4321, reuse unless CI. CI runs one
  *   checkout per machine and sees no change.
+ *
+ * Typecheck policy (`SPINE_CORE_MINOR`):
+ *
+ * - The package is typed against one spine-core generation (4.3) and *runs* on
+ *   several, through the seam in `src/coreCompat.ts`. So `tsc --noEmit` over
+ *   `src/` and `tests/` is only meaningful in the column whose installed core
+ *   is the one the code is typed for; under an older core it reports the
+ *   difference the seam exists to absorb, which is not a defect and must not
+ *   be made to look like one by loosening the types.
+ * - `SPINE_CORE_MINOR` names the spine-core minor a run is against (the CI
+ *   matrix sets it; a local swap can too). Anything other than the typed minor
+ *   builds the pages without the typecheck. Unset — every ordinary local run —
+ *   is the typed path, unchanged.
+ * - What is NOT skipped anywhere is the typecheck of what npm actually ships:
+ *   `tests/package.spec.ts` compiles a consumer against the built `dist/` and
+ *   the installed core, in every column. The emitted `.d.ts` names only types
+ *   that exist across the supported range, so that check is a real assertion in
+ *   an older column rather than a formality.
  */
 const DEFAULT_PORT = 4321;
+/** The spine-core minor `src/` and `tests/` are typed against. */
+const TYPED_CORE_MINOR = '4.3';
 
 function resolveTestPort(raw: string | undefined): number {
   if (raw === undefined) return DEFAULT_PORT;
@@ -41,6 +61,18 @@ function resolveTestPort(raw: string | undefined): number {
 }
 
 const port = resolveTestPort(process.env.TEST_PORT);
+
+/**
+ * True when this run is against a spine-core other than the one `src/` and
+ * `tests/` are typed against, so a type *check* of them would report the
+ * difference the seam absorbs rather than a defect. Exported because
+ * `tests/package.spec.ts` needs the same answer, and one knob read in two
+ * places is one knob — a second copy of the rule is how the two would drift.
+ */
+export const UNTYPED_CORE =
+  !!process.env.SPINE_CORE_MINOR && process.env.SPINE_CORE_MINOR !== TYPED_CORE_MINOR;
+
+const buildScript = UNTYPED_CORE ? 'build:pages' : 'build';
 
 export default defineConfig({
   testDir: './tests',
@@ -62,9 +94,9 @@ export default defineConfig({
     { name: 'webkit', use: { browserName: 'webkit' } },
   ],
   webServer: {
-    // Build includes the fetch-assets hook (idempotent), so a fresh checkout
-    // works end-to-end with `bun run test`.
-    command: `bun run build && bunx vite preview --port ${port} --strictPort`,
+    // Both build scripts carry the fetch-assets hook (idempotent), so a fresh
+    // checkout works end-to-end with `bun run test`.
+    command: `bun run ${buildScript} && bunx vite preview --port ${port} --strictPort`,
     port,
     // A checkout that asked for its own port never wants someone else's
     // server on it — see the port policy above.

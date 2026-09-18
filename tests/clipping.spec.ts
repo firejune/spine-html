@@ -1,5 +1,6 @@
 import { writeFileSync } from 'node:fs';
 
+import { ClippingAttachment } from '@esotericsoftware/spine-core';
 import { expect, type Page, test } from '@playwright/test';
 import type { ClipCapture } from './harness';
 
@@ -104,6 +105,20 @@ const RIM_PX = 3;
  * artwork here or not — instead of asking about the edge of its shadow.
  */
 const CONTENT_ALPHA = 64;
+
+/**
+ * Whether the installed spine-core can express an inverse clip at all.
+ *
+ * `ClippingAttachment.inverse` arrived in 4.3 and no older editor exports one,
+ * so on an older core `src/coreCompat.ts` answers `false` rather than reading a
+ * property that is not there. The probe for it sets the flag by hand, which on
+ * such a core would be writing a field nothing reads and then asserting a
+ * clip-path shape that cannot occur — an absent feature, not a wrong
+ * behaviour. Detected off the class rather than off a version string, for the
+ * same reason the seam is, and phrased as a *feature* so that the day the
+ * supported range's floor moves, this simply starts running again.
+ */
+const INVERSE_CLIPPING = 'inverse' in new ClippingAttachment('inverse-support-probe');
 
 interface MaskMetrics {
   width: number;
@@ -661,11 +676,24 @@ test('part mask: the repository asset clips exactly the slots in its range', asy
   await report('part mask (spineboy-pro portal)', m, clipped, unclipped);
 
   // Not vacuous: something is drawn, and the clip visibly removes part of it.
+  //
+  // Alone in this file, this cell's polygon is the ASSET's — the clipping
+  // attachment in spineboy's own `portal` animation — so how much it removes is
+  // a property of the export, not of the renderer, and it moves when the suite
+  // runs against another spine-core's example assets (measured at the same
+  // pose: 2465 / 2426 cut of 6235 / 6198 content on the 4.3 exports, chromium /
+  // webkit; 2070 / 1999 of 6689 / 6617 on the 4.2 ones — the 4.2 portal poses
+  // the character differently under the same mask). The guard is therefore a
+  // proportion rather than a pixel count: it says what it always meant — the
+  // clip takes a substantial bite out of what was drawn — in terms no export
+  // version owns. Every cell around it authors its polygon in world space and
+  // keeps its absolute numbers.
   expect(m.content).toBeGreaterThan(5000);
-  expect(m.cutPixels).toBeGreaterThan(2000);
+  expect(m.cutPixels).toBeGreaterThan(m.content / 4);
   // The residue is the rim, and only the rim.
   // The two absolute claims: the clip removed everything outside it, and kept
-  // everything inside it. Neither is a comparison of two rasterizations.
+  // everything inside it. Neither is a comparison of two rasterizations, and
+  // neither moves with the export — both held unchanged on 4.2.
   expect(m.contentOutsideClip).toBe(0);
   expect(m.contentMissingInsideClip).toBe(0);
 });
@@ -745,6 +773,7 @@ test('whole-skeleton clip: one clip-path on the root, and the root style given b
 });
 
 test('inverse clip: even-odd against the element box keeps what is outside', async ({ page }) => {
+  test.skip(!INVERSE_CLIPPING, 'the installed spine-core has no inverse clipping');
   const result = await page.evaluate(() => window.spineHtmlHarness.clipInverseProbe());
 
   expect(result.counters.clipCount).toBe(1);

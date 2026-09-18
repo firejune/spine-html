@@ -1,9 +1,25 @@
-# CI: typecheck + the playwright suite (chromium + webkit).
+# CI: the playwright suite (chromium + webkit), once per supported spine-core.
 #
 # The visual tests are A/B within one run and one engine (no golden files),
 # so they are platform-independent by design — ubuntu results are valid even
 # though local dev is macOS. Headless numbers are never performance
 # evidence; nothing here asserts timing.
+#
+# ## Why there is a matrix
+#
+# A Spine runtime reads only the data its own generation exported, so a
+# consumer installs the spine-core that matches their editor and this package
+# has to draw from either (the seam is `src/coreCompat.ts`). "Supported" is not
+# a claim in the README, it is a column here that is green against *that
+# version's own example exports* — which is why each column also refetches the
+# matching spine-runtimes branch. `peerDependencies` in package.json is exactly
+# the set of minors listed below; widening one without the other is the bug
+# this file exists to prevent.
+#
+# The column's core is installed over the lockfile's with `bun add --no-save`,
+# which writes node_modules and leaves package.json and bun.lock alone
+# (verified by the guard step). The repository keeps ONE spine-core
+# devDependency; nothing here commits a second.
 name: ci
 
 on:
@@ -28,12 +44,49 @@ on:
 
 jobs:
   test:
+    name: test (spine-core ${{ matrix.core }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # Every column's result is wanted: "4.2 broke" and "4.3 broke" are
+      # different facts, and cancelling the rest would hide one of them.
+      fail-fast: false
+      matrix:
+        # The typed column first. `typed` marks the one minor `src/` and
+        # `tests/` are written against — see playwright.config.ts.
+        include:
+          - core: '4.3'
+            typed: true
+          - core: '4.2'
+            typed: false
+    env:
+      # Which minor this run is against: turns off `tsc --noEmit` outside the
+      # typed column (playwright.config.ts) and picks the matching exports
+      # (scripts/fetch-assets.sh).
+      SPINE_CORE_MINOR: ${{ matrix.core }}
+      SPINE_ASSETS_BRANCH: ${{ matrix.core }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+
+      - name: Install this column's spine-core
+        if: ${{ !matrix.typed }}
+        run: bun add --no-save "@esotericsoftware/spine-core@${{ matrix.core }}"
+
+      # Two facts the column would otherwise only imply: that the swap took,
+      # and that it left the repository's own manifest and lockfile alone. A
+      # silently-unswapped column would test 4.3 twice and call it coverage.
+      - name: The installed core is the column's, and nothing was committed
+        run: |
+          installed=$(node -p "require('./node_modules/@esotericsoftware/spine-core/package.json').version")
+          echo "spine-core $installed"
+          case "$installed" in
+            ${{ matrix.core }}.*) ;;
+            *) echo "expected ${{ matrix.core }}.x, got $installed"; exit 1 ;;
+          esac
+          git diff --exit-code -- package.json bun.lock
+
       - run: bunx playwright install --with-deps chromium webkit
       - run: bun run test
         env:
@@ -43,7 +96,7 @@ jobs:
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results
+          name: test-results-${{ matrix.core }}
           path: test-results/
           if-no-files-found: ignore
       # The dump is the point of such a run, so it must be uploaded whether the
@@ -62,6 +115,6 @@ jobs:
       - if: ${{ (success() || failure()) && github.event_name == 'workflow_dispatch' && inputs.parity_dump }}
         uses: actions/upload-artifact@v4
         with:
-          name: parity-dump
+          name: parity-dump-${{ matrix.core }}
           path: test-results/
           if-no-files-found: ignore
