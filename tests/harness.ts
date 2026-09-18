@@ -168,6 +168,11 @@ export interface SpineHtmlHarness {
   cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult>;
   scaledPageProbe(): Promise<ScaledPageProbeResult>;
   halfResRenderProbe(): Promise<HalfResRenderProbeResult>;
+  clipPartMaskProbe(): Promise<ClipPartMaskProbeResult>;
+  clipRigidProbe(): Promise<ClipRigidProbeResult>;
+  clipRootProbe(): Promise<ClipRootProbeResult>;
+  clipCountersProbe(): Promise<ClipCountersProbeResult>;
+  clipInverseProbe(): Promise<ClipInverseProbeResult>;
   cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageResult>;
 }
 
@@ -2534,6 +2539,665 @@ async function cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageR
   };
 }
 
+/* --- clipping attachments -------------------------------------------------
+ *
+ * Clipping has no counter that can prove it is CORRECT — a clip-path that is
+ * off by a transform still produces a string and still counts as applied. So
+ * the oracle for these probes is pixels, and the specs build it without
+ * touching the renderer's local-frame math: the clipped capture must equal the
+ * UNCLIPPED capture of the same slots, masked in screen space by the world
+ * polygon these probes hand back.
+ *
+ * Each pixel probe therefore leaves two capture boxes in the DOM for the spec
+ * to screenshot — same size, same origin, same scale — differing in nothing
+ * but `renderer.clipping`.
+ */
+
+import {
+  ClippingAttachment,
+  type Slot,
+  type SlotData,
+} from '@esotericsoftware/spine-core';
+
+const CLIP_PRO = {
+  atlasUrl: '/spineboy/spineboy.atlas',
+  skeletonUrl: '/spineboy/spineboy-pro.json',
+};
+const CLIP_ESS = {
+  atlasUrl: '/spineboy/spineboy.atlas',
+  skeletonUrl: '/spineboy/spineboy-ess.json',
+};
+/** Root scale, capture box and root origin shared by every clipping capture. */
+const CLIP_SCALE = 0.4;
+const CLIP_BOX = { width: 420, height: 340, originX: 210, originY: 320 };
+/**
+ * Capture boxes are left TRANSPARENT and screenshotted with `omitBackground`,
+ * so "is there artwork at this pixel" is a question about alpha rather than
+ * about how close a color is to a backdrop. Spineboy's outfit is nearly black,
+ * and against an opaque dark box the two answers are not the same question.
+ */
+const CLIP_BG = 'transparent';
+
+export interface ClipCapture {
+  /** DOM id of the element the spec screenshots. */
+  id: string;
+  width: number;
+  height: number;
+  /** Root origin inside the capture box, in capture pixels. */
+  originX: number;
+  originY: number;
+  /** Scale from root (CSS world) units to capture pixels. */
+  scale: number;
+  /** Always 'transparent': the boxes are captured with `omitBackground`. */
+  background: string;
+}
+
+export interface ClipElementReport {
+  slot: string;
+  tag: 'img' | 'canvas';
+  visible: boolean;
+  /** Inline clip-path, '' when the element carries none. */
+  clipPath: string;
+  /** Whether the clip's slot range covers this slot. */
+  inRange: boolean;
+}
+
+export interface ClipCounters {
+  clipCount: number;
+  clipSkipCount: number;
+  clipWriteCount: number;
+}
+
+export interface ClipPartMaskProbeResult {
+  startSlot: string;
+  endSlot: string | null;
+  inRangeSlots: string[];
+  outOfRangeSlots: string[];
+  /** The clip polygon in the root's CSS frame (Y negated), flat x,y. */
+  polygon: number[];
+  counters: ClipCounters;
+  /** The full render — nothing hidden — one entry per slot element. */
+  elements: ClipElementReport[];
+  /** Must stay '': a part mask is not the whole-skeleton fast path. */
+  rootClipPath: string;
+  clipped: ClipCapture;
+  unclipped: ClipCapture;
+}
+
+export interface ClipRigidProbeResult {
+  /**
+   * The control capture: the same pose, clipped by a polygon so large it
+   * removes NOTHING. Geometrically it is the unclipped picture; what it has
+   * that `unclipped` lacks is a `clip-path` on every element. So whatever it
+   * and `unclipped` disagree about is the cost of the clip-path's presence in
+   * the rasterizer — not of where the clip was put. Without this, that floor
+   * cannot be told apart from a clip landing in the wrong place.
+   */
+  control: ClipCapture;
+  /** Slots carrying a clip-path, and drawn slots carrying none. */
+  clippedSlots: string[];
+  unclippedSlots: string[];
+  /** Drawn rigid elements whose matrix is neither axis-aligned nor unit. */
+  rotatedOrScaled: number;
+  /** Must stay '': the end slot lies ahead, so the fast path is closed. */
+  rootClipPath: string;
+  counters: ClipCounters;
+  polygon: number[];
+  clipped: ClipCapture;
+  unclipped: ClipCapture;
+}
+
+export interface ClipRootStyleContract {
+  /** What the caller had on the root before the renderer ever ran. */
+  before: string;
+  /** While the whole-skeleton clip is in force. */
+  duringClip: string;
+  /** After the clip stops covering the frame. */
+  afterClipEnds: string;
+  /** While a second whole-skeleton clip is in force again. */
+  duringSecondClip: string;
+  afterDispose: string;
+}
+
+export interface ClipRootProbeResult {
+  /** The root's clip-path under the fast path — a polygon(). */
+  rootClipPath: string;
+  /** Must be 0: the fast path writes the root INSTEAD of the elements. */
+  elementsWithClipPath: number;
+  drawnElements: number;
+  counters: ClipCounters;
+  styleContract: ClipRootStyleContract;
+  polygon: number[];
+  clipped: ClipCapture;
+  unclipped: ClipCapture;
+}
+
+export interface ClipCounterStep {
+  clipWriteCount: number;
+  clipCount: number;
+  clipSkipCount: number;
+  elementsWithClipPath: number;
+  /** Slots whose clip-path string changed during this step. */
+  changedSlots: string[];
+}
+
+export interface ClipCountersProbeResult {
+  /** Drawn elements the clip covers — the ceiling for a per-element sweep. */
+  inRangeElements: number;
+  /** The slot the single-bone nudge is expected to move, and nothing else. */
+  movedSlot: string;
+  firstRender: ClipCounterStep;
+  /** Same pose, same polygon: the write cache must carry all of it. */
+  secondRender: ClipCounterStep;
+  /** Polygon moved: every covered element's local polygon changed. */
+  polygonMoved: ClipCounterStep;
+  /** One bone nudged: only that element's local polygon changed. */
+  oneSlotMoved: ClipCounterStep;
+  /** clipping = false: every clip-path removed, the clip counted as skipped. */
+  disabled: ClipCounterStep;
+  /** clipping = true again: re-applied without any other change. */
+  reEnabled: ClipCounterStep;
+  /** A second clipping attachment met while the first is active. */
+  nested: ClipCounterStep;
+}
+
+export interface ClipInverseProbeResult {
+  /** The even-odd string the renderer wrote for a drawn element. */
+  sampleClipPath: string;
+  elementsWithClipPath: number;
+  /** Must stay '': an inverse clip never takes the root fast path. */
+  rootClipPath: string;
+  counters: ClipCounters;
+  polygon: number[];
+  clipped: ClipCapture;
+  unclipped: ClipCapture;
+}
+
+/** One deterministic pose of a named animation. */
+function posedFor(assets: LoadedAssets, animation: string, time: number): Skeleton {
+  const skeleton = new Skeleton(assets.data);
+  const state = new AnimationState(new AnimationStateData(assets.data));
+  state.setAnimation(0, animation, true);
+  state.update(time);
+  state.apply(skeleton);
+  skeleton.update(time);
+  skeleton.updateWorldTransform(Physics.update);
+  return skeleton;
+}
+
+/** A capture box with a renderer root at a known origin and scale inside it. */
+function openClipCapture(id: string, top: number): {
+  root: HTMLElement;
+  capture: ClipCapture;
+} {
+  const container = document.createElement('div');
+  container.id = id;
+  container.style.position = 'absolute';
+  container.style.left = '0';
+  container.style.top = `${top}px`;
+  container.style.width = `${CLIP_BOX.width}px`;
+  container.style.height = `${CLIP_BOX.height}px`;
+  container.style.overflow = 'hidden';
+  const root = document.createElement('div');
+  root.style.position = 'absolute';
+  root.style.left = `${CLIP_BOX.originX}px`;
+  root.style.top = `${CLIP_BOX.originY}px`;
+  root.style.transformOrigin = '0 0';
+  root.style.transform = `scale(${CLIP_SCALE})`;
+  container.appendChild(root);
+  document.body.appendChild(container);
+  return {
+    root,
+    capture: { id, ...CLIP_BOX, scale: CLIP_SCALE, background: CLIP_BG },
+  };
+}
+
+function clipRenderer(root: HTMLElement, assets: LoadedAssets): SpineHtmlRenderer {
+  const renderer = new SpineHtmlRenderer(root, assets.regionImages);
+  // The root is scaled, so fold that in rather than rastering meshes at 1:1.
+  renderer.pixelRatio = CLIP_SCALE;
+  return renderer;
+}
+
+function clipCounters(renderer: SpineHtmlRenderer): ClipCounters {
+  return {
+    clipCount: renderer.clipCount,
+    clipSkipCount: renderer.clipSkipCount,
+    clipWriteCount: renderer.clipWriteCount,
+  };
+}
+
+/** The slot elements of one root, identified by the z-index the renderer wrote. */
+function clipElements(
+  root: HTMLElement,
+  drawOrder: Slot[],
+  startIndex: number,
+  endIndex: number,
+): ClipElementReport[] {
+  const out: ClipElementReport[] = [];
+  for (const el of Array.from(root.children)) {
+    if (!(el instanceof HTMLImageElement) && !(el instanceof HTMLCanvasElement)) continue;
+    const z = Number(el.style.zIndex);
+    const slot = Number.isInteger(z) ? drawOrder[z] : undefined;
+    out.push({
+      slot: slot ? slot.data.name : `z:${el.style.zIndex}`,
+      tag: el instanceof HTMLImageElement ? 'img' : 'canvas',
+      visible: el.style.display !== 'none',
+      clipPath: el.style.clipPath,
+      inRange: z > startIndex && z <= endIndex,
+    });
+  }
+  return out;
+}
+
+/** The clip polygon in the root's CSS frame — the spec's oracle input. */
+function clipWorldPolygon(skeleton: Skeleton, slot: Slot, clip: ClippingAttachment): number[] {
+  const n = clip.worldVerticesLength;
+  const world = new Float32Array(n);
+  clip.computeWorldVertices(skeleton, slot, 0, n, world, 0, 2);
+  const polygon: number[] = [];
+  // Spine is Y-up, CSS is Y-down — the same negation the renderer applies.
+  for (let v = 0; v < n; v += 2) polygon.push(world[v], -world[v + 1]);
+  return polygon;
+}
+
+/**
+ * A clip polygon is stored in its slot's bone space, and every spineboy slot
+ * hangs off an animated bone — so these tests author the quad in world space
+ * and carry it into the host bone's frame through the inverse of that bone's
+ * applied transform. Where the clip lands is then a property of the test
+ * rather than of the pose. (Spine's bone convention: X = a·vx + b·vy + worldX,
+ * Y = c·vx + d·vy + worldY.)
+ */
+function clipVerticesFromWorld(slot: Slot, world: number[]): number[] {
+  const bone = slot.bone.appliedPose;
+  const det = bone.a * bone.d - bone.b * bone.c;
+  if (det === 0) throw new Error('clip host bone has a singular transform');
+  const inv = 1 / det;
+  const out: number[] = [];
+  for (let i = 0; i < world.length; i += 2) {
+    const dx = world[i] - bone.worldX;
+    const dy = world[i + 1] - bone.worldY;
+    out.push((bone.d * dx - bone.b * dy) * inv, (bone.a * dy - bone.c * dx) * inv);
+  }
+  return out;
+}
+
+function makeClip(
+  name: string,
+  slot: Slot,
+  worldVertices: number[],
+  endSlot: SlotData | null,
+): ClippingAttachment {
+  const clip = new ClippingAttachment(name);
+  clip.vertices = clipVerticesFromWorld(slot, worldVertices);
+  clip.worldVerticesLength = clip.vertices.length;
+  clip.endSlot = endSlot;
+  return clip;
+}
+
+/** A quad, tilted so the rigid tier's inverse-matrix path has real work to do. */
+function tiltedQuad(
+  cx: number,
+  cy: number,
+  halfW: number,
+  halfH: number,
+  degrees: number,
+): number[] {
+  const t = (degrees * Math.PI) / 180;
+  const cos = Math.cos(t);
+  const sin = Math.sin(t);
+  const out: number[] = [];
+  for (const [x, y] of [
+    [-halfW, -halfH],
+    [halfW, -halfH],
+    [halfW, halfH],
+    [-halfW, halfH],
+  ]) {
+    out.push(cx + x * cos - y * sin, cy + x * sin + y * cos);
+  }
+  return out;
+}
+
+/**
+ * The repository's own part mask: spineboy-pro's `portal` animation carries a
+ * clipping attachment in the `clipping` slot that ends at `head-bb`, so it
+ * covers the character and leaves the portal artwork around it alone.
+ *
+ * The two captures hide everything OUT of that range, so the only difference
+ * between them is the clip itself — which is what lets the spec mask one and
+ * compare it to the other.
+ */
+async function clipPartMaskProbe(): Promise<ClipPartMaskProbeResult> {
+  const assets = await loadSkeletonAssets(CLIP_PRO);
+  const skeleton = posedFor(assets, 'portal', 1.2);
+  const drawOrder = skeleton.drawOrder.appliedPose;
+  const startIndex = drawOrder.findIndex(
+    (slot) => slot.appliedPose.attachment instanceof ClippingAttachment,
+  );
+  if (startIndex < 0) throw new Error('the portal animation has no clipping attachment');
+  const startSlot = drawOrder[startIndex];
+  const clip = startSlot.appliedPose.attachment as ClippingAttachment;
+  const ahead = clip.endSlot
+    ? drawOrder.findIndex((slot, i) => i > startIndex && slot.data === clip.endSlot)
+    : -1;
+  const endIndex = ahead === -1 ? drawOrder.length - 1 : ahead;
+
+  const inRangeSlots: string[] = [];
+  const outOfRangeSlots: string[] = [];
+  drawOrder.forEach((slot, i) => {
+    if (i === startIndex) return;
+    (i > startIndex && i <= endIndex ? inRangeSlots : outOfRangeSlots).push(slot.data.name);
+  });
+
+  // Full render first — the DOM report needs the out-of-range slots present.
+  const full = openClipCapture('clip-part-full', CLIP_BOX.height * 2);
+  const fullRenderer = clipRenderer(full.root, assets);
+  fullRenderer.render(skeleton);
+  const elements = clipElements(full.root, drawOrder, startIndex, endIndex);
+  const rootClipPath = full.root.style.clipPath;
+
+  const polygon = clipWorldPolygon(skeleton, startSlot, clip);
+
+  // Now drop everything outside the clip's range, so the captures differ in
+  // nothing but the clip.
+  drawOrder.forEach((slot, i) => {
+    if (i !== startIndex && !(i > startIndex && i <= endIndex)) {
+      slot.appliedPose.attachment = null;
+    }
+  });
+
+  const clipped = openClipCapture('clip-part-a', 0);
+  const clippedRenderer = clipRenderer(clipped.root, assets);
+  clippedRenderer.render(skeleton);
+
+  const unclipped = openClipCapture('clip-part-b', CLIP_BOX.height);
+  const unclippedRenderer = clipRenderer(unclipped.root, assets);
+  unclippedRenderer.clipping = false;
+  unclippedRenderer.render(skeleton);
+
+  return {
+    startSlot: startSlot.data.name,
+    endSlot: clip.endSlot ? clip.endSlot.name : null,
+    inRangeSlots,
+    outOfRangeSlots,
+    polygon,
+    counters: clipCounters(clippedRenderer),
+    elements,
+    rootClipPath,
+    clipped: clipped.capture,
+    unclipped: unclipped.capture,
+  };
+}
+
+/**
+ * The rigid tier under a tilted clip: spineboy-ess is region attachments only,
+ * so every element here is an `<img>` posed by a full matrix and every
+ * clip-path has to come back through that matrix's inverse.
+ *
+ * The clip sits in the first slot and ends at the LAST one, so it covers every
+ * drawn element (which is what makes the whole capture maskable) while the
+ * root fast path stays shut — the end slot lies ahead.
+ */
+async function clipRigidProbe(): Promise<ClipRigidProbeResult> {
+  const assets = await loadSkeletonAssets(CLIP_ESS);
+  const skeleton = posedFor(assets, 'walk', 1.2);
+  const drawOrder = skeleton.drawOrder.appliedPose;
+  const host = drawOrder[0];
+  const last = drawOrder[drawOrder.length - 1];
+
+  // The control first: clipped by a quad far larger than the skeleton, so
+  // every element carries a clip-path and none of them loses a pixel.
+  host.appliedPose.attachment = makeClip(
+    'probe-covering',
+    host,
+    tiltedQuad(0, 350, 20000, 20000, 0),
+    last.data,
+  );
+  const control = openClipCapture('clip-rigid-c', CLIP_BOX.height * 2);
+  const controlRenderer = clipRenderer(control.root, assets);
+  controlRenderer.render(skeleton);
+
+  const clip = makeClip('probe-tilted', host, tiltedQuad(40, 380, 200, 130, 22), last.data);
+  host.appliedPose.attachment = clip;
+
+  const polygon = clipWorldPolygon(skeleton, host, clip);
+
+  const clipped = openClipCapture('clip-rigid-a', 0);
+  const clippedRenderer = clipRenderer(clipped.root, assets);
+  clippedRenderer.render(skeleton);
+
+  const unclipped = openClipCapture('clip-rigid-b', CLIP_BOX.height);
+  const unclippedRenderer = clipRenderer(unclipped.root, assets);
+  unclippedRenderer.clipping = false;
+  unclippedRenderer.render(skeleton);
+
+  const reports = clipElements(clipped.root, drawOrder, 0, drawOrder.length - 1);
+  let rotatedOrScaled = 0;
+  for (const el of Array.from(clipped.root.children)) {
+    if (!(el instanceof HTMLImageElement) || el.style.display === 'none') continue;
+    const m = /matrix\(([^)]+)\)/.exec(el.style.transform);
+    if (!m) continue;
+    const [a, b, c, d] = m[1].split(',').map(Number);
+    // Anything but the identity 2×2 means the inverse below is doing work.
+    if (Math.abs(a - 1) > 1e-6 || Math.abs(d - 1) > 1e-6 || b !== 0 || c !== 0) {
+      rotatedOrScaled++;
+    }
+  }
+
+  return {
+    control: control.capture,
+    clippedSlots: reports.filter((r) => r.clipPath !== '').map((r) => r.slot),
+    unclippedSlots: reports.filter((r) => r.visible && r.clipPath === '').map((r) => r.slot),
+    rotatedOrScaled,
+    rootClipPath: clipped.root.style.clipPath,
+    counters: clipCounters(clippedRenderer),
+    polygon,
+    clipped: clipped.capture,
+    unclipped: unclipped.capture,
+  };
+}
+
+/**
+ * The whole-skeleton shape: an axis-aligned rectangle in the first slot whose
+ * end slot is its OWN slot. The official draw loops never offer the starting
+ * slot to clipEnd (they `continue` past it), so that clip never ends and
+ * covers every element — which is the case the root fast path exists for.
+ *
+ * The style contract gets its own throwaway root: the root is the caller's
+ * element, so the inline clip-path found there has to come back.
+ */
+async function clipRootProbe(): Promise<ClipRootProbeResult> {
+  const assets = await loadSkeletonAssets(CLIP_ESS);
+  const skeleton = posedFor(assets, 'walk', 1.2);
+  const drawOrder = skeleton.drawOrder.appliedPose;
+  const host = drawOrder[0];
+  const original = host.appliedPose.attachment;
+  // A screen-shaped window over the character, the consumer shape this serves.
+  const rect = [-120, 100, 220, 100, 220, 520, -120, 520];
+  const clip = makeClip('probe-window', host, rect, host.data);
+  host.appliedPose.attachment = clip;
+
+  const polygon = clipWorldPolygon(skeleton, host, clip);
+
+  const clipped = openClipCapture('clip-root-a', 0);
+  const clippedRenderer = clipRenderer(clipped.root, assets);
+  clippedRenderer.render(skeleton);
+
+  const unclipped = openClipCapture('clip-root-b', CLIP_BOX.height);
+  const unclippedRenderer = clipRenderer(unclipped.root, assets);
+  unclippedRenderer.clipping = false;
+  unclippedRenderer.render(skeleton);
+
+  const reports = clipElements(clipped.root, drawOrder, 0, drawOrder.length);
+  const counters = clipCounters(clippedRenderer);
+
+  // The borrowed-style contract, on a root that already carries one.
+  const contract = openClipCapture('clip-root-style', CLIP_BOX.height * 2);
+  contract.root.style.clipPath = 'inset(0px)';
+  // Read it back rather than trusting the literal: what has to come back is
+  // whatever the engine serialized, which is what the renderer saved.
+  const before = contract.root.style.clipPath;
+  const contractRenderer = clipRenderer(contract.root, assets);
+  contractRenderer.render(skeleton);
+  const duringClip = contract.root.style.clipPath;
+  host.appliedPose.attachment = original;
+  contractRenderer.render(skeleton);
+  const afterClipEnds = contract.root.style.clipPath;
+  host.appliedPose.attachment = clip;
+  contractRenderer.render(skeleton);
+  const duringSecondClip = contract.root.style.clipPath;
+  contractRenderer.dispose();
+  const afterDispose = contract.root.style.clipPath;
+
+  return {
+    rootClipPath: clipped.root.style.clipPath,
+    elementsWithClipPath: reports.filter((r) => r.clipPath !== '').length,
+    drawnElements: reports.filter((r) => r.visible).length,
+    counters,
+    styleContract: { before, duringClip, afterClipEnds, duringSecondClip, afterDispose },
+    polygon,
+    clipped: clipped.capture,
+    unclipped: unclipped.capture,
+  };
+}
+
+/**
+ * Writes-on-change, the disable switch, and the nested-clip rule — all on one
+ * renderer, because each step's meaning is "what changed since the last one".
+ * No pixels here: every number below is a deterministic counter.
+ */
+async function clipCountersProbe(): Promise<ClipCountersProbeResult> {
+  const assets = await loadSkeletonAssets(CLIP_ESS);
+  const skeleton = posedFor(assets, 'walk', 1.2);
+  const drawOrder = skeleton.drawOrder.appliedPose;
+  const host = drawOrder[0];
+  const last = drawOrder[drawOrder.length - 1];
+  const clip = makeClip('probe-counters', host, tiltedQuad(40, 380, 200, 130, 22), last.data);
+  host.appliedPose.attachment = clip;
+
+  const root = document.createElement('div');
+  root.style.position = 'absolute';
+  root.style.left = '0';
+  root.style.top = '0';
+  document.body.appendChild(root);
+  const renderer = clipRenderer(root, assets);
+
+  let previous = new Map<string, string>();
+  function step(): ClipCounterStep {
+    renderer.render(skeleton);
+    const reports = clipElements(root, drawOrder, 0, drawOrder.length - 1);
+    const now = new Map(reports.map((r) => [r.slot, r.clipPath]));
+    const changedSlots: string[] = [];
+    for (const [slot, value] of now) {
+      if (previous.get(slot) !== value) changedSlots.push(slot);
+    }
+    previous = now;
+    return {
+      clipWriteCount: renderer.clipWriteCount,
+      clipCount: renderer.clipCount,
+      clipSkipCount: renderer.clipSkipCount,
+      elementsWithClipPath: reports.filter((r) => r.clipPath !== '').length,
+      changedSlots,
+    };
+  }
+
+  const firstRender = step();
+  const inRangeElements = firstRender.elementsWithClipPath;
+  const secondRender = step();
+
+  // Move the polygon itself: every covered element's local polygon changes.
+  const moved = clip.vertices as number[];
+  for (let i = 0; i < moved.length; i++) moved[i] += 7;
+  const polygonMoved = step();
+
+  // Nudge one bone's APPLIED world transform. Nothing recomputes the
+  // hierarchy afterwards, so no child bone follows and exactly the slots on
+  // that bone move — and this one is picked because it carries exactly one
+  // slot that is actually drawn (a bone whose only slot is undrawn would move
+  // nothing at all and make the assertion pass for the wrong reason).
+  const drawn = drawOrder.filter(
+    (slot) => slot !== host && previous.get(slot.data.name) !== undefined,
+  );
+  const movedSlot = drawn.find(
+    (slot) => drawn.filter((other) => other.bone === slot.bone).length === 1,
+  );
+  if (!movedSlot) throw new Error('no drawn slot is alone on its bone');
+  movedSlot.bone.appliedPose.worldX += 13;
+  const oneSlotMoved = step();
+
+  renderer.clipping = false;
+  const disabled = step();
+  renderer.clipping = true;
+  const reEnabled = step();
+
+  // A second clipping attachment while the first is still active: spine-core's
+  // clipStart ignores it, so it is counted, not nested.
+  const second = drawOrder[3];
+  second.appliedPose.attachment = makeClip(
+    'probe-second',
+    second,
+    tiltedQuad(0, 300, 120, 120, 0),
+    last.data,
+  );
+  const nested = step();
+
+  renderer.dispose();
+  root.remove();
+
+  return {
+    inRangeElements,
+    movedSlot: movedSlot.data.name,
+    firstRender,
+    secondRender,
+    polygonMoved,
+    oneSlotMoved,
+    disabled,
+    reEnabled,
+    nested,
+  };
+}
+
+/**
+ * An inverse clip: everything OUTSIDE the polygon stays visible. CSS says that
+ * with an even-odd polygon whose outer ring is the element's own box, so the
+ * shape is expressible per element — and never on the root, which is a 0×0
+ * origin element with no box to ring.
+ */
+async function clipInverseProbe(): Promise<ClipInverseProbeResult> {
+  const assets = await loadSkeletonAssets(CLIP_ESS);
+  const skeleton = posedFor(assets, 'walk', 1.2);
+  const drawOrder = skeleton.drawOrder.appliedPose;
+  const host = drawOrder[0];
+  const clip = makeClip('probe-inverse', host, tiltedQuad(40, 380, 160, 110, 22), host.data);
+  clip.inverse = true;
+  host.appliedPose.attachment = clip;
+
+  const polygon = clipWorldPolygon(skeleton, host, clip);
+
+  const clipped = openClipCapture('clip-inverse-a', 0);
+  const clippedRenderer = clipRenderer(clipped.root, assets);
+  clippedRenderer.render(skeleton);
+
+  const unclipped = openClipCapture('clip-inverse-b', CLIP_BOX.height);
+  const unclippedRenderer = clipRenderer(unclipped.root, assets);
+  unclippedRenderer.clipping = false;
+  unclippedRenderer.render(skeleton);
+
+  const reports = clipElements(clipped.root, drawOrder, 0, drawOrder.length);
+  const sample = reports.find((r) => r.visible && r.clipPath !== '');
+
+  return {
+    sampleClipPath: sample ? sample.clipPath : '',
+    elementsWithClipPath: reports.filter((r) => r.clipPath !== '').length,
+    rootClipPath: clipped.root.style.clipPath,
+    counters: clipCounters(clippedRenderer),
+    polygon,
+    clipped: clipped.capture,
+    unclipped: unclipped.capture,
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -2551,5 +3215,10 @@ window.spineHtmlHarness = {
   cutFlightFailureProbe,
   scaledPageProbe,
   halfResRenderProbe,
+  clipPartMaskProbe,
+  clipRigidProbe,
+  clipRootProbe,
+  clipCountersProbe,
+  clipInverseProbe,
   cutRuleStage,
 };

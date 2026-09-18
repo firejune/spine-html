@@ -23,7 +23,8 @@ README.md for architecture and measured numbers.
   backend exists — switch backends rather than micro-optimizing the canvas2d
   triangle path for Safari.
 - Never assert absolute milliseconds in tests; assert the deterministic counters
-  (drawn / reused / realloc'd / clips skipped) instead.
+  (drawn / reused / realloc'd / clips applied / clips skipped / clip-path
+  writes) instead.
 
 ## Architecture invariants
 
@@ -94,8 +95,32 @@ README.md for architecture and measured numbers.
   mean one per frame, which is why `pixelRatio: 'auto'` was dropped rather than
   built.
 - Element-level features (z-index draw order, SVG-filter tint, mix-blend-mode,
-  dirty-skip, backing policy) are backend-agnostic. Keep them out of the raster
-  backends.
+  dirty-skip, backing policy, clipping) are backend-agnostic. Keep them out of
+  the raster backends.
+- **Clipping is an element-level CSS `clip-path`, written in each element's own
+  local frame** — the world polygon through the inverse of the `<img>` matrix
+  for rigid slots, minus the canvas translate for mesh slots (`transform-origin`
+  is `0 0` on every slot element, which is what lets the matrix be inverted with
+  no origin term). Semantics are spine-core's, taken from the official draw
+  loops rather than inferred: one active clip at a time, applied through the end
+  slot inclusive, and an end slot that is the clip's OWN slot never ends it —
+  `clipEnd(slot)` runs *before* `clipStart` on the starting slot and the loop
+  then `continue`s past the trailing `clipEnd`, so the starting slot is never
+  offered to it (spine-core 4.3.13 `dist/SkeletonRendererCore.js`, and
+  `dist/SkeletonRenderer.js` of `@esotericsoftware/spine-webgl` 4.3.13). That
+  own-slot case is the whole-skeleton clip, and it takes the **root fast path**:
+  one `clip-path` on the root, whose inline value is borrowed and restored (the
+  root is the caller's element) — never both root and per-element for one clip.
+  Writes are cached per element like `transform`, with coordinates quantized to
+  1/1000 of a local unit, so a static clip over a static pose costs zero writes
+  per frame. An **inverse** clip keeps a region with a hole in it, which needs
+  two rings — `polygon()` is one closed ring and silently turns a box plus a
+  polygon into a self-intersecting one whose even-odd fill leaves a wedge along
+  the seam, so inverse clips are a two-subpath `path(evenodd, …)` instead.
+  Neither raster backend knows any of this exists, and **the mesh
+  dirty signature must never start depending on the clip** — a mesh that held
+  still has to keep reusing its raster under a moving clip. `tests/clipping.spec.ts`
+  holds it, against a screen-space oracle that never touches the local-frame math.
 - **A RegionImage map belongs to the caller, not to a renderer.** Its URLs may
   be blobs from `unpackRegions`, an atlas page passed through whole, or the
   caller's own part PNGs — and one map is normally shared by several renderers

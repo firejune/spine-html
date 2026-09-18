@@ -86,8 +86,29 @@ with a self-contained test suite (backend visual parity + invariants) and CI.
 - ✅ Dirty-skip: a mesh whose canvas-space vertices didn't change reuses last frame's
   raster — the CSS translate still tracks it, so parts that hold a pose (or move by
   whole pixels) pay zero raster. 10 frozen spineboys: WebKit ~141 → ~0.5 ms/frame
-- ⬜ Clipping — deliberately unsupported (counted and skipped); layered transparent
-  parts + `overflow: hidden` cover the practical cases
+- ✅ Clipping attachments as element-level CSS `clip-path`: spine-core's semantics
+  (one active clip at a time, applied from the clip's slot through its end slot
+  inclusive), with the polygon expressed in each element's own local frame — the
+  inverse of the `<img>` matrix for rigid slots, the canvas translate for mesh
+  slots. Covers **part masks** (a clip with a real end slot, like this repository's
+  own `portal` animation) and **whole-skeleton clips** (an end slot that never
+  arrives, which takes a fast path: one `clip-path` on the root instead of one per
+  element). **Inverse clips** are supported too: the region they keep has a hole
+  in it, so it needs two rings, and `polygon()` carries only one — a box and a
+  polygon listed inside one `polygon()` become a single self-intersecting ring
+  whose even-odd fill leaves a wedge along the seam between them (measured, on a
+  corner of spineboy's boot). So an inverse clip is written as a two-subpath
+  `path(evenodd, …)` whose outer ring is the element's own box. The whole feature
+  is element-level, so both mesh backends see the same thing and neither raster
+  path knows clipping exists; `renderer.clipping = false`
+  restores the old counted-and-skipped behaviour. Concave polygons go to CSS as
+  authored — the convex decomposition spine's CPU clipper performs exists to feed a
+  triangle rasterizer and has no job here. Two things this does not do: Spine's
+  clipper convexifies an *inverse* polygon (convex hull) where CSS clips it as
+  authored, so the two agree exactly when that polygon is convex — which is the
+  shape `inverse` is meant for; and the cost of many simultaneous `clip-path`s on
+  real-device Safari is **not measured** (the headless numbers that exist are not
+  Safari evidence — see Measured above)
 - ✅ Safari mesh cost root-caused by on-device triangulation (two corrections deep):
   the early "~15× slower per-triangle path" was a **headless-WebKit artifact**
   (software rasterization), and the follow-up "on par with Chromium" held only for
@@ -385,6 +406,36 @@ const renderer = new SpineHtmlRenderer(rootElement, regionImages);
   mesh once (no reallocation), so it is fine to expose as a user setting.
 - `renderer.triangleExpand` — clip overdraw in px that closes antialiased mesh
   seams (default 0.5). Also re-rasters every mesh once when changed.
+- `renderer.clipping` — apply clipping attachments (default `true`). What it
+  writes is one CSS `clip-path` per element the active clip covers, in that
+  element's own local frame; nothing reaches the raster backends, and a clip is
+  not part of the mesh dirty signature, so a mesh that held still keeps reusing
+  its raster under a moving clip. **Writes happen on change only**: each
+  clip-path is cached exactly as `transform` is, coordinates are quantized to
+  1/1000 of a local unit so float jitter cannot defeat that cache, and a static
+  polygon over a static pose therefore costs **zero style writes per frame after
+  the first** — `renderer.clipWriteCount` is the check, alongside
+  `clipCount` (applied) and `clipSkipCount` (not applied: switched off, a second
+  clip met while one was active, an inactive bone, a degenerate polygon).
+  **The whole-skeleton fast path**: when the clip starts before anything has been
+  drawn and never ends, one `clip-path` goes on the root instead of one per
+  element. The root is *your* element, so its inline `clip-path` is **borrowed,
+  not taken** — saved on the first write and put back verbatim when the clip
+  stops covering the frame, when `clipping` goes `false`, and by `dispose()`.
+  Per-element clip-paths and the root clip-path are never both in force for the
+  same clip. Two things to know about that path: the polygon is written in the
+  root's **border box** frame, which is where absolutely-positioned slot elements
+  start too *unless the root has a CSS border* (a border would offset the
+  whole-skeleton clip by its width — keep borders off the render root, which is
+  the normal shape for a 0×0 origin element); and an inverse clip never takes it,
+  because its CSS form needs an outer ring around a box and the root has none.
+  One further consequence of that path: a `clip-path` other than `none` makes an
+  element a stacking context (CSS Masking), so a whole-skeleton clip isolates
+  `mix-blend-mode` slots from backdrops *outside* the root — which a root
+  carrying a `transform` (the usual pan/zoom stage) already does. Per-element
+  clips do not change blending, since a blended slot is its own stacking context
+  either way. Setting `clipping = false` removes every clip-path this renderer
+  wrote.
 
 **A zoomable stage.** The mesh tier rasters at `world × pixelRatio` in the
 root's own coordinates, and it cannot see a CSS transform above the root — so
@@ -418,8 +469,9 @@ Debug knobs (query string): `?skel=pro|ess` `?anim=walk` `?count=10` pick the sc
 ratio, `?timescale=0` freezes the pose (every mesh should report "reused"),
 `?expand=0` disables the crack-closing clip overdraw, `?backend=webgl` rasterizes
 meshes through the shared WebGL blitter (also a live header select; the stats line
-names the active backend), and `?time=1.2` seeks every instance to the same pose
-for deterministic captures.
+names the active backend), `?clipping=0` turns clipping attachments back off (they
+are then counted and skipped, as before v0.6 — try it on `?anim=portal`), and
+`?time=1.2` seeks every instance to the same pose for deterministic captures.
 
 ## Tests
 
@@ -436,8 +488,23 @@ are diffed directly with a shift-tolerant comparison, so missing parts,
 wrong colors, and tint/blend divergence fail regardless of platform.
 Hairline seams are guarded by a deterministic canary (`?expand=0` must
 change the canvas2d raster), and counter tests pin the dirty-skip /
-grow-only-backing / clip-skip invariants plus spine-core's region corner
+grow-only-backing / clip-counter invariants plus spine-core's region corner
 order (BL, UL, UR, BR).
+
+Clipping gets its own oracle (`tests/clipping.spec.ts`), because a clip-path
+that went through the wrong transform still parses and still counts as applied.
+A clipped capture is compared against the **unclipped** capture of the same
+slots masked in **screen space** by the world polygon — built once through the
+stage transform, never through an element's local frame, so the check cannot
+agree with the renderer by sharing its mistake. What it asserts is occupancy,
+not pixel values: outside a 3 px band around the polygon's outline (where the
+browser's clip-path antialiasing and the canvas `ctx.clip()` the oracle uses
+legitimately differ), **no artwork may survive where the polygon excludes it
+and none may go missing where it does not** — both counts absolute, no budget.
+Pixel values are logged but not asserted, because a clipped element is drawn
+through a mask and its silhouettes come out a shade different all over the
+picture; a control capture, clipped by a polygon that removes nothing, pins
+that down by coming back byte-identical to the unclipped one.
 
 The loading path is not observable in a rendered frame, so it gets its own
 page (`tests/harness.html`, a second build entry) that exposes the library to

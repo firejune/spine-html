@@ -47,11 +47,24 @@ test('running scene: grow-only mesh backing reaches a realloc-free steady state'
   }
 });
 
-test('portal scene: skipped clipping attachments are counted', async ({ page }) => {
-  // Clipping is deliberately unsupported — but it must be *visible* in the
-  // stats line, not silently dropped.
+test('portal scene: the clipping attachment is applied, none skipped', async ({ page }) => {
+  // spineboy-pro's portal animation carries one clipping attachment, a part
+  // mask over the character. It is applied now (see tests/clipping.spec.ts for
+  // what "applied" is worth in pixels); here it only has to be *visible* in
+  // the stats line, on the applied side of it.
   await page.goto('/?skel=pro&anim=portal&count=1&dpr=1&time=1.2&timescale=0');
-  await expect(page.locator('#stats')).toContainText(/\d+ clips skipped/);
+  const stats = page.locator('#stats');
+  await expect(stats).toContainText('1 clips applied');
+  await expect(stats).not.toContainText('clips skipped');
+});
+
+test('portal scene with ?clipping=0: the clip is counted as skipped', async ({ page }) => {
+  // The pre-0.6 behaviour is still reachable, and still says so in the same
+  // words the stats line always used.
+  await page.goto('/?skel=pro&anim=portal&count=1&dpr=1&time=1.2&timescale=0&clipping=0');
+  const stats = page.locator('#stats');
+  await expect(stats).toContainText(/\d+ clips skipped/);
+  await expect(stats).not.toContainText('clips applied');
 });
 
 test('spine-core region corner order stays BL, UL, UR, BR', () => {
