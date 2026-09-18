@@ -45,6 +45,8 @@
     "dev": "vite",
     "prebuild": "bash scripts/fetch-assets.sh",
     "build": "tsc --noEmit && vite build",
+    "prebuild:pages": "bash scripts/fetch-assets.sh",
+    "build:pages": "vite build",
     "build:lib": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepublishOnly": "npm run build:lib",
     "preview": "vite preview",
@@ -52,7 +54,7 @@
     "fetch-assets": "bash scripts/fetch-assets.sh"
   },
   "peerDependencies": {
-    "@esotericsoftware/spine-core": "^4.3.0"
+    "@esotericsoftware/spine-core": ">=4.2.0 <4.4.0"
   },
   "devDependencies": {
     "@esotericsoftware/spine-core": "^4.3.13",

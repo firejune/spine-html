@@ -169,6 +169,42 @@ assets.dispose();
 `spine-html` is a third-party renderer and is not affiliated with or endorsed by
 Esoteric Software.
 
+### Which spine-core to install
+
+> **Install the `@esotericsoftware/spine-core` that matches the Spine editor
+> version your data was exported from.**
+
+A Spine runtime reads only the data its own generation exported, so this is
+never a choice between "newest" and "oldest" — it is decided by your `.json` or
+`.skel` files. `spine-core` is a **peer** dependency here precisely so the
+decision stays yours, and `spine-html` draws from either generation:
+
+| `@esotericsoftware/spine-core` | `spine-html` |
+| --- | --- |
+| **4.3.x** | ✅ supported |
+| **4.2.x** | ✅ supported |
+| 4.1.x and older | ❌ not supported |
+
+*Supported* means one specific thing: a column of this repository's CI runs the
+**whole** test suite on that minor, against **that version's own** example
+exports. `peerDependencies` is that set and nothing wider. Nothing in the API
+above changes with the version — the difference is absorbed internally, in one
+file, chosen once per renderer by looking at the objects spine-core hands over.
+
+**Worth knowing, because it is silent.** If you point a 4.3 runtime at older
+data, the bad outcome is not the one that throws. 4.3 reads constraints from a
+single top-level `constraints` array, where 4.2 and older write separate
+`ik` / `transform` / `path` / `physics` ones — so an older export that still
+parses loads **none of its constraints at all**, and the skeleton animates on
+bones alone: no IK, no path, no physics, no error. Measured over a real-world
+corpus of 267 skeletons (88% of them 4.2 exports): 40% failed to parse under
+4.3.13 outright, and across those that did parse, **0 of 7,065** constraints and
+**0 of 5,704** physics constraints were loaded. If a skeleton renders but goes
+limp, this is why — and installing the matching `spine-core` is the whole fix.
+
+Spine 3.8 and older are out of scope: they are not published under this package
+name.
+
 ### One atlas, several skeletons
 
 Skeletons that share an atlas — a character's `-ess` and `-pro` exports, a whole
@@ -524,7 +560,14 @@ bun run test   # builds + serves the demo, then runs chromium + webkit
 ```
 
 Playwright drives the demo (`tests/`, config in `playwright.config.ts`; CI
-runs the same suite on ubuntu). The visual check is **A/B within one run**:
+runs the same suite on ubuntu, **once per supported spine-core minor**). That
+matrix is what the compatibility table above is made of: each column installs
+that minor over the lockfile's, fetches the matching spine-runtimes branch's
+example exports, and runs everything. `SPINE_ASSETS_BRANCH=4.2 bun run
+fetch-assets` gets those exports locally, and `SPINE_CORE_MINOR` tells the run
+which minor it is against — anything but the typed one builds without
+`tsc --noEmit`, since the package is typed against one generation and runs on
+several. The visual check is **A/B within one run**:
 no golden snapshots are committed (they rot across platforms/GPUs) — instead
 the same deterministic pose (`?time` + `?timescale=0`) is screenshotted with
 `?backend=canvas2d` and `?backend=webgl` in the same engine and the buffers

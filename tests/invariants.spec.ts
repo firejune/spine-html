@@ -1,10 +1,14 @@
 import { expect, test } from '@playwright/test';
-import {
-  RegionAttachment,
-  Sequence,
-  type Slot,
-  TextureRegion,
-} from '@esotericsoftware/spine-core';
+import { RegionAttachment, type Slot, TextureRegion } from '@esotericsoftware/spine-core';
+/**
+ * `Sequence` comes through the namespace rather than by name because it is not
+ * on spine-core 4.2's root entry at all — measured on 4.2.120, whose
+ * `dist/index.js` re-exports every other `attachments/` module and not that
+ * one; 4.3.13 does export it. A named import of a missing export is a *link*
+ * error, so it would fail this whole spec file before the branch below could
+ * decline to use it, in a column where nothing is actually wrong.
+ */
+import * as spine from '@esotericsoftware/spine-core';
 
 /**
  * Deterministic counters and math invariants.
@@ -67,11 +71,44 @@ test('portal scene with ?clipping=0: the clip is counted as skipped', async ({ p
   await expect(stats).not.toContainText('clips applied');
 });
 
+/**
+ * Where a region attachment's vertex offsets and UVs are computed is the one
+ * place the two supported spine-core generations differ in *construction*
+ * rather than in reading, so this probe — and only this probe — has to build
+ * the objects two ways.
+ *
+ * 4.3 moved them onto the `Sequence` (`RegionAttachment.computeUVs` fills a
+ * caller's arrays, and the offsets are then passed into
+ * `computeWorldVertices`); before that they lived on the attachment, written by
+ * `updateRegion()` and read back out of it by a `computeWorldVertices` that
+ * takes no offsets. `src/coreCompat.ts` hides that difference for *reading* a
+ * posed skeleton, which is all the renderer ever does — it never constructs an
+ * attachment, so the seam has no constructor to offer and this test detects the
+ * generation itself, off the 4.3 method the seam calls.
+ */
+const POSE_CORE_INSTALLED = 'getOffsets' in RegionAttachment.prototype;
+
+/** A region attachment in whichever shape the installed spine-core has. */
+interface AnyRegionAttachment {
+  x: number;
+  y: number;
+  scaleX: number;
+  scaleY: number;
+  rotation: number;
+  width: number;
+  height: number;
+  region: unknown;
+  offset: ArrayLike<number>;
+  uvs: ArrayLike<number>;
+  updateRegion(): void;
+  computeWorldVertices(slot: unknown, world: Float32Array, offset: number, stride: number): void;
+}
+
 test('spine-core region corner order stays BL, UL, UR, BR', () => {
   // Node-side, no browser. The renderer derives its CSS matrix from three of
   // the four corners computeWorldVertices emits, assuming the order
-  // BL, UL, UR, BR — which is what 4.2.98 and 4.3.13 actually produce (the
-  // br/bl/ul/ur comments inside computeWorldVertices are stale; upstream
+  // BL, UL, UR, BR — which is what 4.2.98, 4.2.120 and 4.3.13 actually produce
+  // (the br/bl/ul/ur comments inside computeWorldVertices are stale; upstream
   // believes the order is BR, BL, UL, UR). If a spine-core upgrade ever
   // reorders the corners, every rigid slot would render skewed — this test
   // must go red first.
@@ -89,21 +126,43 @@ test('spine-core region corner order stays BL, UL, UR, BR', () => {
   region.degrees = 0;
 
   // 2×1 region, identity transforms: offsets must be the four corners
-  // around the center, in BL, UL, UR, BR order (Spine is Y-up).
-  const offsets: number[] = new Array<number>(8).fill(0);
-  const uvs = new Float32Array(8);
-  RegionAttachment.computeUVs(region, 0, 0, 1, 1, 0, 2, 1, offsets, uvs);
-  expect(offsets).toEqual([-1, -0.5, -1, 0.5, 1, 0.5, 1, -0.5]);
-  // UV order agrees: (u,v2)=BL, (u,v)=UL, (u2,v)=UR, (u2,v2)=BR.
-  expect(Array.from(uvs)).toEqual([0, 1, 0, 0, 1, 0, 1, 1]);
-
-  // An identity bone pose must preserve that order through
-  // computeWorldVertices (which reads only slot.bone.appliedPose).
-  const slot = {
-    bone: { appliedPose: { worldX: 0, worldY: 0, a: 1, b: 0, c: 0, d: 1 } },
-  } as unknown as Slot;
+  // around the center, in BL, UL, UR, BR order (Spine is Y-up), and the UV
+  // order must agree: (u,v2)=BL, (u,v)=UL, (u2,v)=UR, (u2,v2)=BR.
+  const CORNERS = [-1, -0.5, -1, 0.5, 1, 0.5, 1, -0.5];
+  const UVS = [0, 1, 0, 0, 1, 0, 1, 1];
   const world = new Float32Array(8);
-  const attachment = new RegionAttachment('corner-probe', new Sequence(1, false));
-  attachment.computeWorldVertices(slot, offsets, world, 0, 2);
-  expect(Array.from(world)).toEqual([-1, -0.5, -1, 0.5, 1, 0.5, 1, -0.5]);
+
+  if (POSE_CORE_INSTALLED) {
+    const offsets: number[] = new Array<number>(8).fill(0);
+    const uvs = new Float32Array(8);
+    RegionAttachment.computeUVs(region, 0, 0, 1, 1, 0, 2, 1, offsets, uvs);
+    expect(offsets).toEqual(CORNERS);
+    expect(Array.from(uvs)).toEqual(UVS);
+
+    // An identity bone pose must preserve that order through
+    // computeWorldVertices (which reads only slot.bone.appliedPose).
+    const slot = {
+      bone: { appliedPose: { worldX: 0, worldY: 0, a: 1, b: 0, c: 0, d: 1 } },
+    } as unknown as Slot;
+    const attachment = new RegionAttachment('corner-probe', new spine.Sequence(1, false));
+    attachment.computeWorldVertices(slot, offsets, world, 0, 2);
+  } else {
+    const attachment = new (RegionAttachment as unknown as new (
+      name: string,
+      path: string,
+    ) => AnyRegionAttachment)('corner-probe', 'corner-probe');
+    attachment.region = region;
+    attachment.width = 2;
+    attachment.height = 1;
+    attachment.updateRegion();
+    expect(Array.from(attachment.offset)).toEqual(CORNERS);
+    expect(Array.from(attachment.uvs)).toEqual(UVS);
+
+    // Pre-4.3 the bone IS its own applied pose, and the offsets are read off
+    // the attachment rather than handed in.
+    const slot = { bone: { worldX: 0, worldY: 0, a: 1, b: 0, c: 0, d: 1 } };
+    attachment.computeWorldVertices(slot, world, 0, 2);
+  }
+
+  expect(Array.from(world)).toEqual(CORNERS);
 });

@@ -3,13 +3,11 @@ import {
   ClippingAttachment,
   MeshAttachment,
   RegionAttachment,
-  type Sequence,
   type Skeleton,
   type Slot,
   type SlotData,
-  type SlotPose,
-  type TextureAtlasRegion,
 } from '@esotericsoftware/spine-core';
+import { type CoreCompat, coreCompatFor, type SlotPoseView } from './coreCompat.js';
 import { type PageSource, type RegionImage, straightAlphaSource } from './DomTexture.js';
 import { getMeshGlBlitter, type MeshBlitJob } from './MeshGlBlitter.js';
 
@@ -251,6 +249,14 @@ export class SpineHtmlRenderer {
   /** Backend that actually rasterized the mesh tier during the last render(). */
   meshBackendActive: MeshBackend = 'canvas2d';
 
+  /**
+   * How this renderer reaches spine-core, picked from the first skeleton it is
+   * handed and then reused — see coreCompat.ts. Null until then, because the
+   * constructor has no skeleton to look at and the installed core is not
+   * knowable from the root element.
+   */
+  private core: CoreCompat | null = null;
+
   private readonly views = new Map<Slot, SlotView>();
   private readonly pendingJobs: MeshBlitJob[] = [];
   private readonly pendingViews: SlotView[] = [];
@@ -383,6 +389,8 @@ export class SpineHtmlRenderer {
   }
 
   render(skeleton: Skeleton): void {
+    // One feature detection per renderer, never per slot and never per frame.
+    const core = (this.core ??= coreCompatFor(skeleton));
     this.clipCount = 0;
     this.clipSkipCount = 0;
     this.clipWriteCount = 0;
@@ -397,11 +405,11 @@ export class SpineHtmlRenderer {
     this.drewAnything = false;
     const blitter = this.meshBackend === 'webgl' ? getMeshGlBlitter() : null;
     this.meshBackendActive = blitter ? 'webgl' : 'canvas2d';
-    const drawOrder = skeleton.drawOrder.appliedPose;
+    const drawOrder = core.drawOrder(skeleton);
 
     for (let i = 0, n = drawOrder.length; i < n; i++) {
       const slot = drawOrder[i];
-      const pose = slot.appliedPose;
+      const pose = core.pose(slot);
       const attachment = pose.attachment;
 
       // The official draw loops take the clipping attachment before anything
@@ -502,12 +510,12 @@ export class SpineHtmlRenderer {
   private renderRegion(
     skeleton: Skeleton,
     slot: Slot,
-    pose: SlotPose,
+    pose: SlotPoseView,
     attachment: RegionAttachment,
     zIndex: number,
   ): void {
-    const sequence = attachment.sequence;
-    const region = sequence.regions[sequence.resolveIndex(pose)] as TextureAtlasRegion | null;
+    const core = this.core as CoreCompat;
+    const region = core.regionAt(attachment, slot, core.sequenceIndex(attachment, pose));
     const regionImage = region && this.regionImages.get(region.name);
     if (!regionImage) {
       this.hide(slot);
@@ -523,7 +531,7 @@ export class SpineHtmlRenderer {
       img.height = regionImage.height;
     }
 
-    attachment.computeWorldVertices(slot, attachment.getOffsets(pose), regionVertices, 0, 2);
+    core.regionWorldVertices(attachment, slot, pose, regionVertices);
     // Corner order from spine-core is BL, UL, UR, BR — derived from
     // computeUVs, whose per-vertex UVs are (u,v2), (u,v), (u2,v), (u2,v2).
     // (The br/bl/ul/ur comments inside computeWorldVertices are stale.)
@@ -551,13 +559,13 @@ export class SpineHtmlRenderer {
   private renderMesh(
     skeleton: Skeleton,
     slot: Slot,
-    pose: SlotPose,
+    pose: SlotPoseView,
     attachment: MeshAttachment,
     zIndex: number,
   ): void {
-    const sequence: Sequence = attachment.sequence;
-    const sequenceIndex = sequence.resolveIndex(pose);
-    const region = sequence.regions[sequenceIndex] as TextureAtlasRegion | null;
+    const core = this.core as CoreCompat;
+    const sequenceIndex = core.sequenceIndex(attachment, pose);
+    const region = core.regionAt(attachment, slot, sequenceIndex);
     const page = region?.texture?.getImage() as HTMLImageElement | undefined;
     if (!region || !page) {
       this.hide(slot);
@@ -571,7 +579,7 @@ export class SpineHtmlRenderer {
     const count = attachment.worldVerticesLength;
     if (this.scratchVertices.length < count) this.scratchVertices = new Float32Array(count);
     const vertices = this.scratchVertices;
-    attachment.computeWorldVertices(skeleton, slot, 0, count, vertices, 0, 2);
+    core.vertexWorldVertices(attachment, skeleton, slot, 0, count, vertices, 0, 2);
 
     // World bounds (in CSS coords: Y negated).
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -672,7 +680,7 @@ export class SpineHtmlRenderer {
       view.meshVertexCount = count;
       view.meshBackendDrawn = this.meshBackendActive;
 
-      const uvs = sequence.getUVs(sequenceIndex);
+      const uvs = core.meshUVs(attachment, sequenceIndex);
       const triangles = attachment.triangles;
       if (this.meshBackendActive === 'webgl') {
         // Queued, not drawn: render() flushes the whole batch through the
@@ -920,9 +928,10 @@ export class SpineHtmlRenderer {
       this.clipSkipCount++;
       return;
     }
+    const core = this.core as CoreCompat;
     if (this.scratchVertices.length < count) this.scratchVertices = new Float32Array(count);
     const world = this.scratchVertices;
-    clip.computeWorldVertices(skeleton, slot, 0, count, world, 0, 2);
+    core.vertexWorldVertices(clip, skeleton, slot, 0, count, world, 0, 2);
     if (this.clipPolygon.length < count) this.clipPolygon = new Float64Array(count);
     const poly = this.clipPolygon;
     for (let v = 0; v < count; v += 2) {
@@ -932,7 +941,7 @@ export class SpineHtmlRenderer {
     this.clipPolygonLength = count;
     this.clipAttachment = clip;
     this.clipEndSlot = clip.endSlot;
-    this.clipInverse = clip.inverse;
+    this.clipInverse = core.inverse(clip);
     this.clipCount++;
 
     // Whole-skeleton fast path: nothing was drawn before this clip started and
@@ -941,7 +950,7 @@ export class SpineHtmlRenderer {
     // excluded: its CSS form needs an outer ring around the element's own box,
     // and the root is an origin element with no box to use.
     this.clipOnRoot =
-      !this.drewAnything && !clip.inverse && !endsAhead(drawOrder, index, clip.endSlot);
+      !this.drewAnything && !this.clipInverse && !endsAhead(drawOrder, index, clip.endSlot);
     if (this.clipOnRoot) this.writeRootClip(this.rootClipPath());
   }
 
@@ -1071,7 +1080,7 @@ export class SpineHtmlRenderer {
   private applyCommon(
     view: SlotView,
     slot: Slot,
-    pose: SlotPose,
+    pose: SlotPoseView,
     attachmentColor: { r: number; g: number; b: number; a: number },
     skeleton: Skeleton,
     zIndex: number,

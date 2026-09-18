@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { dirname, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import { UNTYPED_CORE } from '../playwright.config';
 
 /**
  * What npm ships, checked the way a consumer meets it — node-side, no browser.
@@ -87,8 +88,26 @@ test.beforeAll(() => {
   mkdirSync(pkgRoot, { recursive: true });
 
   // One build, shared by every assertion in this file.
+  //
+  // `--noCheck` outside the typed column: this spec is about what npm *ships*,
+  // and under an older spine-core a type check of `src/` reports the generation
+  // difference `src/coreCompat.ts` exists to absorb — which would take the
+  // whole file down on the one thing it is not asking about. It still emits
+  // everything, declarations included, and the emit is the same emit: measured
+  // on spine-core 4.2.120, `--noCheck` produced files byte-identical to the
+  // fully-checked 4.3 build. So every assertion below — the `exports` map, the
+  // import walk, the emitted file set, and the consumer typecheck against the
+  // *shipped* `.d.ts` — is a real one in every column. The typed column is
+  // unchanged and still fails here on a type error.
   const built = node(
-    [tscBin, '-p', resolve(repoRoot, 'tsconfig.build.json'), '--outDir', pkgDist],
+    [
+      tscBin,
+      '-p',
+      resolve(repoRoot, 'tsconfig.build.json'),
+      '--outDir',
+      pkgDist,
+      ...(UNTYPED_CORE ? ['--noCheck'] : []),
+    ],
     repoRoot,
   );
   expect(built.status, `tsc -p tsconfig.build.json failed:\n${built.stdout}${built.stderr}`).toBe(0);
@@ -168,6 +187,7 @@ const EMITTED_MODULES = [
   'MeshGlBlitter',
   'SpineHtmlRenderer',
   'binary',
+  'coreCompat',
   'index',
   'loadAtlasAssets',
   'loadSkeletonAssets',
@@ -337,6 +357,7 @@ test('nothing reachable from the root entry carries the binary reader', () => {
     'DomTexture.js',
     'MeshGlBlitter.js',
     'SpineHtmlRenderer.js',
+    'coreCompat.js',
     'index.js',
     'loadAtlasAssets.js',
     'loadSkeletonAssets.js',

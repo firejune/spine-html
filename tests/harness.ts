@@ -18,6 +18,7 @@ import {
 import type { SkeletonData } from '@esotericsoftware/spine-core';
 import { loadSkeletonBinary } from '../src/binary';
 import { getMeshGlBlitter } from '../src/MeshGlBlitter';
+import { type BonePoseView, coreCompatFor, type SlotPoseView } from '../src/coreCompat';
 import { straightAlphaDerivations, straightAlphaSource } from '../src/DomTexture';
 
 /**
@@ -2718,6 +2719,27 @@ export interface ClipInverseProbeResult {
   unclipped: ClipCapture;
 }
 
+/**
+ * The clipping probes do not only read pose state, they WRITE it — they swap a
+ * slot's attachment for a synthetic clip and nudge a bone. Where that state
+ * lives moved in 4.3 (`slot.appliedPose`, `bone.appliedPose`,
+ * `skeleton.drawOrder.appliedPose`), so these three go through the same seam
+ * the renderer uses instead of naming one generation's layout. The seam picks
+ * its shape from the live objects and holds no state, so calling it per probe
+ * costs a property test.
+ */
+function drawOrderOf(skeleton: Skeleton): Slot[] {
+  return coreCompatFor(skeleton).drawOrder(skeleton);
+}
+
+function poseOf(skeleton: Skeleton, slot: Slot): SlotPoseView {
+  return coreCompatFor(skeleton).pose(slot);
+}
+
+function bonePoseOf(skeleton: Skeleton, slot: Slot): BonePoseView {
+  return coreCompatFor(skeleton).bonePose(slot.bone);
+}
+
 /** One deterministic pose of a named animation. */
 function posedFor(assets: LoadedAssets, animation: string, time: number): Skeleton {
   const skeleton = new Skeleton(assets.data);
@@ -2799,7 +2821,7 @@ function clipElements(
 function clipWorldPolygon(skeleton: Skeleton, slot: Slot, clip: ClippingAttachment): number[] {
   const n = clip.worldVerticesLength;
   const world = new Float32Array(n);
-  clip.computeWorldVertices(skeleton, slot, 0, n, world, 0, 2);
+  coreCompatFor(skeleton).vertexWorldVertices(clip, skeleton, slot, 0, n, world, 0, 2);
   const polygon: number[] = [];
   // Spine is Y-up, CSS is Y-down — the same negation the renderer applies.
   for (let v = 0; v < n; v += 2) polygon.push(world[v], -world[v + 1]);
@@ -2814,8 +2836,8 @@ function clipWorldPolygon(skeleton: Skeleton, slot: Slot, clip: ClippingAttachme
  * rather than of the pose. (Spine's bone convention: X = a·vx + b·vy + worldX,
  * Y = c·vx + d·vy + worldY.)
  */
-function clipVerticesFromWorld(slot: Slot, world: number[]): number[] {
-  const bone = slot.bone.appliedPose;
+function clipVerticesFromWorld(skeleton: Skeleton, slot: Slot, world: number[]): number[] {
+  const bone = bonePoseOf(skeleton, slot);
   const det = bone.a * bone.d - bone.b * bone.c;
   if (det === 0) throw new Error('clip host bone has a singular transform');
   const inv = 1 / det;
@@ -2829,13 +2851,14 @@ function clipVerticesFromWorld(slot: Slot, world: number[]): number[] {
 }
 
 function makeClip(
+  skeleton: Skeleton,
   name: string,
   slot: Slot,
   worldVertices: number[],
   endSlot: SlotData | null,
 ): ClippingAttachment {
   const clip = new ClippingAttachment(name);
-  clip.vertices = clipVerticesFromWorld(slot, worldVertices);
+  clip.vertices = clipVerticesFromWorld(skeleton, slot, worldVertices);
   clip.worldVerticesLength = clip.vertices.length;
   clip.endSlot = endSlot;
   return clip;
@@ -2876,13 +2899,13 @@ function tiltedQuad(
 async function clipPartMaskProbe(): Promise<ClipPartMaskProbeResult> {
   const assets = await loadSkeletonAssets(CLIP_PRO);
   const skeleton = posedFor(assets, 'portal', 1.2);
-  const drawOrder = skeleton.drawOrder.appliedPose;
+  const drawOrder = drawOrderOf(skeleton);
   const startIndex = drawOrder.findIndex(
-    (slot) => slot.appliedPose.attachment instanceof ClippingAttachment,
+    (slot) => poseOf(skeleton, slot).attachment instanceof ClippingAttachment,
   );
   if (startIndex < 0) throw new Error('the portal animation has no clipping attachment');
   const startSlot = drawOrder[startIndex];
-  const clip = startSlot.appliedPose.attachment as ClippingAttachment;
+  const clip = poseOf(skeleton, startSlot).attachment as ClippingAttachment;
   const ahead = clip.endSlot
     ? drawOrder.findIndex((slot, i) => i > startIndex && slot.data === clip.endSlot)
     : -1;
@@ -2908,7 +2931,7 @@ async function clipPartMaskProbe(): Promise<ClipPartMaskProbeResult> {
   // nothing but the clip.
   drawOrder.forEach((slot, i) => {
     if (i !== startIndex && !(i > startIndex && i <= endIndex)) {
-      slot.appliedPose.attachment = null;
+      poseOf(skeleton, slot).attachment = null;
     }
   });
 
@@ -2947,13 +2970,14 @@ async function clipPartMaskProbe(): Promise<ClipPartMaskProbeResult> {
 async function clipRigidProbe(): Promise<ClipRigidProbeResult> {
   const assets = await loadSkeletonAssets(CLIP_ESS);
   const skeleton = posedFor(assets, 'walk', 1.2);
-  const drawOrder = skeleton.drawOrder.appliedPose;
+  const drawOrder = drawOrderOf(skeleton);
   const host = drawOrder[0];
   const last = drawOrder[drawOrder.length - 1];
 
   // The control first: clipped by a quad far larger than the skeleton, so
   // every element carries a clip-path and none of them loses a pixel.
-  host.appliedPose.attachment = makeClip(
+  poseOf(skeleton, host).attachment = makeClip(
+    skeleton,
     'probe-covering',
     host,
     tiltedQuad(0, 350, 20000, 20000, 0),
@@ -2963,8 +2987,14 @@ async function clipRigidProbe(): Promise<ClipRigidProbeResult> {
   const controlRenderer = clipRenderer(control.root, assets);
   controlRenderer.render(skeleton);
 
-  const clip = makeClip('probe-tilted', host, tiltedQuad(40, 380, 200, 130, 22), last.data);
-  host.appliedPose.attachment = clip;
+  const clip = makeClip(
+    skeleton,
+    'probe-tilted',
+    host,
+    tiltedQuad(40, 380, 200, 130, 22),
+    last.data,
+  );
+  poseOf(skeleton, host).attachment = clip;
 
   const polygon = clipWorldPolygon(skeleton, host, clip);
 
@@ -3015,13 +3045,14 @@ async function clipRigidProbe(): Promise<ClipRigidProbeResult> {
 async function clipRootProbe(): Promise<ClipRootProbeResult> {
   const assets = await loadSkeletonAssets(CLIP_ESS);
   const skeleton = posedFor(assets, 'walk', 1.2);
-  const drawOrder = skeleton.drawOrder.appliedPose;
+  const drawOrder = drawOrderOf(skeleton);
   const host = drawOrder[0];
-  const original = host.appliedPose.attachment;
+  const hostPose = poseOf(skeleton, host);
+  const original = hostPose.attachment;
   // A screen-shaped window over the character, the consumer shape this serves.
   const rect = [-120, 100, 220, 100, 220, 520, -120, 520];
-  const clip = makeClip('probe-window', host, rect, host.data);
-  host.appliedPose.attachment = clip;
+  const clip = makeClip(skeleton, 'probe-window', host, rect, host.data);
+  hostPose.attachment = clip;
 
   const polygon = clipWorldPolygon(skeleton, host, clip);
 
@@ -3046,10 +3077,10 @@ async function clipRootProbe(): Promise<ClipRootProbeResult> {
   const contractRenderer = clipRenderer(contract.root, assets);
   contractRenderer.render(skeleton);
   const duringClip = contract.root.style.clipPath;
-  host.appliedPose.attachment = original;
+  hostPose.attachment = original;
   contractRenderer.render(skeleton);
   const afterClipEnds = contract.root.style.clipPath;
-  host.appliedPose.attachment = clip;
+  hostPose.attachment = clip;
   contractRenderer.render(skeleton);
   const duringSecondClip = contract.root.style.clipPath;
   contractRenderer.dispose();
@@ -3075,11 +3106,17 @@ async function clipRootProbe(): Promise<ClipRootProbeResult> {
 async function clipCountersProbe(): Promise<ClipCountersProbeResult> {
   const assets = await loadSkeletonAssets(CLIP_ESS);
   const skeleton = posedFor(assets, 'walk', 1.2);
-  const drawOrder = skeleton.drawOrder.appliedPose;
+  const drawOrder = drawOrderOf(skeleton);
   const host = drawOrder[0];
   const last = drawOrder[drawOrder.length - 1];
-  const clip = makeClip('probe-counters', host, tiltedQuad(40, 380, 200, 130, 22), last.data);
-  host.appliedPose.attachment = clip;
+  const clip = makeClip(
+    skeleton,
+    'probe-counters',
+    host,
+    tiltedQuad(40, 380, 200, 130, 22),
+    last.data,
+  );
+  poseOf(skeleton, host).attachment = clip;
 
   const root = document.createElement('div');
   root.style.position = 'absolute';
@@ -3128,7 +3165,7 @@ async function clipCountersProbe(): Promise<ClipCountersProbeResult> {
     (slot) => drawn.filter((other) => other.bone === slot.bone).length === 1,
   );
   if (!movedSlot) throw new Error('no drawn slot is alone on its bone');
-  movedSlot.bone.appliedPose.worldX += 13;
+  bonePoseOf(skeleton, movedSlot).worldX += 13;
   const oneSlotMoved = step();
 
   renderer.clipping = false;
@@ -3139,7 +3176,8 @@ async function clipCountersProbe(): Promise<ClipCountersProbeResult> {
   // A second clipping attachment while the first is still active: spine-core's
   // clipStart ignores it, so it is counted, not nested.
   const second = drawOrder[3];
-  second.appliedPose.attachment = makeClip(
+  poseOf(skeleton, second).attachment = makeClip(
+    skeleton,
     'probe-second',
     second,
     tiltedQuad(0, 300, 120, 120, 0),
@@ -3172,11 +3210,17 @@ async function clipCountersProbe(): Promise<ClipCountersProbeResult> {
 async function clipInverseProbe(): Promise<ClipInverseProbeResult> {
   const assets = await loadSkeletonAssets(CLIP_ESS);
   const skeleton = posedFor(assets, 'walk', 1.2);
-  const drawOrder = skeleton.drawOrder.appliedPose;
+  const drawOrder = drawOrderOf(skeleton);
   const host = drawOrder[0];
-  const clip = makeClip('probe-inverse', host, tiltedQuad(40, 380, 160, 110, 22), host.data);
+  const clip = makeClip(
+    skeleton,
+    'probe-inverse',
+    host,
+    tiltedQuad(40, 380, 160, 110, 22),
+    host.data,
+  );
   clip.inverse = true;
-  host.appliedPose.attachment = clip;
+  poseOf(skeleton, host).attachment = clip;
 
   const polygon = clipWorldPolygon(skeleton, host, clip);
 
