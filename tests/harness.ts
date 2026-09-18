@@ -163,6 +163,9 @@ export interface SpineHtmlHarness {
   loaderHttpFailureProbe(): Promise<LoaderHttpFailureProbeResult>;
   sharedAtlasProbe(): Promise<SharedAtlasProbeResult>;
   binaryProbe(): Promise<BinaryProbeResult>;
+  cutConcurrencyProbe(): Promise<CutConcurrencyProbeResult>;
+  cutOrderProbe(): Promise<CutOrderProbeResult>;
+  cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult>;
 }
 
 declare global {
@@ -1402,6 +1405,485 @@ async function binaryProbe(): Promise<BinaryProbeResult> {
   };
 }
 
+// --- concurrent region cuts -------------------------------------------------
+
+/**
+ * unpackRegions starts the region cuts together and awaits them together, so
+ * the properties that used to fall out of a serial loop — atlas order,
+ * last-duplicate-wins, nothing stranded by a failure — now have to be held
+ * deliberately. None of that is visible in a rendered frame either, and none of
+ * it can be timed: the oracle is `HTMLCanvasElement.prototype.toBlob` itself,
+ * wrapped so the probes can count how many encodes overlap and choose the order
+ * the callbacks come back in.
+ */
+
+/** Six small regions, none covering its page, so every one of them is cut. */
+const CONCURRENT_ATLAS = `part.png
+size: 64, 32
+a
+bounds: 0, 0, 16, 16
+b
+bounds: 16, 0, 16, 16
+c
+bounds: 32, 0, 16, 16
+d
+bounds: 48, 0, 16, 16
+e
+bounds: 0, 16, 16, 16
+f
+bounds: 16, 16, 16, 16
+`;
+
+/**
+ * Six 1024×1024 cuts off one 2048×1024 page — 6.29 Mpx of canvas backing if
+ * they all ran at once, which is what makes the backing budget observable.
+ * They overlap in the page on purpose; only the cut sizes matter here.
+ */
+const BUDGET_ATLAS = `wide.png
+size: 2048, 1024
+w0
+bounds: 0, 0, 1024, 1024
+w1
+bounds: 1, 0, 1024, 1024
+w2
+bounds: 2, 0, 1024, 1024
+w3
+bounds: 3, 0, 1024, 1024
+w4
+bounds: 4, 0, 1024, 1024
+w5
+bounds: 5, 0, 1024, 1024
+`;
+
+/** Six cuts of six different sizes: a blob landing in the wrong slot shows. */
+const ORDERED_ATLAS = `part.png
+size: 64, 32
+r0
+bounds: 0, 0, 10, 4
+r1
+bounds: 0, 5, 11, 5
+r2
+bounds: 0, 11, 12, 6
+r3
+bounds: 0, 18, 13, 7
+r4
+bounds: 20, 0, 14, 8
+r5
+bounds: 20, 9, 15, 9
+`;
+
+/** The same name twice, at different sizes, so the winner is identifiable. */
+const DUPLICATE_ATLAS = `part.png
+size: 64, 32
+dup
+bounds: 0, 0, 20, 20
+solo
+bounds: 24, 0, 12, 12
+dup
+bounds: 40, 0, 8, 8
+`;
+
+/** Four cuts; the first one is the one the trap answers with null. */
+const IN_FLIGHT_FAIL_ATLAS = `part.png
+size: 64, 32
+boom
+bounds: 0, 0, 16, 16
+held-a
+bounds: 16, 0, 16, 16
+held-b
+bounds: 32, 0, 16, 16
+held-c
+bounds: 48, 0, 16, 16
+`;
+
+/** What one instrumented run saw at HTMLCanvasElement.prototype.toBlob. */
+export interface CutTrapReport {
+  /** toBlob calls started. */
+  callCount: number;
+  /** Backing pixels of each canvas at call time, in call order. */
+  callPixels: number[];
+  /** Highest (started − delivered) reached: 1 means the cuts ran in series. */
+  peakInFlight: number;
+  /** Highest Σ backing pixels held by those simultaneously in-flight cuts. */
+  peakInFlightPixels: number;
+  /** Call indices in the order their callbacks were finally delivered. */
+  deliveryOrder: number[];
+  /** True when a hold-and-reverse trap gave up waiting for every call. */
+  deadlineHit: boolean;
+}
+
+/** How a trap hands the encoded blobs back to unpackRegions. */
+type CutDelivery =
+  /** Straight through — the trap only counts. */
+  | { kind: 'immediate' }
+  /** Hold every blob until `expected` have arrived, then deliver them backwards. */
+  | { kind: 'reverse'; expected: number; deadlineMs: number }
+  /** Answer call `nullAt` with null at once, hold the rest until release(). */
+  | { kind: 'failOne'; nullAt: number };
+
+interface CutTrap {
+  /** The counters as they stand right now. */
+  snapshot(): CutTrapReport;
+  /** Cuts started whose callback has not been delivered yet. */
+  inFlight(): number;
+  /** Resolves once the nulled callback has been delivered ('failOne'). */
+  nulled: Promise<void>;
+  /** Delivers everything still held ('failOne'). */
+  release(): void;
+  restore(): void;
+}
+
+function installCutTrap(delivery: CutDelivery): CutTrap {
+  const real = HTMLCanvasElement.prototype.toBlob;
+  const callPixels: number[] = [];
+  const deliveryOrder: number[] = [];
+  const held: Array<{ index: number; run: () => void }> = [];
+  let inFlight = 0;
+  let inFlightPixels = 0;
+  let peakInFlight = 0;
+  let peakInFlightPixels = 0;
+  let deadlineHit = false;
+  let released = false;
+  let timer = 0;
+  let resolveNulled = (): void => {};
+  const nulled = new Promise<void>((resolve) => {
+    resolveNulled = resolve;
+  });
+
+  const send = (index: number, run: () => void): void => {
+    deliveryOrder.push(index);
+    inFlight--;
+    inFlightPixels -= callPixels[index] ?? 0;
+    run();
+  };
+
+  const flush = (reverse: boolean): void => {
+    const batch = held.splice(0, held.length);
+    if (reverse) batch.reverse();
+    for (const entry of batch) send(entry.index, entry.run);
+  };
+
+  HTMLCanvasElement.prototype.toBlob = function (
+    this: HTMLCanvasElement,
+    callback: BlobCallback,
+    type?: string,
+    quality?: unknown,
+  ): void {
+    const index = callPixels.length;
+    const pixels = this.width * this.height;
+    callPixels.push(pixels);
+    inFlight++;
+    inFlightPixels += pixels;
+    peakInFlight = Math.max(peakInFlight, inFlight);
+    peakInFlightPixels = Math.max(peakInFlightPixels, inFlightPixels);
+
+    real.call(
+      this,
+      (blob) => {
+        if (delivery.kind === 'immediate') {
+          send(index, () => callback(blob));
+          return;
+        }
+        if (delivery.kind === 'failOne') {
+          if (index === delivery.nullAt) {
+            send(index, () => callback(null));
+            resolveNulled();
+            return;
+          }
+          // Past release() the encodes that had not called back yet are the
+          // latest arrivals of all, so they go straight through — holding them
+          // would only mean nothing ever delivers them.
+          if (released) send(index, () => callback(blob));
+          else held.push({ index, run: () => callback(blob) });
+          return;
+        }
+        held.push({ index, run: () => callback(blob) });
+        clearTimeout(timer);
+        if (held.length >= delivery.expected) {
+          flush(true);
+          return;
+        }
+        // A serial implementation never gets `expected` encodes in flight, so
+        // the trap must not be able to deadlock it: it delivers what it has.
+        timer = window.setTimeout(() => {
+          deadlineHit = true;
+          flush(true);
+        }, delivery.deadlineMs);
+      },
+      type,
+      quality as never,
+    );
+  } as typeof HTMLCanvasElement.prototype.toBlob;
+
+  return {
+    snapshot: () => ({
+      callCount: callPixels.length,
+      callPixels: [...callPixels],
+      peakInFlight,
+      peakInFlightPixels,
+      deliveryOrder: [...deliveryOrder],
+      deadlineHit,
+    }),
+    inFlight: () => inFlight,
+    nulled,
+    release: () => {
+      released = true;
+      flush(false);
+    },
+    restore: () => {
+      clearTimeout(timer);
+      HTMLCanvasElement.prototype.toBlob = real;
+    },
+  };
+}
+
+/** Builds a TextureAtlas whose every page is backed by one painted image. */
+async function paintAtlas(
+  text: string,
+  sizes: Record<string, { width: number; height: number }>,
+): Promise<{
+  atlas: TextureAtlas;
+  pageImages: Map<string, HTMLImageElement>;
+  pageUrls: string[];
+}> {
+  const atlas = new TextureAtlas(text);
+  const pageImages = new Map<string, HTMLImageElement>();
+  const pageUrls: string[] = [];
+  for (const page of atlas.pages) {
+    const size = sizes[page.name] ?? { width: page.width, height: page.height };
+    const painted = await makePageImage(size.width, size.height);
+    page.setTexture(new DomTexture(painted.image));
+    pageImages.set(page.name, painted.image);
+    pageUrls.push(painted.url);
+  }
+  return { atlas, pageImages, pageUrls };
+}
+
+export interface CutConcurrencySample {
+  regionCount: number;
+  cuts: CutTrapReport;
+  /** Σ backing pixels of every cut, i.e. the peak an unbounded run would hit. */
+  totalCutPixels: number;
+}
+
+export interface CutConcurrencyProbeResult {
+  /** Six 16×16 cuts: far under the backing budget, so all of them overlap. */
+  small: CutConcurrencySample;
+  /** Six 1024×1024 cuts: more backing than the budget allows in flight. */
+  budgeted: CutConcurrencySample;
+  /** The demo's own atlas, through loadAtlasAssets. */
+  spineboy: CutConcurrencySample;
+}
+
+/**
+ * How many region cuts have a PNG encode in flight at once, and how much canvas
+ * backing they hold while they do.
+ *
+ * The count is the whole defect: awaited one at a time it is 1, and a load then
+ * costs the sum of every encode — minutes in a throttled background tab, where
+ * one 8×8 toBlob was measured taking 7.5 s to call back. The pixels are the
+ * price of fixing it, since every started cut keeps its canvas alive until its
+ * blob arrives; they are what the backing budget in DomTexture.ts bounds.
+ */
+async function cutConcurrencyProbe(): Promise<CutConcurrencyProbeResult> {
+  async function measure(
+    text: string,
+    sizes: Record<string, { width: number; height: number }>,
+  ): Promise<CutConcurrencySample> {
+    const painted = await paintAtlas(text, sizes);
+    const trap = installCutTrap({ kind: 'immediate' });
+    let images: Map<string, RegionImage>;
+    try {
+      images = await unpackRegions(painted.atlas, painted.pageImages);
+    } finally {
+      trap.restore();
+    }
+    revokeRegions(images);
+    for (const url of painted.pageUrls) URL.revokeObjectURL(url);
+    const cuts = trap.snapshot();
+    return {
+      regionCount: painted.atlas.regions.length,
+      cuts,
+      totalCutPixels: cuts.callPixels.reduce((sum, pixels) => sum + pixels, 0),
+    };
+  }
+
+  const small = await measure(CONCURRENT_ATLAS, {});
+  const budgeted = await measure(BUDGET_ATLAS, {});
+
+  // The real thing: one 1024×256 page, 40 regions, all of them cut.
+  const trap = installCutTrap({ kind: 'immediate' });
+  let assets: Awaited<ReturnType<typeof loadAtlasAssets>>;
+  try {
+    assets = await loadAtlasAssets({ atlasUrl: '/spineboy/spineboy.atlas' });
+  } finally {
+    trap.restore();
+  }
+  const spineboyCuts = trap.snapshot();
+  const spineboy: CutConcurrencySample = {
+    regionCount: assets.atlas.regions.length,
+    cuts: spineboyCuts,
+    totalCutPixels: spineboyCuts.callPixels.reduce((sum, pixels) => sum + pixels, 0),
+  };
+  assets.dispose();
+
+  return { small, budgeted, spineboy };
+}
+
+export interface CutOrderProbeResult {
+  /** Region names in atlas order, and the map's key order beside them. */
+  atlasNames: string[];
+  mapNames: string[];
+  regions: RegionEntry[];
+  order: CutTrapReport;
+  /** Duplicate-name run, same reversed delivery. */
+  dupAtlasNames: string[];
+  dupMapNames: string[];
+  dupRegions: RegionEntry[];
+  dupOrder: CutTrapReport;
+  dupCreatedUrls: string[];
+  /** Liveness of every URL the duplicate run minted, before anything revoked. */
+  dupAliveAfterUnpack: Record<string, boolean>;
+}
+
+/**
+ * Atlas order and last-duplicate-wins, with the blobs deliberately delivered
+ * backwards.
+ *
+ * Concurrent encodes come back in whatever order the browser finishes them, so
+ * "the map is in atlas order" stops being something the loop gives away for
+ * free. Hoping for out-of-order delivery would make this a lottery, so the trap
+ * forces it: it holds every blob until all of them have arrived, then hands
+ * them back last-first.
+ */
+async function cutOrderProbe(): Promise<CutOrderProbeResult> {
+  async function run(
+    text: string,
+    expected: number,
+  ): Promise<{
+    atlasNames: string[];
+    regions: RegionEntry[];
+    report: CutTrapReport;
+    created: string[];
+    images: Map<string, RegionImage>;
+    pageUrls: string[];
+  }> {
+    const painted = await paintAtlas(text, {});
+    const trap = installCutTrap({ kind: 'reverse', expected, deadlineMs: 750 });
+    let unpacked: { result: Map<string, RegionImage>; created: string[]; revoked: string[] };
+    try {
+      unpacked = await trackObjectUrls(() => unpackRegions(painted.atlas, painted.pageImages));
+    } finally {
+      trap.restore();
+    }
+    return {
+      atlasNames: painted.atlas.regions.map((region) => region.name),
+      regions: entries(unpacked.result),
+      report: trap.snapshot(),
+      created: unpacked.created,
+      images: unpacked.result,
+      pageUrls: painted.pageUrls,
+    };
+  }
+
+  const ordered = await run(ORDERED_ATLAS, 6);
+  revokeRegions(ordered.images);
+  for (const url of ordered.pageUrls) URL.revokeObjectURL(url);
+
+  const dup = await run(DUPLICATE_ATLAS, 3);
+  // Sampled before anything is revoked: the shadowed URL must already be dead,
+  // freed by unpackRegions when the later region of the same name took over.
+  const dupAliveAfterUnpack = await alive(dup.created);
+  revokeRegions(dup.images);
+  for (const url of dup.pageUrls) URL.revokeObjectURL(url);
+
+  return {
+    atlasNames: ordered.atlasNames,
+    mapNames: ordered.regions.map((region) => region.name),
+    regions: ordered.regions,
+    order: ordered.report,
+    dupAtlasNames: dup.atlasNames,
+    dupMapNames: dup.regions.map((region) => region.name),
+    dupRegions: dup.regions,
+    dupOrder: dup.report,
+    dupCreatedUrls: dup.created,
+    dupAliveAfterUnpack,
+  };
+}
+
+export interface CutFlightFailureProbeResult {
+  /** Message unpackRegions rejected with ('' if it resolved). */
+  message: string;
+  /** Cuts started but not yet delivered when the failing one came back null. */
+  inFlightAtFailure: number;
+  /** Cuts whose blob was still held when the failure had already been seen. */
+  createdUrls: string[];
+  revokedUrls: string[];
+  /** Sampled after every held callback was delivered and the call settled. */
+  aliveAfter: Record<string, boolean>;
+  /** unhandledrejection events seen for the whole attempt. */
+  unhandledRejections: number;
+  cuts: CutTrapReport;
+}
+
+/**
+ * A cut that fails while the others are still encoding.
+ *
+ * This is the failure the serial loop could not have: its blobs arrive after
+ * the error is already known, and a load that walked away from them would mint
+ * owned blob URLs with nothing left to revoke them. The trap answers the first
+ * region with null (what a browser does when it cannot encode) and holds the
+ * other three until the probe releases them, so the late arrivals are forced
+ * rather than raced. Liveness is sampled only after they have landed.
+ */
+async function cutFlightFailureProbe(): Promise<CutFlightFailureProbeResult> {
+  const painted = await paintAtlas(IN_FLIGHT_FAIL_ATLAS, {});
+
+  let unhandledRejections = 0;
+  const onUnhandled = (): void => {
+    unhandledRejections++;
+  };
+  window.addEventListener('unhandledrejection', onUnhandled);
+
+  const trap = installCutTrap({ kind: 'failOne', nullAt: 0 });
+  let inFlightAtFailure = 0;
+  let attempt: { result: string; created: string[]; revoked: string[] };
+  try {
+    attempt = await trackObjectUrls(async () => {
+      const settled = unpackRegions(painted.atlas, painted.pageImages).then(
+        () => '',
+        (error) => (error instanceof Error ? error.message : String(error)),
+      );
+      await trap.nulled;
+      inFlightAtFailure = trap.inFlight();
+      // One macrotask for the failure path to get as far as it can, which is
+      // as far as the cuts it still has to wait for.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      trap.release();
+      return await settled;
+    });
+  } finally {
+    trap.restore();
+  }
+
+  // An unhandled rejection is reported a task later than the rejection itself.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  window.removeEventListener('unhandledrejection', onUnhandled);
+
+  const aliveAfter = await alive(attempt.created);
+  for (const url of painted.pageUrls) URL.revokeObjectURL(url);
+
+  return {
+    message: attempt.result,
+    inFlightAtFailure,
+    createdUrls: attempt.created,
+    revokedUrls: attempt.revoked,
+    aliveAfter,
+    unhandledRejections,
+    cuts: trap.snapshot(),
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -1414,4 +1896,7 @@ window.spineHtmlHarness = {
   loaderHttpFailureProbe,
   sharedAtlasProbe,
   binaryProbe,
+  cutConcurrencyProbe,
+  cutOrderProbe,
+  cutFlightFailureProbe,
 };

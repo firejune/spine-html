@@ -91,6 +91,17 @@ README.md for architecture and measured numbers.
   the caller's too, so nothing here nulls `page.texture` or drops a page to
   reclaim memory (the reason step 2 of #7 was declined); a page goes when the
   caller drops the atlas and the skeleton data that reach it.
+- **`unpackRegions` starts the region cuts concurrently**, so a failure has to
+  account for cuts still in flight: their blobs arrive *after* the error is
+  known, and turning those into owned URLs nobody can revoke is a leak with no
+  visual signature. The cleanup therefore waits for every started cut before
+  revoking and throwing, and the map is built from `atlas.regions` once they
+  settle — never from the arrivals — so atlas order and last-duplicate-wins
+  survive out-of-order delivery. How many cuts run at once is a private
+  backing-pixel budget in DomTexture.ts (a measurement, not a knob: every
+  started cut holds its canvas until its blob lands). `tests/regions.spec.ts`
+  holds all of it by wrapping `toBlob` — overlap is a count, arrival order is
+  chosen rather than raced, and nothing there is timed.
 - The loaders (`loadAtlasAssets.ts`, `loadSkeletonAssets.ts`, `binary.ts`) are a
   convenience layer, not a dependency: nothing else in `src/` imports them —
   `loadSkeletonAssets.ts` and `binary.ts` import `loadAtlasAssets.ts`, and that
