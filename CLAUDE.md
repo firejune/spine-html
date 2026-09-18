@@ -145,11 +145,22 @@ README.md for architecture and measured numbers.
 - Conventional Commits, English subject and body. Commit each finished unit
   immediately. The subjects are load-bearing now: release-please reads them to
   pick the next version and to write CHANGELOG.md.
-- Pushing to origin is fine (owner-confirmed). Releases are not ours to cut:
-  pushing to `main` makes `release.yml` open a `release: vX.Y.Z` pull request,
-  and **merging that pull request is the owner's click**. Never merge it, and
-  never run `npm version` or `npm publish` by hand — the npm publish happens in
-  CI over OIDC. See RELEASING.md.
+- Pushing to origin is fine (owner-confirmed), and **so is merging** (owner
+  decision, 2026-09-18; until v0.4.1 the release was the owner's click, and
+  v0.5.0 was the first cut made under this rule): a feature pull request once
+  its checks are green, and the `release: vX.Y.Z` pull request `release.yml`
+  keeps open after every push to `main`. Merging that one is the cut, and the
+  call belongs to the session that landed the work. Make it from the tree, not
+  from the generated diff: what `npm pack --dry-run` ships, whether the headline
+  change is reachable by a consumer, whether the release reversed itself — get a
+  green on the release commit first (RELEASING.md says how), and say in the
+  release notes what was not measured. Read the checks, then merge as a separate
+  command; never chain the two. After the cut, verify the published artifact,
+  not the workflow's word: the registry version, the provenance attestation, and
+  an import of both entry points by package name from a clean directory. What
+  stays the owner's: issues filed by outside contributors, and anything that
+  leaves the repository (posts, contacts, spending). Never run `npm version` or
+  `npm publish` by hand — the publish happens in CI over OIDC.
 
 ## Known backlog
 

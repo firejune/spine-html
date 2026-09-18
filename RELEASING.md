@@ -79,20 +79,35 @@ Two properties of that configuration are load-bearing in the workflow:
 2. Wait for the `release` run to open or update the `release: vX.Y.Z` pull
    request.
 3. Read the diff — the version and the generated changelog are the whole review.
-   Optionally run the suite against the release branch: **Actions → ci → Run
-   workflow → `release-please--branches--main`** (see below for why it is not
-   automatic).
+   Run the suite against the release branch — read the branch name off the
+   pull request, it carries the package name
+   (`release-please--branches--main--components--spine-html`): **Actions → ci →
+   Run workflow**, or `gh workflow run ci.yml --ref <that branch>` (see below
+   for why it is not automatic).
 4. **Merge it.** That is the cut.
 5. Watch the second `release` run: it tags, releases, and publishes.
 6. Confirm: `npm view spine-html version`, and the npm page shows the
    provenance attestation linking the tarball to the workflow run.
 
-## Why the release pull request has no CI checks
+## Why the release pull request shows no CI check
 
-A pull request opened with the default `GITHUB_TOKEN` starts no other workflow
-runs — GitHub suppresses that to prevent recursive runs — so `ci.yml` does not
-fire on release-please's pull request. The usual fix is a personal access token
-or a GitHub App, and this repository deliberately does not use one:
+A pull request opened with the default `GITHUB_TOKEN` does not get an ordinary
+workflow run. What actually happens — observed on the first release pull
+request this automation opened (#17) — is that `ci` **is created** on every
+update of the release branch and then held at once with the conclusion
+`action_required`, waiting for a maintainer to approve it. Nothing runs, `gh pr
+checks` reports "no checks", and the pull request reads as `UNSTABLE` rather
+than clean. "Absent" and "held" call for different actions, so it is worth being
+exact: there are two ways to get a green on the release commit itself —
+
+- dispatch `ci` on the release branch (**Actions → ci → Run workflow**, or
+  `gh workflow run ci.yml --ref <release branch>`), which is what v0.5.0 did
+  (84 passed on the release commit before the merge); or
+- approve the held run (`gh api -X POST
+  repos/firejune/spine-html/actions/runs/<id>/approve`).
+
+The usual way to make the check automatic is a personal access token or a
+GitHub App, and this repository deliberately does not use one:
 
 - The base of the release pull request is a commit on `main` that `ci.yml`
   already tested on push.
@@ -113,7 +128,7 @@ requests: read and write**, store it as the repository secret
 (`secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN`). The cost is a
 credential to rotate.
 
-## What was pre-flighted, and what only the first cut can prove
+## What was pre-flighted, and what the first cut proved
 
 A throwaway branch (run 32583528151) exercised everything in the publish path
 that does not touch the registry: `id-token: write` mints an OIDC token with
@@ -130,8 +145,12 @@ group printed at the start of a job never lists `IdToken`, whether or not the
 job requested it. The probe requested `id-token: write`, the group showed only
 `Contents: read` / `Metadata: read`, and the token minted anyway.
 
-Only the first real cut can prove the registry side of the exchange, because it
-needs the trusted publisher to exist. If it fails on authentication rather than
+The registry side of the exchange could only be proven by a real cut, because it
+needs the trusted publisher to exist — and **v0.5.0 (2026-09-18) proved it**: the
+release pull request was merged, the same `release` run tagged, released and
+published in one pass, and the registry serves the tarball with a SLSA
+provenance attestation. What follows is kept for the day it breaks: if a publish
+fails on authentication rather than
 on a publisher mismatch, the first thing to try is dropping `registry-url` from
 the `setup-node` step: it exists only to write an `.npmrc`, and the `.npmrc` it
 writes carries a `NODE_AUTH_TOKEN` placeholder that nothing sets.
