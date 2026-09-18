@@ -77,8 +77,9 @@ const POSE = 'time=1.2&timescale=0&count=1&dpr=1';
 const SCENES = [
   // Hoverboard exhaust uses BlendMode.Additive → mix-blend-mode: plus-lighter.
   { name: 'hoverboard (additive glow)', query: `skel=pro&anim=hoverboard&${POSE}` },
-  // Portal carries a ClippingAttachment — deliberately skipped, on both backends.
-  { name: 'portal (clipping skip)', query: `skel=pro&anim=portal&${POSE}` },
+  // Portal carries a ClippingAttachment, applied as a per-element clip-path.
+  // Clipping is element-level, so it must land identically on both backends.
+  { name: 'portal (clipping)', query: `skel=pro&anim=portal&${POSE}` },
   // Whole-skeleton tint rides the feColorMatrix filter on <img> and <canvas>.
   { name: 'walk (tint filter)', query: `skel=pro&anim=walk&tint=ff9060&${POSE}` },
 ] as const;

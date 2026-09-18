@@ -6,6 +6,7 @@ import {
   type Sequence,
   type Skeleton,
   type Slot,
+  type SlotData,
   type SlotPose,
   type TextureAtlasRegion,
 } from '@esotericsoftware/spine-core';
@@ -41,6 +42,58 @@ function expandPoint(x: number, y: number, cx: number, cy: number, amount: numbe
   return [x + dx * s, y + dy * s];
 }
 
+/**
+ * Formats one clip-path coordinate, rounded to 1/1000 of the element's local
+ * unit so that a pose which recomputes to a bit-different float does not
+ * defeat the write cache.
+ *
+ * Why 1/1000: the local unit is an atlas unit for a rigid `<img>` (the matrix
+ * denominator) and a CSS pixel for a mesh canvas, so the worst error this can
+ * add on screen is half a quantum times the element's local-to-screen scale.
+ * At a 50× upscale — far past anything a skeleton is posed at — that is
+ * 0.025 px, an order of magnitude under one device pixel at dpr 3, while
+ * still sitting three orders of magnitude above the f32 recomputation jitter
+ * of coordinates that run 10²–10³ units. Shortest-round-trip number
+ * formatting then keeps every coordinate at three decimals or fewer.
+ */
+function clipCoord(v: number): string {
+  return `${clipNum(v)}px`;
+}
+
+/**
+ * The same quantized number without a unit, for `path()` data — SVG path
+ * coordinates are user units and a `px` suffix there is a parse error.
+ */
+function clipNum(v: number): number {
+  return Math.round(v * 1000) / 1000;
+}
+
+/**
+ * Bound past which a local coordinate is treated as degenerate rather than
+ * written. Two reasons, and the second is the hard one: a near-singular
+ * element matrix sends the inverse — and with it these coordinates — toward
+ * infinity, and JavaScript switches to exponential notation at 1e21, which is
+ * not valid CSS. The browser would then drop the whole declaration and the
+ * element would render UNCLIPPED, which is the one failure mode a clip must
+ * never have. A billion local units is already far outside anything a
+ * skeleton poses, so nothing expressible is lost by stopping here.
+ */
+const CLIP_COORD_LIMIT = 1e9;
+
+/**
+ * Does `endSlot` still lie ahead of `index` in the draw order? A null end slot
+ * never does, and neither does the clip's own slot (the scan starts past it)
+ * nor one already passed — which is exactly why each of those clips runs to
+ * the end of the draw order instead of ending.
+ */
+function endsAhead(drawOrder: Slot[], index: number, endSlot: SlotData | null): boolean {
+  if (!endSlot) return false;
+  for (let i = index + 1, n = drawOrder.length; i < n; i++) {
+    if (drawOrder[i].data === endSlot) return true;
+  }
+  return false;
+}
+
 type SlotKind = 'image' | 'canvas';
 
 interface SlotView {
@@ -54,6 +107,8 @@ interface SlotView {
   blendMode: BlendMode;
   /** Last transform string written, to skip no-op style writes. */
   transform: string;
+  /** Last clip-path string written ('' = none), to skip no-op style writes. */
+  clipPath: string;
   /** Current RGB tint; (1,1,1) means untinted (no filter applied). */
   tintR: number;
   tintG: number;
@@ -107,17 +162,51 @@ const BLEND_CSS: Record<BlendMode, string> = {
  * RGB tint (skeleton × slot × attachment color) is applied per element with
  * an SVG feColorMatrix reference filter — exact channel multiply, works the
  * same on <img> and <canvas>. Dark (two-color) tint is not expressible that
- * way and is unsupported. Clipping attachments are deliberately unsupported
- * (transparent layered parts make them unnecessary); they are counted in
- * clipSkipCount.
+ * way and is unsupported. Clipping attachments become a CSS clip-path per
+ * element, in that element's own local frame, on spine-core's semantics — one
+ * active clip at a time, ending at the end slot inclusive (see `clipping`).
  *
  * Coordinate mapping: Spine is Y-up, CSS is Y-down — world Y is negated.
  * spine-core computes everything (bones, constraints, physics, deformed
  * vertices) on the CPU; this class only draws.
  */
 export class SpineHtmlRenderer {
-  /** Clipping attachments encountered (visible but unsupported). */
+  /**
+   * Apply clipping attachments (default). Each element drawn inside an active
+   * clip gets a CSS `clip-path` in its own local frame — an element-level
+   * feature, so both mesh backends see exactly the same thing and neither
+   * raster path knows clipping exists.
+   *
+   * spine-core's semantics, not an approximation of them: one clip is active
+   * at a time (a second clipping attachment met while one is active is
+   * ignored, as SkeletonClipping.clipStart does), a clip applies to the slots
+   * drawn after its own slot through its end slot inclusive, and an end slot
+   * that is the clip's own slot — or one already passed — never ends it, so
+   * the clip runs to the end of the draw order. That last case is the
+   * whole-skeleton clip, and it takes a fast path: one `clip-path` on the root
+   * instead of one per element. The root is the caller's element, so its
+   * inline `clip-path` is borrowed — saved on the first write and restored
+   * when the clip stops covering the frame, when `clipping` goes false, and by
+   * `dispose()`.
+   *
+   * False restores the pre-0.6 behaviour: clips are counted in clipSkipCount
+   * and nothing is clipped, with any clip-path this renderer wrote removed.
+   */
+  clipping = true;
+  /** Clipping attachments applied last frame. */
+  clipCount = 0;
+  /**
+   * Clipping attachments NOT applied last frame: `clipping` is false, another
+   * clip was already active (spine-core ignores the second one), the slot's
+   * bone is inactive, or the polygon has fewer than three points.
+   */
   clipSkipCount = 0;
+  /**
+   * `clip-path` style writes performed last frame, across slot elements and
+   * the root, clears included. A static polygon over static elements settles
+   * at zero: every clip-path is cached per element exactly as `transform` is.
+   */
+  clipWriteCount = 0;
   /** Mesh canvases rasterized last frame. */
   meshCount = 0;
   /** Mesh canvases that reused their previous raster last frame. */
@@ -173,6 +262,25 @@ export class SpineHtmlRenderer {
   private glPages: Set<HTMLImageElement> | null = null;
   private scratchVertices = new Float32Array(256);
   private tintDefs: SVGSVGElement | null = null;
+  /** The clip in force at the current point of the draw order, if any. */
+  private clipAttachment: ClippingAttachment | null = null;
+  private clipEndSlot: SlotData | null = null;
+  private clipInverse = false;
+  /** True while the active clip is served by one clip-path on the root. */
+  private clipOnRoot = false;
+  /** Whether any element has been drawn yet this frame (the fast-path test). */
+  private drewAnything = false;
+  /** The active clip polygon in CSS space (Y already negated), flat x,y. */
+  private clipPolygon = new Float64Array(0);
+  private clipPolygonLength = 0;
+  /**
+   * The root's inline `clip-path` before this renderer borrowed it; null means
+   * not borrowed. The root belongs to the caller, so the fast path gives back
+   * exactly the string it found.
+   */
+  private rootClipSaved: string | null = null;
+  /** Last clip-path string written to the root, to skip no-op style writes. */
+  private rootClipWritten = '';
 
   /**
    * @param root Positioned element (e.g. position:absolute) that becomes the
@@ -275,11 +383,18 @@ export class SpineHtmlRenderer {
   }
 
   render(skeleton: Skeleton): void {
+    this.clipCount = 0;
     this.clipSkipCount = 0;
+    this.clipWriteCount = 0;
     this.meshCount = 0;
     this.meshReuseCount = 0;
     this.canvasReallocCount = 0;
     this.triangleCount = 0;
+    this.clipAttachment = null;
+    this.clipEndSlot = null;
+    this.clipInverse = false;
+    this.clipOnRoot = false;
+    this.drewAnything = false;
     const blitter = this.meshBackend === 'webgl' ? getMeshGlBlitter() : null;
     this.meshBackendActive = blitter ? 'webgl' : 'canvas2d';
     const drawOrder = skeleton.drawOrder.appliedPose;
@@ -289,8 +404,26 @@ export class SpineHtmlRenderer {
       const pose = slot.appliedPose;
       const attachment = pose.attachment;
 
+      // The official draw loops take the clipping attachment before anything
+      // else and in this order: end whatever clip this slot closes, start this
+      // slot's clip, then `continue` — skipping the per-slot clipEnd at the
+      // bottom. That `continue` is the whole own-slot rule: the slot that
+      // STARTS a clip is never offered to clipEnd afterwards, so an end slot
+      // equal to the clip's own slot ends nothing and the clip runs to the end
+      // of the draw order. [spine-core 4.3.13 dist/SkeletonRendererCore.js,
+      // and dist/SkeletonRenderer.js of @esotericsoftware/spine-webgl 4.3.13.]
+      if (attachment instanceof ClippingAttachment) {
+        this.clipEnd(slot);
+        // An inactive bone means the official loop never reaches the clipping
+        // branch at all, so no clip starts.
+        if (slot.bone.active) this.clipStart(skeleton, slot, attachment, drawOrder, i);
+        else this.clipSkipCount++;
+        this.hide(slot);
+        continue;
+      }
       if (!slot.bone.active) {
         this.hide(slot);
+        this.clipEnd(slot);
         continue;
       }
       if (attachment instanceof RegionAttachment) {
@@ -298,10 +431,14 @@ export class SpineHtmlRenderer {
       } else if (attachment instanceof MeshAttachment) {
         this.renderMesh(skeleton, slot, pose, attachment, i);
       } else {
-        if (attachment instanceof ClippingAttachment) this.clipSkipCount++;
         this.hide(slot);
       }
+      // After the slot is drawn: the end slot is inside its own clip.
+      this.clipEnd(slot);
     }
+    // Only a clip that covered the whole frame keeps the root's style; every
+    // other frame hands the caller's inline value back.
+    if (!this.clipOnRoot) this.releaseRootClip();
 
     if (this.pendingJobs.length) {
       if (!blitter || !blitter.flush(this.pendingJobs)) {
@@ -320,8 +457,9 @@ export class SpineHtmlRenderer {
 
   /**
    * Removes every element this renderer added to the root (slot elements and
-   * the tint filter defs), and hands the atlas pages it uploaded back to the
-   * shared GL blitter — the one resource here that outlives the instance, so
+   * the tint filter defs), restores the root's own inline `clip-path` if the
+   * whole-skeleton clip path borrowed it, and hands the atlas pages it
+   * uploaded back to the shared GL blitter — the one resource here that outlives the instance, so
    * the one that has to be given back explicitly (GPU memory, and no garbage
    * collector feels pressure from it). The pages are reference-counted there:
    * a page another live renderer still draws stays uploaded, and the texture
@@ -336,6 +474,9 @@ export class SpineHtmlRenderer {
    * releases nothing a second time.
    */
   dispose(): void {
+    // The root is the caller's element and outlives this renderer, so the
+    // borrowed inline clip-path goes back before the slot elements go.
+    this.releaseRootClip();
     for (const view of this.views.values()) view.el.remove();
     this.views.clear();
     this.tintDefs?.remove();
@@ -389,6 +530,9 @@ export class SpineHtmlRenderer {
     const c = (blx - ulx) / h;
     const d = (bly - uly) / h;
     this.setTransform(view, `matrix(${a},${b},${c},${d},${ulx},${uly})`);
+    // Rigid elements carry a full affine, so the clip polygon rides its
+    // inverse into the local (atlas-unit) frame the <img> box spans.
+    this.applyClip(view, a, b, c, d, ulx, uly, w, h);
 
     this.applyCommon(view, slot, pose, attachment.color, skeleton, zIndex);
   }
@@ -500,6 +644,11 @@ export class SpineHtmlRenderer {
     }
 
     this.setTransform(view, `translate(${minX}px,${minY}px)`);
+    // A mesh canvas is posed by a translate only, so its local frame is the
+    // CSS-space polygon minus that translate. The clip never reaches the
+    // raster: it is not part of the dirty signature, and a mesh whose vertices
+    // held still still reuses its raster under a moving clip.
+    this.applyClip(view, 1, 0, 0, 1, minX, minY, view.canvasW / ratio, view.canvasH / ratio);
 
     if (!dirty) {
       this.meshReuseCount++;
@@ -729,6 +878,171 @@ export class SpineHtmlRenderer {
     ctx.restore();
   }
 
+  // --- clipping tier ---------------------------------------------------------
+
+  /**
+   * Begins a clip, mirroring SkeletonClipping.clipStart — whose first line is
+   * `if (this.clipAttachment) return`, so a second clipping attachment met
+   * while one is active is ignored rather than nested.
+   *
+   * The polygon is spine-core's: computeWorldVertices gives it in world space
+   * each frame, and the only thing done to it here is the Y negation the rest
+   * of the renderer already applies. It is NOT convexified or triangulated the
+   * way the CPU clipper does — CSS `polygon()` takes a concave polygon
+   * directly, so the decomposition that exists to feed a triangle rasterizer
+   * has no job here.
+   */
+  private clipStart(
+    skeleton: Skeleton,
+    slot: Slot,
+    clip: ClippingAttachment,
+    drawOrder: Slot[],
+    index: number,
+  ): void {
+    const count = clip.worldVerticesLength;
+    if (this.clipAttachment || !this.clipping || count < 6) {
+      this.clipSkipCount++;
+      return;
+    }
+    if (this.scratchVertices.length < count) this.scratchVertices = new Float32Array(count);
+    const world = this.scratchVertices;
+    clip.computeWorldVertices(skeleton, slot, 0, count, world, 0, 2);
+    if (this.clipPolygon.length < count) this.clipPolygon = new Float64Array(count);
+    const poly = this.clipPolygon;
+    for (let v = 0; v < count; v += 2) {
+      poly[v] = world[v];
+      poly[v + 1] = -world[v + 1]; // Spine is Y-up, CSS is Y-down.
+    }
+    this.clipPolygonLength = count;
+    this.clipAttachment = clip;
+    this.clipEndSlot = clip.endSlot;
+    this.clipInverse = clip.inverse;
+    this.clipCount++;
+
+    // Whole-skeleton fast path: nothing was drawn before this clip started and
+    // it never ends, so every element of this frame is inside it — one
+    // clip-path on the root beats one per element. An inverse clip is
+    // excluded: its CSS form needs an outer ring around the element's own box,
+    // and the root is an origin element with no box to use.
+    this.clipOnRoot =
+      !this.drewAnything && !clip.inverse && !endsAhead(drawOrder, index, clip.endSlot);
+    if (this.clipOnRoot) this.writeRootClip(this.rootClipPath());
+  }
+
+  /**
+   * Ends the active clip if this slot is its end slot, called after the slot
+   * has been drawn so that the end slot is itself clipped. Every other slot is
+   * ignored, exactly as SkeletonClipping.clipEnd ignores it.
+   *
+   * This cannot fire for a clip on the root fast path: that path is only taken
+   * when no slot ahead of the clip carries its end slot.
+   */
+  private clipEnd(slot: Slot): void {
+    if (this.clipAttachment && this.clipEndSlot === slot.data) {
+      this.clipAttachment = null;
+      this.clipEndSlot = null;
+    }
+  }
+
+  /**
+   * Writes (or clears) this element's clip-path. `a…f` is the element's own
+   * CSS transform, and the world polygon is carried through its INVERSE:
+   * clip-path is resolved in the element's local frame and then transformed
+   * along with the element, so the polygon has to arrive there already.
+   *
+   * `transform-origin` is `0 0` on every slot element (see view()), so the
+   * matrix maps local (0,0) to (e,f) with no origin term to undo, and
+   * `left/top: 0` puts the border box — clip-path's reference box — on that
+   * same local origin.
+   */
+  private applyClip(
+    view: SlotView,
+    a: number,
+    b: number,
+    c: number,
+    d: number,
+    e: number,
+    f: number,
+    boxW: number,
+    boxH: number,
+  ): void {
+    if (!this.clipAttachment || this.clipOnRoot) {
+      this.setClipPath(view, '');
+      return;
+    }
+    const det = a * d - b * c;
+    // Singular: the element is collapsed onto a line or a point and draws
+    // nothing, so there is no clip to express and no style write to pay for.
+    if (det === 0) return;
+    const inv = 1 / det;
+    const poly = this.clipPolygon;
+    const n = this.clipPolygonLength;
+    // An inverse clip shows what is OUTSIDE the polygon. That shape has a hole
+    // in it, so it needs TWO rings — an outer one and the polygon — and
+    // `polygon()` cannot carry two: it is one closed ring, and listing a box
+    // and a polygon inside it just makes one self-intersecting ring whose
+    // even-odd fill leaves a wedge of the seam between them (measured, on a
+    // corner of spineboy's boot). `path()` takes subpaths, so an inverse clip
+    // is written as two of them with the even-odd rule. The outer ring is the
+    // element's own box: the element paints nothing outside it anyway, so
+    // box-minus-polygon is exactly the visible part of the inverse region.
+    const inverse = this.clipInverse;
+    let s = inverse
+      ? `path(evenodd,'M0 0H${clipNum(boxW)}V${clipNum(boxH)}H0Z`
+      : 'polygon(';
+    for (let v = 0; v < n; v += 2) {
+      const dx = poly[v] - e;
+      const dy = poly[v + 1] - f;
+      const lx = (d * dx - c * dy) * inv;
+      const ly = (a * dy - b * dx) * inv;
+      // Near-singular matrices blow the inverse up; see CLIP_COORD_LIMIT for
+      // why an unwritable coordinate must not become a written-and-ignored one.
+      if (!(Math.abs(lx) <= CLIP_COORD_LIMIT) || !(Math.abs(ly) <= CLIP_COORD_LIMIT)) return;
+      if (inverse) {
+        s += `${v > 0 ? 'L' : 'M'}${clipNum(lx)} ${clipNum(ly)}`;
+      } else {
+        s += `${v > 0 ? ',' : ''}${clipCoord(lx)} ${clipCoord(ly)}`;
+      }
+    }
+    this.setClipPath(view, inverse ? `${s}Z')` : `${s})`);
+  }
+
+  private setClipPath(view: SlotView, clipPath: string): void {
+    if (view.clipPath === clipPath) return;
+    view.clipPath = clipPath;
+    view.el.style.clipPath = clipPath;
+    this.clipWriteCount++;
+  }
+
+  /** The active polygon in the root's own frame — no element transform. */
+  private rootClipPath(): string {
+    const poly = this.clipPolygon;
+    let s = 'polygon(';
+    for (let v = 0, n = this.clipPolygonLength; v < n; v += 2) {
+      if (v > 0) s += ',';
+      s += `${clipCoord(poly[v])} ${clipCoord(poly[v + 1])}`;
+    }
+    return `${s})`;
+  }
+
+  private writeRootClip(clipPath: string): void {
+    // Borrow the caller's inline value once, so releaseRootClip gives back
+    // exactly what was there. Reading `.style` is CSSOM, not a layout read.
+    if (this.rootClipSaved === null) this.rootClipSaved = this.root.style.clipPath;
+    if (this.rootClipWritten === clipPath) return;
+    this.rootClipWritten = clipPath;
+    this.root.style.clipPath = clipPath;
+    this.clipWriteCount++;
+  }
+
+  private releaseRootClip(): void {
+    if (this.rootClipSaved === null) return;
+    this.root.style.clipPath = this.rootClipSaved;
+    this.rootClipSaved = null;
+    this.rootClipWritten = '';
+    this.clipWriteCount++;
+  }
+
   // --- shared plumbing -------------------------------------------------------
 
   private setTransform(view: SlotView, transform: string): void {
@@ -746,6 +1060,9 @@ export class SpineHtmlRenderer {
     skeleton: Skeleton,
     zIndex: number,
   ): void {
+    // This element is about to be visible: the whole-skeleton fast path is
+    // only open to a clip that starts before anything has been drawn.
+    this.drewAnything = true;
     const sc = skeleton.color;
     const pc = pose.color;
     if (view.zIndex !== zIndex) {
@@ -840,6 +1157,7 @@ export class SpineHtmlRenderer {
         opacity: 1,
         blendMode: BlendMode.Normal,
         transform: '',
+        clipPath: '',
         tintR: 1,
         tintG: 1,
         tintB: 1,
@@ -863,9 +1181,15 @@ export class SpineHtmlRenderer {
 
   private hide(slot: Slot): void {
     const view = this.views.get(slot);
-    if (view && view.visible) {
+    if (!view) return;
+    if (view.visible) {
       view.visible = false;
       view.el.style.display = 'none';
     }
+    // A hidden element keeps no clip-path: one left behind would sit there
+    // stale until the slot draws again, and "nothing is clipped" has to be
+    // true of the DOM, not only of what gets painted. Cached like every other
+    // write, so the sweep costs one write per element, once.
+    this.setClipPath(view, '');
   }
 }

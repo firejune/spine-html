@@ -24,6 +24,7 @@ const STAGE_SCALE = 0.4;
 // ?dpr=2 overrides the mesh-canvas backing ratio; ?timescale=0 freezes the
 // animation (isolates the dirty-skip path: every mesh should report reused);
 // ?backend=webgl rasterizes meshes through the shared WebGL blitter;
+// ?clipping=0 turns clipping attachments back off (counted, not applied);
 // ?time=1.2 seeks every instance to the same pose (deterministic screenshots).
 const params = new URLSearchParams(location.search);
 
@@ -144,6 +145,8 @@ function main(
       renderer.meshBackend = backendSelect.value as MeshBackend;
       const expandParam = params.get('expand');
       if (expandParam !== null) renderer.triangleExpand = Number(expandParam) || 0;
+      const clippingParam = params.get('clipping');
+      if (clippingParam !== null) renderer.clipping = clippingParam !== '0';
       // Mesh canvases raster at the effective on-screen resolution: device
       // pixels × the stage downscale (a plain devicePixelRatio would
       // oversample by 1/STAGE_SCALE).
@@ -227,14 +230,18 @@ function main(
       let reused = 0;
       let reallocs = 0;
       let triangles = 0;
-      let clips = 0;
+      let clipsApplied = 0;
+      let clipsSkipped = 0;
+      let clipWrites = 0;
       let backing = 0;
       for (const inst of instances) {
         meshes += inst.renderer.meshCount;
         reused += inst.renderer.meshReuseCount;
         reallocs += inst.renderer.canvasReallocCount;
         triangles += inst.renderer.triangleCount;
-        clips += inst.renderer.clipSkipCount;
+        clipsApplied += inst.renderer.clipCount;
+        clipsSkipped += inst.renderer.clipSkipCount;
+        clipWrites += inst.renderer.clipWriteCount;
         backing += inst.renderer.meshBackingPixels;
       }
       const reallocNote = reallocs ? ` / ${reallocs} realloc'd` : '';
@@ -253,7 +260,14 @@ function main(
             ? ' · webgl'
             : ' · webgl unavailable → canvas2d'
           : '';
-      const clipNote = clips ? ` · ${clips} clips skipped` : '';
+      // Applied and skipped are separate tokens on purpose: "skipped" keeps
+      // its old wording so the counter it always meant still reads the same.
+      // clip-path writes only show up while they are happening — a static clip
+      // over a settled pose writes nothing after the first frame.
+      const clipNote =
+        (clipsApplied ? ` · ${clipsApplied} clips applied` : '') +
+        (clipsSkipped ? ` · ${clipsSkipped} clips skipped` : '') +
+        (clipWrites ? ` (${clipWrites} clip-path writes)` : '');
       // Real fps from rAF cadence: catches bottlenecks that live outside the
       // frame callback (compositing, page throttling) which the ms split
       // cannot see.
