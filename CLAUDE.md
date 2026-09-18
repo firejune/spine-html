@@ -136,7 +136,11 @@ README.md for architecture and measured numbers.
   bypass entirely. It must **never** build into the repository's own `dist/`:
   during a run `vite preview` is serving the demo out of `dist/` and
   `build:lib` opens with `rm -rf dist`, so a lib build there would pull the
-  ground out from under every other spec in the same run.
+  ground out from under every other spec in the same run. It also pins the
+  exact set of files that build emits, because an unreachable file has no other
+  signature: `src/main.ts` is the demo's entry, `tsconfig.build.json` compiled
+  all of `src/`, and so `dist/main.*` shipped in 0.4.1 and 0.5.0 without any
+  resolver, import walk or consumer ever noticing (#24).
 - Keep `@playwright/test` pinned to a version whose browser revisions match the
   machine's `~/Library/Caches/ms-playwright` before bumping it.
 
