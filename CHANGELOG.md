@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/firejune/spine-html/compare/v0.6.0...v0.7.0) (2026-09-18)
+
+
+### Features
+
+* **core:** run on spine-core 4.2 as well as 4.3, behind one access seam ([#45](https://github.com/firejune/spine-html/issues/45)) ([602ff94](https://github.com/firejune/spine-html/commit/602ff943c6b006d76520c4c9b21a5d909b7cac63))
+
 ## [0.6.0](https://github.com/firejune/spine-html/compare/v0.5.2...v0.6.0) (2026-09-18)
 
 
