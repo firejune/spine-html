@@ -164,6 +164,7 @@ export interface BackingProbeResult {
 export interface SpineHtmlHarness {
   unpackProbe(): Promise<UnpackProbeResult>;
   passThroughProbe(): Promise<PassThroughProbeResult>;
+  rotatedCutProbe(): Promise<RotatedCutProbeResult>;
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
   loaderProbe(): Promise<LoaderProbeResult>;
   loaderFailureProbe(): Promise<LoaderFailureProbeResult>;
@@ -353,6 +354,197 @@ async function unpackFailureProbe(): Promise<UnpackFailureProbeResult> {
     createdUrls: attempt.created,
     revokedUrls: attempt.revoked,
     aliveAfter: await alive(attempt.created),
+  };
+}
+
+/**
+ * Orientation of a 90°-packed cut (#49).
+ *
+ * The packer stores such a region turned counter-clockwise, and spine-core is
+ * what says so: `TextureAtlas` takes `u`/`v` from the packed rect's top-left
+ * corner and, at `degrees === 90`, `u2`/`v2` from `x + height` / `y + width` —
+ * the rect's far edges — and `RegionAttachment` then names the artwork's
+ * corners, in the rigid tier's order BL, UL, UR, BR, as (u2, v2), (u, v2),
+ * (u, v), (u2, v). So the artwork's top-left corner is the packed rect's
+ * bottom-left. Every release up to 0.7.0 turned the rect the same way the
+ * packer had, and the bitmap came out 180° round.
+ *
+ * Nothing in this probe rotates anything, which is the point: the rotated
+ * fixtures that existed before it could not see that, because the only
+ * reference they had for a turned bitmap reimplemented the cut's own transform
+ * — and a reference that shares the convention agrees with the code under test
+ * whichever way both are wrong. Here the page is painted as exact bytes, cut by
+ * the shipped `unpackRegions`, and handed back whole beside the UVs spine-core
+ * parsed; which page texel each UV names is derived in the spec, from the UVs.
+ *
+ * Two fixtures, because "covers its page" and "is cut" are different questions:
+ * a rotated region that covers its page must still be cut (the pass-through
+ * would hand back artwork lying on its side), and one that does not cover it is
+ * the cut path proper.
+ */
+
+/** A glyph packed rotated on a page it does not cover. */
+const ROTATED_CUT_ATLAS = `glyph.png
+size: 32, 24
+glyph
+bounds: 4, 2, 12, 20
+rotate: true
+`;
+
+/** The same glyph packed rotated onto a page that is exactly its rect. */
+const ROTATED_WHOLE_ATLAS = `turned.png
+size: 20, 12
+turned
+bounds: 0, 0, 12, 20
+rotate: true
+`;
+
+/** Quadrants of the packed rect, clockwise from the rect's own top-left. */
+const ROTATED_CUT_QUADRANTS = ['#e02020', '#20c040', '#2050e0', '#e0c020'] as const;
+/** Outside the packed rect — a cut that read the wrong rect carries it. */
+const ROTATED_CUT_SURROUND = '#101820';
+
+export interface PixelGrid {
+  width: number;
+  height: number;
+  /** '#rrggbbaa' per pixel, row-major. */
+  pixels: string[];
+}
+
+export interface RotatedCutSample {
+  /** The region as spine-core parsed it: packed bounds, rotation and UVs. */
+  region: {
+    name: string;
+    x: number;
+    y: number;
+    /** Artwork size; the rect it occupies on the page is height × width. */
+    width: number;
+    height: number;
+    degrees: number;
+    u: number;
+    v: number;
+    u2: number;
+    v2: number;
+  };
+  page: PixelGrid;
+  cut: PixelGrid;
+  /** False when unpackRegions handed the page URL back instead of cutting. */
+  minted: boolean;
+}
+
+export interface RotatedCutProbeResult {
+  /** Rotated, and smaller than its page. */
+  sub: RotatedCutSample;
+  /** Rotated, and exactly its page. */
+  whole: RotatedCutSample;
+}
+
+/**
+ * RGBA bytes for a page carrying one packed rect in four corner colours.
+ *
+ * The rect is written in *page* coordinates — where the packer put it — and
+ * nothing here knows which of its corners the artwork's top-left is. Four
+ * distinct quadrants make every one of the eight orientations of the bitmap a
+ * different picture, so no flip and no quarter-turn can pass the assertion.
+ */
+function packedGlyphPage(
+  pageWidth: number,
+  pageHeight: number,
+  rect: { x: number; y: number; width: number; height: number },
+): Uint8ClampedArray {
+  const rgba = (hex: string): [number, number, number, number] => [
+    parseInt(hex.slice(1, 3), 16),
+    parseInt(hex.slice(3, 5), 16),
+    parseInt(hex.slice(5, 7), 16),
+    255,
+  ];
+  const surround = rgba(ROTATED_CUT_SURROUND);
+  const quadrants = ROTATED_CUT_QUADRANTS.map(rgba);
+  const pixels = new Uint8ClampedArray(pageWidth * pageHeight * 4);
+  for (let y = 0; y < pageHeight; y++) {
+    for (let x = 0; x < pageWidth; x++) {
+      const inside =
+        x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height;
+      let colour = surround;
+      if (inside) {
+        const right = x - rect.x >= rect.width / 2;
+        const bottom = y - rect.y >= rect.height / 2;
+        colour = quadrants[bottom ? (right ? 2 : 3) : right ? 1 : 0];
+      }
+      pixels.set(colour, (y * pageWidth + x) * 4);
+    }
+  }
+  return pixels;
+}
+
+/** A bitmap's pixels as '#rrggbbaa', row-major — the spec does the deriving. */
+function pixelGrid(image: HTMLImageElement): PixelGrid {
+  const { data, width, height } = readImagePixels(image);
+  const pixels: string[] = [];
+  for (let at = 0; at < data.length; at += 4) {
+    let hex = '#';
+    for (let channel = 0; channel < 4; channel++) {
+      hex += data[at + channel].toString(16).padStart(2, '0');
+    }
+    pixels.push(hex);
+  }
+  return { width, height, pixels };
+}
+
+/** One rotated region cut by the shipped path, with the page it came from. */
+async function rotatedCutSample(
+  atlasText: string,
+  pageName: string,
+  pageWidth: number,
+  pageHeight: number,
+  /** The rect on the page, as the packer wrote it: the artwork's transpose. */
+  rect: { x: number; y: number; width: number; height: number },
+): Promise<RotatedCutSample> {
+  const pageUrl = pngUrl(packedGlyphPage(pageWidth, pageHeight, rect), pageWidth, pageHeight);
+  const image = await loadImage(pageUrl);
+  const atlas = new TextureAtlas(atlasText);
+  for (const page of atlas.pages) page.setTexture(new DomTexture(image));
+
+  const images = await unpackRegions(atlas, new Map([[pageName, image]]));
+  const region = atlas.regions[0];
+  const cut = images.get(region.name);
+  if (!cut) throw new Error(`region ${region.name} missing from the unpack`);
+  const sample: RotatedCutSample = {
+    region: {
+      name: region.name,
+      x: region.x,
+      y: region.y,
+      width: region.width,
+      height: region.height,
+      degrees: region.degrees,
+      u: region.u,
+      v: region.v,
+      u2: region.u2,
+      v2: region.v2,
+    },
+    page: pixelGrid(image),
+    cut: pixelGrid(await loadImage(cut.url)),
+    minted: cut.url !== pageUrl,
+  };
+  revokeRegions(images);
+  URL.revokeObjectURL(pageUrl);
+  return sample;
+}
+
+async function rotatedCutProbe(): Promise<RotatedCutProbeResult> {
+  return {
+    sub: await rotatedCutSample(ROTATED_CUT_ATLAS, 'glyph.png', 32, 24, {
+      x: 4,
+      y: 2,
+      width: 20,
+      height: 12,
+    }),
+    whole: await rotatedCutSample(ROTATED_WHOLE_ATLAS, 'turned.png', 20, 12, {
+      x: 0,
+      y: 0,
+      width: 20,
+      height: 12,
+    }),
   };
 }
 
@@ -2411,8 +2603,16 @@ async function cutRuleRegion(
   ctx.imageSmoothingEnabled = true;
   ctx.imageSmoothingQuality = 'high';
   if (rotated) {
-    ctx.translate(0, canvas.height);
-    ctx.rotate(-Math.PI / 2);
+    // The shipped restore, so the only variable between the rules is the
+    // rounding: clockwise, because spine-core's UVs put the artwork's top-left
+    // at the packed rect's bottom-left (the derivation is in cutRegion). This
+    // read `translate(0, canvas.height); rotate(−π/2)` until #49, matching the
+    // cut it is measured against — which is why a rule comparison could not
+    // see that both were turning the rect the wrong way. On the 4.2 exports,
+    // whose packer rotated ten regions, leaving it would make this comparison
+    // about rotation instead of about rounding.
+    ctx.translate(canvas.width, 0);
+    ctx.rotate(Math.PI / 2);
   }
   ctx.drawImage(image, sx, sy, sw, sh, 0, 0, dw, dh);
   const blob = await new Promise<Blob>((resolve, reject) => {
@@ -4355,6 +4555,7 @@ async function pmaStage(options: PmaStageOptions): Promise<PmaStageResult> {
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
+  rotatedCutProbe,
   unpackFailureProbe,
   loaderProbe,
   loaderFailureProbe,

@@ -65,6 +65,103 @@ test('a region covering its whole page reuses the page image', async ({ page }) 
   for (const url of probe.createdUrls) expect(probe.aliveAfter[url]).toBe(false);
 });
 
+/**
+ * Orientation of a 90°-packed cut (#49).
+ *
+ * `cutRegion` turned the packed rect counter-clockwise — the same way the
+ * packer had turned the artwork — so the bitmap came out 180° round and the
+ * rigid tier drew every rotated part inverted, in every release up to 0.7.0.
+ * Nothing here was in a position to see it: the rotated region above covers its
+ * page and the one in the scaled-page fixture is a single flat colour, and the
+ * only reference in the harness for a turned bitmap reimplemented the cut's own
+ * transform, which agrees with the code under test whichever way both are
+ * wrong.
+ *
+ * So this is asserted against **spine-core's UVs** and nothing else. A rotated
+ * region's corners, in the rigid tier's order BL, UL, UR, BR, carry
+ * `(u2, v2), (u, v2), (u, v), (u2, v)` — `tests/invariants.spec.ts` pins that
+ * against whichever core is installed, on both supported generations — so a
+ * point (s, t) of the artwork, s across and t down from its top-left corner,
+ * samples the page at
+ *
+ *   UL + s·(UR − UL) + t·(BL − UL)  =  ( u + t·(u2 − u),  v2 + s·(v − v2) )
+ *
+ * in the continuous `uv * size` frame both raster backends already address
+ * texels in. That is the read the official runtime performs, written out. Every
+ * pixel of the cut is held against it, not just the four corners, so a rect
+ * taken one texel off is as visible as a turn.
+ */
+
+interface Grid {
+  width: number;
+  height: number;
+  pixels: string[];
+}
+
+const texel = (grid: Grid, x: number, y: number): string => grid.pixels[y * grid.width + x];
+
+test('a 90°-packed cut holds the page texels spine-core names for its corners', async ({
+  page,
+}) => {
+  const probe = await page.evaluate(() => window.spineHtmlHarness.rotatedCutProbe());
+
+  for (const [where, sample] of Object.entries(probe)) {
+    const { region, cut } = sample;
+    const pageGrid = sample.page;
+
+    // The premise. Both fixtures are packed rotated, and both are cut: a
+    // rotated region never takes the whole-page pass-through, since that URL
+    // holds artwork lying on its side.
+    expect(region.degrees, where).toBe(90);
+    expect(sample.minted, where).toBe(true);
+    // The bitmap is the artwork upright — the transpose of its rect on the page.
+    expect([cut.width, cut.height], where).toEqual([region.width, region.height]);
+
+    /** The page texel spine-core's UVs put under this pixel of the artwork. */
+    const fromPage = (cx: number, cy: number): string => {
+      const s = (cx + 0.5) / cut.width;
+      const t = (cy + 0.5) / cut.height;
+      const u = region.u + t * (region.u2 - region.u);
+      const v = region.v2 + s * (region.v - region.v2);
+      return texel(pageGrid, Math.floor(u * pageGrid.width), Math.floor(v * pageGrid.height));
+    };
+
+    const corners = {
+      UL: [0, 0],
+      UR: [cut.width - 1, 0],
+      BR: [cut.width - 1, cut.height - 1],
+      BL: [0, cut.height - 1],
+    } as const;
+    const drawn = Object.fromEntries(
+      Object.entries(corners).map(([corner, [x, y]]) => [corner, texel(cut, x, y)]),
+    );
+    expect(drawn, where).toEqual(
+      Object.fromEntries(
+        Object.entries(corners).map(([corner, [x, y]]) => [corner, fromPage(x, y)]),
+      ),
+    );
+
+    // Not vacuous: four different colours meet in the middle of the packed
+    // rect, so no quarter-turn and no mirror of this bitmap holds them in the
+    // same corners. The old transform put UL's colour at BR and BR's at UL.
+    expect(new Set(Object.values(drawn)).size, where).toBe(4);
+
+    // …and every other pixel, which is what also catches a rect read off by a
+    // texel or a cut that fell partly outside the region.
+    const wrong: string[] = [];
+    for (let cy = 0; cy < cut.height; cy++) {
+      for (let cx = 0; cx < cut.width; cx++) {
+        const drawnTexel = texel(cut, cx, cy);
+        const named = fromPage(cx, cy);
+        if (drawnTexel !== named && wrong.length < 5) {
+          wrong.push(`(${cx},${cy}) is ${drawnTexel}, UVs name ${named}`);
+        }
+      }
+    }
+    expect(wrong, where).toEqual([]);
+  }
+});
+
 test('a failed unpack revokes what it already minted', async ({ page }) => {
   const probe = await page.evaluate(() => window.spineHtmlHarness.unpackFailureProbe());
 

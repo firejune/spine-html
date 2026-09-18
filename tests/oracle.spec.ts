@@ -63,52 +63,62 @@ test.use({ viewport: { width: 820, height: 760 } });
  * every cell, the way `PARITY_DUMP=1` does for the parity suite. It is an
  * instrument, not a threshold: without it no mask is computed in the page.
  *
- * ## ROTATED PACKING — what this found on its first run, unfixed
+ * ## ROTATED PACKING — what this found on its first run (#49, since repaired)
  *
- * **The rigid tier draws a 90°-packed atlas region differently from the
- * official runtime.** Every cell below is `test.fixme` on an atlas that has
- * any, and that is a *feature* test on the parsed atlas (`rotatedRegions`),
- * not a version key — the trigger is "this packer rotated something", which a
- * consumer atlas can do on any generation.
+ * The first thing this oracle produced was a red 4.2 column: **the rigid tier
+ * drew a 90°-packed atlas region 180° round.** The cut turned the packed rect
+ * counter-clockwise, the same way the packer had turned the artwork, instead of
+ * back — a transform that dated from the first commit of the package, so every
+ * release up to 0.7.0 carried it. `src/DomTexture.ts` has the repair and the
+ * derivation from spine-core's UVs; `tests/regions.spec.ts` has the
+ * oracle-free guard on the cut itself, and `tests/invariants.spec.ts` pins the
+ * UV convention both are derived from.
  *
- * It surfaced because the two spineboy branches pack differently: the atlas on
- * the **4.3** branch rotates **nothing**, and the one on the **4.2** branch
- * rotates **ten** regions — `front-shin`, `front-thigh`, `rear-shin`,
+ * Every cell below was `test.fixme` on an atlas with any rotated region while
+ * that stood, on a *feature* test of the parsed atlas (`rotatedRegions`) rather
+ * than a version key — the trigger is "this packer rotated something", which a
+ * consumer atlas can do on any generation. The skip is gone: the cells run on
+ * rotated atlases now, and that is what makes the 4.2 column the proof of the
+ * repair. It is only a column because the two spineboy branches pack
+ * differently — the **4.3** branch's atlas rotates **nothing** and the **4.2**
+ * branch's rotates **ten** regions (`front-shin`, `front-thigh`, `rear-shin`,
  * `rear-upper-arm`, `front-fist-open`, `muzzle01`, `muzzle03`, `muzzle-ring`,
- * `hoverboard-thruster`, `portal-flare2`. So the 4.3 column is green and the
- * 4.2 column was not, and the difference between the columns is the artwork's
- * packing rather than the runtime's generation.
+ * `hoverboard-thruster`, `portal-flare2`) — and the count is logged per cell so
+ * a green run on an unrotated atlas cannot be mistaken for evidence.
  *
- * MEASURED (macOS chromium, 4.2 exports, spine-core 4.2.120, full suite run):
- * every cell over the limit, `bad` 3.402–13.732% of content against a 0.141–
- * 1.778% floor on the unrotated atlas, peak channel delta 213–240. It is not
- * antialiasing and not filtering:
+ * MEASURED WITH THE DEFECT IN PLACE (macOS chromium, 4.2 exports, spine-core
+ * 4.2.120, full suite run), kept because it is the record of what this
+ * signature looks like: every cell over the limit, `bad` 3.402–13.732% of
+ * content against a 0.141–1.778% floor on the unrotated atlas, peak channel
+ * delta 213–240. It was not antialiasing and not filtering:
  *
- * - **Direction: neither.** darker and lighter come out level (10.648% against
+ * - **Direction: neither.** darker and lighter came out level (10.648% against
  *   12.426% on the rigid cell), which is displacement, not a colour error.
- * - **Nothing is missing.** contentMismatch stays at 0.146–1.727%, inside the
- *   floor — the same pixels are painted, in different places.
- * - **The mask puts it on the parts, not the edges.** Solid red over both
- *   thighs, both shins and the boots, while the head, torso and gun carry only
- *   the usual yellow outline. Every solid-red part is a `rotate: 90` region or
- *   is posed by one.
- * - **It is the rigid tier.** Every rotated region is a *region* attachment in
+ * - **Nothing was missing.** contentMismatch stayed at 0.146–1.727%, inside the
+ *   floor — the same pixels painted, in different places.
+ * - **The mask put it on the parts, not the edges.** Solid red over both
+ *   thighs, both shins and the boots, while the head, torso and gun carried
+ *   only the usual yellow outline. Every solid-red part was a `rotate: 90`
+ *   region or was posed by one.
+ * - **It was the rigid tier.** Every rotated region is a *region* attachment in
  *   `spineboy-ess`, and all but one (`front-shin`) in `spineboy-pro` — and the
- *   meshed cells score lower (7.653–7.730%) than the rigid ones (13.418–
- *   13.732%) because their mesh slots are correct and dilute it. The mesh tier
- *   samples the page through spine-core's UVs; the rigid tier draws an
+ *   meshed cells scored lower (7.653–7.730%) than the rigid ones (13.418–
+ *   13.732%) because their mesh slots were correct and diluted it. The mesh
+ *   tier samples the page through spine-core's UVs; the rigid tier draws an
  *   unpacked, un-rotated cut through a CSS matrix. Only the second one
- *   disagrees.
+ *   disagreed.
  *
- * Which side is wrong is not asserted here, but the reference's leg is
- * anatomically coherent and this package's is not (knee pad at the ankle, boot
- * detached at the hip), and the rigid tier is the only side doing anything
- * rotation-specific.
- *
- * Nothing was tuned to hide this and nothing in `src/` was touched to make it
- * go away: the limits above are calibrated on the unrotated atlas, where they
- * hold with the headroom recorded, and the cells say plainly when they are not
- * measuring what they claim to.
+ * REPAIRED (macOS, 4.2 exports, spine-core 4.2.120, full suite run): every cell
+ * inside the limits it was calibrated to on the *unrotated* atlas, and not one
+ * of those limits was touched to get there — `bad` 0.176–2.120% of content on
+ * chromium and 0.186–0.903% on webkit, the rigid cells at 2.120% / 0.469%
+ * (straight page) and 1.704% / 0.335% (premultiplied). contentMismatch peaks at
+ * 1.611%, and the alignment canary still detects one world unit, at 2.78× and
+ * 5.17×. Re-applying the old transform on the same tree takes it back to
+ * 3.402–13.426% and 3.338–12.586%, red on 20 of the 22 cells — the exception
+ * being `clipping (portal)`, whose content is dominated by an unrotated mask,
+ * which is one more reason the cut has a guard of its own that does not depend
+ * on a rendered pose. The PR for #49 carries the per-cell table.
  */
 
 const POSE = { animation: 'walk', time: 1.2 } as const;
@@ -337,14 +347,6 @@ for (const cell of CELLS) {
     // A = the official runtime, B = this package, so "darker" below reads as
     // "spine-html darker than the reference" — #37's direction.
     const referenceShot = await capture(page, cell, 'reference');
-    // See ROTATED PACKING at the top of this file: a 90°-packed region is drawn
-    // differently from the official runtime, so on an atlas that has any, these
-    // cells measure that defect and not what they were written to measure.
-    test.fixme(
-      referenceShot.info.rotatedRegions > 0,
-      `${referenceShot.info.rotatedRegions} of this atlas's regions are 90°-packed — ` +
-        'the rigid tier disagrees with the reference on those; see ROTATED PACKING',
-    );
     const domShot = await capture(page, cell, 'dom');
     const reference = referenceShot.shot;
     const dom = domShot.shot;
@@ -360,6 +362,9 @@ for (const cell of CELLS) {
     // is the early signal, not just the pass/fail line.
     console.log(
       `[oracle] ${testInfo.project.name} ${cell.name}: ${m.width}x${m.height}, ` +
+        // See ROTATED PACKING: this is what the cells used to skip on, and a
+        // zero says the atlas in front of them cannot show #49's defect class.
+        `rotatedRegions=${referenceShot.info.rotatedRegions}, ` +
         `content ref=${m.contentA} dom=${m.contentB} union=${m.contentUnion}, ` +
         `bad=${m.bad} of ${m.rawBad} raw (${(badRatio * 100).toFixed(3)}% of content, ` +
         `ch>${CHANNEL_TOLERANCE}), maxDelta=${m.maxDelta}, ` +
@@ -469,11 +474,6 @@ test('alignment canary: a one-unit world offset is detected', async ({ page }) =
   await openHarness(page);
   const cell = CELLS[1]; // the meshed canvas2d cell — every tier is in it
   const referenceShot = await capture(page, cell, 'reference');
-  test.fixme(
-    referenceShot.info.rotatedRegions > 0,
-    'a 90°-packed region moves the aligned floor this canary is a ratio against; ' +
-      'see ROTATED PACKING',
-  );
   const reference = referenceShot.shot;
   const aligned = (await capture(page, cell, 'dom')).shot;
   const offset = (await capture(page, cell, 'dom', 1)).shot;
@@ -482,6 +482,7 @@ test('alignment canary: a one-unit world offset is detected', async ({ page }) =
   const offsetDiff = await diffInPage(page, reference, offset);
   console.log(
     `[oracle] ${test.info().project.name} alignment canary: ` +
+      `rotatedRegions=${referenceShot.info.rotatedRegions}, ` +
       `aligned rawBad=${alignedDiff.rawBad}, +1 world unit rawBad=${offsetDiff.rawBad}, ` +
       `ratio=${(offsetDiff.rawBad / Math.max(1, alignedDiff.rawBad)).toFixed(2)}×`,
   );

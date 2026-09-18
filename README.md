@@ -65,9 +65,11 @@ with a self-contained test suite (backend visual parity + invariants) and CI.
 
 - ✅ Region attachments (rigid parts): exact affine mapping, draw-order via `z-index`,
   attachment swaps, alpha
-- ✅ Atlas unpacking at load time (90°-packed regions restored), so the rigid per-frame
-  path never touches a canvas — a region that covers its whole page is passed through
-  uncut, and `revokeRegions()` frees the rest when a skeleton is unloaded
+- ✅ Atlas unpacking at load time (90°-packed regions restored to the orientation
+  spine-core's UVs name, held by the pixel oracle on exports whose packer rotated),
+  so the rigid per-frame path never touches a canvas — a region that covers its whole
+  page is passed through uncut, and `revokeRegions()` frees the rest when a skeleton
+  is unloaded
 - ✅ Mesh attachments (deform tier): small per-part canvases sized to the mesh's world
   bounds, interleaved with the rigid `<img>` slots in one stacking context — the DOM
   handles the bones, a rasterizer handles the warps
@@ -311,6 +313,14 @@ const data = new SkeletonJson(new AtlasAttachmentLoader(atlas)).readSkeletonData
 // …and on unload, after every renderer using them is disposed:
 revokeRegions(regionImages);
 ```
+
+A region the packer stored turned (`rotate: 90`) is cut upright again, and which
+way round that is comes from spine-core's own UVs rather than from the cut: such
+a region's corners carry `(u2, v2), (u, v2), (u, v), (u2, v)` in the order
+BL, UL, UR, BR, so the artwork's top-left corner sits at the packed rect's
+bottom-left and unpacking it is a clockwise turn. Every release up to 0.7.0
+turned it the other way and drew rotated rigid parts 180° round (#49); if you
+worked around that by re-packing an atlas without rotation, you can stop.
 
 `unpackRegions` mints one blob URL per region; `revokeRegions` is its
 counterpart. It only frees URLs `unpackRegions` created, so a map you built
@@ -630,6 +640,14 @@ then both are screenshotted and diffed. Eleven cells: the rigid tier, the mesh
 tier on both backends, the exporter's own premultiplied page (`spineboy-pma`)
 on all three, a clipping pose, an additive-blend pose, a per-slot rgba/alpha
 pose, and a whole-skeleton tint.
+
+It earned its keep on the first run: the rigid tier was drawing every
+90°-packed atlas region 180° round (#49), in every release up to 0.7.0, and no
+comparison of this package against itself could have seen it. Rotated packing is
+held there now — the example exports from the 4.2 branch rotate ten regions
+where the 4.3 branch's rotate none, so the CI column that installs 4.2 is what
+keeps the restore honest, and each cell logs how many regions its atlas rotated
+so a green run on an unrotated one cannot be mistaken for the proof.
 
 Two things make it evidence rather than decoration. The camera match is
 **derived** — solved against the DOM mapping, not fitted to a picture — and

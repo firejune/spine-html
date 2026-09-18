@@ -87,6 +87,28 @@ README.md for architecture and measured numbers.
   page. The page's declared size missing or zero still means "the image is its
   own declared size". `tests/regions.spec.ts` holds it, on artwork painted
   three times at 0.5×/1×/2× rather than resampled.
+- **Which way a 90°-packed rect is turned back is derived from spine-core's
+  UVs, never from the cut.** `TextureAtlas` takes `u`/`v` from the packed
+  rect's top-left corner and, at `degrees === 90`, `u2`/`v2` from `x + height`
+  / `y + width`; `RegionAttachment` then names the artwork's corners in the
+  rigid tier's own order BL, UL, UR, BR as `(u2, v2), (u, v2), (u, v),
+  (u2, v)`. So the artwork's **top-left corner is the packed rect's
+  bottom-left**, the packer turned it counter-clockwise, and unpacking is a
+  *clockwise* turn (`translate(cw, 0); rotate(+π/2)`). Turning it the other way
+  is #49: the bitmap comes out 180° round, `renderRegion` pins its top-left to
+  the attachment's UL corner either way, and every rotated rigid part is drawn
+  inverted while its outline stays roughly in place — which shipped from the
+  first commit to 0.7.0 because nothing was in a position to see it. The
+  rotated fixtures either covered their page (pass-through, never cut) or were
+  one flat colour, and the harness's own reference for a turned bitmap
+  reimplemented the cut's transform: **a reference that shares the convention
+  agrees with the code under test whichever way both are wrong**, which is the
+  general rule here and not a fact about rotation. So a rotated expectation is
+  written from the UVs and nothing else — `tests/regions.spec.ts` asserts a
+  cut's pixels against the page texels those UVs name, on a rotated region that
+  does not cover its page, and `tests/invariants.spec.ts` pins the UV
+  convention itself against whichever core is installed. The mesh tier never
+  had the defect: it samples the page through those same UVs.
 - **Alpha convention is per tier, keyed off `page.pma`** (#37). The exporter
   premultiplies by default, so most consumer atlases carry `pma: true` and the
   file's RGB is already multiplied by its alpha. GL then uploads it *without*
@@ -315,9 +337,17 @@ README.md for architecture and measured numbers.
   asserts both) and fetching that spine-runtimes branch's exports
   (`SPINE_ASSETS_BRANCH`, which also stamps `public/spineboy` so a branch switch
   refetches from clean rather than mixing two generations). Locally:
-  `SPINE_ASSETS_BRANCH=4.2 bun run fetch-assets`, `bun add --no-save
-  '@esotericsoftware/spine-core@4.2'`, then `SPINE_CORE_MINOR=4.2 bun run test`
-  — and `bun install --frozen-lockfile` afterwards to put 4.3 back. **Do not
+  `bun add --no-save '@esotericsoftware/spine-core@4.2'
+  '@esotericsoftware/spine-webgl@4.2'`, then `SPINE_ASSETS_BRANCH=4.2
+  SPINE_CORE_MINOR=4.2 bun run test` — and afterwards `bun install
+  --frozen-lockfile` plus `SPINE_ASSETS_BRANCH=4.3 bun run fetch-assets` to put
+  4.3 back. **`SPINE_ASSETS_BRANCH` belongs on the test run itself**, not only
+  on a `fetch-assets` before it: the run's own build hook fetches again, and
+  without it the stamped 4.2 exports are wiped and refetched at the default 4.3
+  *while the run is starting*. The column then puts the 4.2 runtime in front of
+  4.3 data, which is the one thing it was not meant to measure, and the red it
+  produces looks like anything but an assets swap (the loading specs go first).
+  CI does not hit this because the matrix sets both variables at job level. **Do not
   fork an expectation per version to make a column green.** The spineboy export
   is structurally identical on all four branches (52 slots, 66 region + 12 mesh +
   1 clipping attachment, the same 11 animations including `portal`), so slot
@@ -350,22 +380,6 @@ README.md for architecture and measured numbers.
   `npm publish` by hand — the publish happens in CI over OIDC.
 
 ## Known backlog
-
-- 🔴 **The rigid tier draws a `rotate: 90` atlas region differently from the
-  official runtime**, found by the oracle on its first run and deliberately not
-  fixed in the change that found it. The 4.3 branch's spineboy atlas rotates
-  nothing and the 4.2 branch's rotates ten regions, so this reads as "the 4.2
-  column" and is not: the trigger is the *packer*, which a consumer atlas can
-  do on any generation, and the skip is a feature test on the parsed atlas
-  (`rotatedRegions`) for exactly that reason. Measured: every oracle cell over
-  the limit, `bad` 3.4–13.7% of content against a 0.14–1.78% floor, with no
-  direction (darker ≈ lighter), no missing content (`contentMismatch` inside
-  the floor) and the mask on whole parts rather than edges. It is the rigid
-  tier: every rotated region is a region attachment, and the meshed cells score
-  *lower* because their mesh slots are correct and dilute it. Nothing in the
-  suite could have seen it — `tests/regions.spec.ts` exercises a rotated region
-  that covers its **whole page**, which takes the pass-through path, never the
-  cut path.
 
 - Linux WebKit is no longer a parity outlier — it was canvas2d drawing the
   whole atlas page per triangle, and the source sub-rect above retired both the
