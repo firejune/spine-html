@@ -18,6 +18,7 @@ import {
 import type { SkeletonData } from '@esotericsoftware/spine-core';
 import { loadSkeletonBinary } from '../src/binary';
 import { getMeshGlBlitter } from '../src/MeshGlBlitter';
+import { straightAlphaDerivations, straightAlphaSource } from '../src/DomTexture';
 
 /**
  * Browser-side test harness (see harness.html).
@@ -174,6 +175,10 @@ export interface SpineHtmlHarness {
   clipCountersProbe(): Promise<ClipCountersProbeResult>;
   clipInverseProbe(): Promise<ClipInverseProbeResult>;
   cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageResult>;
+  pmaFixtureProbe(): Promise<PmaFixtureProbeResult>;
+  pmaCutProbe(): Promise<PmaCutProbeResult>;
+  pmaDerivationProbe(): Promise<PmaDerivationProbeResult>;
+  pmaStage(options: PmaStageOptions): Promise<PmaStageResult>;
 }
 
 declare global {
@@ -3198,6 +3203,773 @@ async function clipInverseProbe(): Promise<ClipInverseProbeResult> {
   };
 }
 
+// --- premultiplied atlas pages (`pma: true`, #37) ---------------------------
+
+/**
+ * Fixtures for premultiplied pages, built here rather than committed.
+ *
+ * The repository's own atlas has no `pma:` line, so nothing in the suite ever
+ * drew such a page. What follows makes one out of the page that ships: the same
+ * artwork with `rgb = round(rgb * a / 255)` written into it, under the same
+ * atlas text plus `pma: true`. Rendered correctly, the two must produce the
+ * same picture — which is the whole test.
+ *
+ * The twin is encoded here, byte by byte, instead of through `canvas.toBlob`.
+ * A 2D canvas stores premultiplied colour, so writing values into one and
+ * encoding them back out quantizes them at low alpha (measured: up to ~12 of
+ * 255 around alpha 11, on both engines) — the fixture would then carry an error
+ * of the same order as the thing being measured. Reading the *source* page
+ * through a canvas is safe by contrast: the premultiplied product survives that
+ * round trip exactly, and the premultiplied product is all the twin holds.
+ */
+
+/** CRC-32 table (PNG chunk checksums). */
+const PNG_CRC = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngCrc32(bytes: Uint8Array): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = PNG_CRC[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function pngAdler32(bytes: Uint8Array): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    a = (a + bytes[i]) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+function pngChunk(type: string, data: Uint8Array): Uint8Array {
+  const out = new Uint8Array(12 + data.length);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  view.setUint32(8 + data.length, pngCrc32(out.subarray(4, 8 + data.length)));
+  return out;
+}
+
+/**
+ * RGBA8 PNG bytes holding exactly `pixels` — no filtering (filter byte 0 per
+ * row) and stored deflate blocks, so the file says what was handed in and the
+ * encoder needs neither a dependency nor `CompressionStream`.
+ */
+function encodePng(pixels: Uint8ClampedArray, width: number, height: number): Uint8Array {
+  const stride = 1 + width * 4;
+  const raw = new Uint8Array(height * stride);
+  for (let y = 0; y < height; y++) {
+    raw.set(pixels.subarray(y * width * 4, (y + 1) * width * 4), y * stride + 1);
+  }
+  const blocks = Math.max(1, Math.ceil(raw.length / 65535));
+  const zlib = new Uint8Array(2 + blocks * 5 + raw.length + 4);
+  zlib[0] = 0x78;
+  zlib[1] = 0x01;
+  let at = 2;
+  for (let block = 0; block < blocks; block++) {
+    const start = block * 65535;
+    const length = Math.min(65535, raw.length - start);
+    zlib[at++] = block === blocks - 1 ? 1 : 0;
+    zlib[at++] = length & 0xff;
+    zlib[at++] = (length >> 8) & 0xff;
+    zlib[at++] = ~length & 0xff;
+    zlib[at++] = (~length >> 8) & 0xff;
+    zlib.set(raw.subarray(start, start + length), at);
+    at += length;
+  }
+  new DataView(zlib.buffer).setUint32(at, pngAdler32(raw));
+  const ihdr = new Uint8Array(13);
+  const header = new DataView(ihdr.buffer);
+  header.setUint32(0, width);
+  header.setUint32(4, height);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // colour type: RGBA
+  const parts = [
+    new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib),
+    pngChunk('IEND', new Uint8Array(0)),
+  ];
+  const png = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+  let offset = 0;
+  for (const part of parts) {
+    png.set(part, offset);
+    offset += part.length;
+  }
+  return png;
+}
+
+/** A blob URL for those pixels as a PNG. The caller owns it. */
+function pngUrl(pixels: Uint8ClampedArray, width: number, height: number): string {
+  const png = encodePng(pixels, width, height);
+  // The array is freshly allocated, so its buffer is exactly its bytes.
+  return URL.createObjectURL(new Blob([png.buffer as ArrayBuffer], { type: 'image/png' }));
+}
+
+/** An image's pixels as a canvas reads them back (straight alpha). */
+function readImagePixels(image: HTMLImageElement): {
+  data: Uint8ClampedArray;
+  width: number;
+  height: number;
+} {
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) throw new Error('2d context unavailable');
+  ctx.drawImage(image, 0, 0);
+  return { data: ctx.getImageData(0, 0, width, height).data, width, height };
+}
+
+/** `rgb = round(rgb * a / 255)` — the exporter's premultiply, on a copy. */
+function premultiplied(pixels: Uint8ClampedArray): Uint8ClampedArray {
+  const out = new Uint8ClampedArray(pixels.length);
+  for (let i = 0; i < pixels.length; i += 4) {
+    const a = pixels[i + 3];
+    out[i] = Math.round((pixels[i] * a) / 255);
+    out[i + 1] = Math.round((pixels[i + 1] * a) / 255);
+    out[i + 2] = Math.round((pixels[i + 2] * a) / 255);
+    out[i + 3] = a;
+  }
+  return out;
+}
+
+/** The same atlas text, with its (single) page declared premultiplied. */
+function withPmaFlag(atlasText: string): string {
+  const lines = atlasText.split('\n');
+  const at = lines.findIndex((line) => /^\s*size\s*:/.test(line));
+  if (at === -1) throw new Error('atlas has no size: line to flag');
+  const indent = /^\s*/.exec(lines[at])?.[0] ?? '';
+  lines.splice(at + 1, 0, `${indent}pma: true`);
+  return lines.join('\n');
+}
+
+/**
+ * The premultiplied twin of a page image, as a blob URL the caller owns.
+ *
+ * The source is read through a canvas, which quantizes straight colour at low
+ * alpha — but not the premultiplied *product*, which is all that is written
+ * here, so the twin holds exactly `round(rgb * a / 255)` of the original file.
+ */
+function premultipliedTwin(page: HTMLImageElement): {
+  url: string;
+  width: number;
+  height: number;
+} {
+  const { data, width, height } = readImagePixels(page);
+  return { url: pngUrl(premultiplied(data), width, height), width, height };
+}
+
+/** Twin page images by page scale, minted once per document (like cutRulePages). */
+const pmaTwins = new Map<number, Promise<{ image: HTMLImageElement; url: string }>>();
+
+function pmaTwinPage(scale: number): Promise<{ image: HTMLImageElement; url: string }> {
+  const cached = pmaTwins.get(scale);
+  if (cached) return cached;
+  const built = (async () => {
+    const straight = await cutRulePageImage(scale);
+    const twin = premultipliedTwin(straight);
+    return { image: await loadImage(twin.url), url: twin.url };
+  })();
+  pmaTwins.set(scale, built);
+  return built;
+}
+
+export interface PmaBand {
+  label: string;
+  pixels: number;
+  maxError: number;
+  meanError: number;
+  /** Pixels past the analytic ceiling for their alpha — must be 0. */
+  overBound: number;
+}
+
+export interface PmaFixtureProbeResult {
+  pageSize: { width: number; height: number };
+  /** Bytes of the hand-encoded twin, and whether it decoded at all. */
+  pngBytes: number;
+  decodedSize: { width: number; height: number };
+  /** Fully opaque texels, where a canvas read is lossless: must match exactly. */
+  opaquePixels: number;
+  opaqueMismatches: number;
+  /**
+   * |read-back − written| over the twin, per alpha band. This *is* the
+   * un-premultiply's precision loss: the derivation starts from this read.
+   */
+  readBack: PmaBand[];
+  /**
+   * The derived straight-alpha source, read back against
+   * `round(read-back * 255 / a)`: how often, and how far, the canvas's own
+   * 8-bit conversion disagrees with that arithmetic.
+   */
+  derivedMismatches: number;
+  derivedMaxDrift: number;
+  /**
+   * The derivation composited over black — the premultiplied product the screen
+   * actually gets — against what the page holds. This is the end-to-end
+   * fidelity of the un-premultiply. A second premultiply would show here as a
+   * large, one-directional error at mid alpha.
+   */
+  compositeMaxError: number;
+  composite: PmaBand[];
+  /** Samples behind compositeMaxError, for reading a failure. */
+  compositeWorst: string[];
+}
+
+/**
+ * The fixture, measured rather than assumed: the twin decodes, holds what was
+ * written where a canvas can see it, and the derivation neither re-premultiplies
+ * nor drifts from what it started with.
+ */
+async function pmaFixtureProbe(): Promise<PmaFixtureProbeResult> {
+  const straight = await cutRulePageImage(1);
+  const source = readImagePixels(straight);
+  const written = premultiplied(source.data);
+  const png = encodePng(written, source.width, source.height);
+  const url = URL.createObjectURL(new Blob([png.buffer as ArrayBuffer], { type: 'image/png' }));
+  const twin = await loadImage(url);
+  const readBack = readImagePixels(twin).data;
+
+  // Bands by alpha: the ceiling on a canvas round trip at alpha a is
+  // min(a, 127.5 / a + 0.5), and it is what limits the repair at low alpha.
+  const bands = [
+    { label: 'a = 255 (opaque)', min: 255, max: 255 },
+    { label: 'a 128–254', min: 128, max: 254 },
+    { label: 'a 32–127', min: 32, max: 127 },
+    { label: 'a 1–31', min: 1, max: 31 },
+  ];
+  const measured: PmaBand[] = bands.map((band) => ({
+    label: band.label,
+    pixels: 0,
+    maxError: 0,
+    meanError: 0,
+    overBound: 0,
+  }));
+  const sums = new Array<number>(bands.length).fill(0);
+  let opaquePixels = 0;
+  let opaqueMismatches = 0;
+  for (let i = 0; i < written.length; i += 4) {
+    const a = written[i + 3];
+    if (a === 0) continue;
+    const error = Math.max(
+      Math.abs(readBack[i] - written[i]),
+      Math.abs(readBack[i + 1] - written[i + 1]),
+      Math.abs(readBack[i + 2] - written[i + 2]),
+    );
+    if (a === 255) {
+      opaquePixels++;
+      if (error !== 0) opaqueMismatches++;
+    }
+    const bound = Math.min(a, 127.5 / a + 0.5);
+    for (let b = 0; b < bands.length; b++) {
+      if (a < bands[b].min || a > bands[b].max) continue;
+      const band = measured[b];
+      band.pixels++;
+      sums[b] += error;
+      if (error > band.maxError) band.maxError = error;
+      if (error > bound) band.overBound++;
+      break;
+    }
+  }
+  for (let b = 0; b < measured.length; b++) {
+    const band = measured[b];
+    band.meanError = band.pixels ? Math.round((sums[b] / band.pixels) * 1000) / 1000 : 0;
+  }
+
+  // The library's own derivation, read back and composited.
+  const derived = straightAlphaSource(twin, true) as HTMLCanvasElement;
+  const derivedCtx = derived.getContext('2d', { willReadFrequently: true });
+  if (!derivedCtx) throw new Error('2d context unavailable');
+  const derivedPixels = derivedCtx.getImageData(0, 0, derived.width, derived.height).data;
+  const over = document.createElement('canvas');
+  over.width = derived.width;
+  over.height = derived.height;
+  const overCtx = over.getContext('2d', { willReadFrequently: true });
+  if (!overCtx) throw new Error('2d context unavailable');
+  overCtx.fillStyle = '#000000';
+  overCtx.fillRect(0, 0, over.width, over.height);
+  overCtx.drawImage(derived, 0, 0);
+  const composited = overCtx.getImageData(0, 0, over.width, over.height).data;
+
+  let derivedMismatches = 0;
+  let derivedMaxDrift = 0;
+  let compositeMaxError = 0;
+  const compositeBands: PmaBand[] = bands.map((band) => ({
+    label: band.label,
+    pixels: 0,
+    maxError: 0,
+    meanError: 0,
+    overBound: 0,
+  }));
+  const compositeSums = new Array<number>(bands.length).fill(0);
+  const worst: string[] = [];
+  for (let i = 0; i < readBack.length; i += 4) {
+    const a = readBack[i + 3];
+    if (a === 0) continue;
+    let pixelError = 0;
+    for (let c = 0; c < 3; c++) {
+      const expected = Math.min(255, Math.round((readBack[i + c] * 255) / a));
+      const drift = Math.abs(derivedPixels[i + c] - expected);
+      if (drift !== 0) derivedMismatches++;
+      if (drift > derivedMaxDrift) derivedMaxDrift = drift;
+      // Composited over opaque black, the premultiplied product is what lands —
+      // and it is measured against what the page actually holds, not against
+      // the quantized read the derivation had to start from. (The two differ:
+      // a texel whose read overshoots its alpha clamps back onto the true
+      // value, so the end-to-end error can be smaller than the read's.)
+      const error = Math.abs(composited[i + c] - written[i + c]);
+      if (error > pixelError) pixelError = error;
+    }
+    if (pixelError > compositeMaxError) {
+      compositeMaxError = pixelError;
+      if (worst.length < 8) {
+        worst.push(
+          `a=${a} page=${written[i]} read=${readBack[i]} ` +
+            `derived=${derivedPixels[i]} composite=${composited[i]}`,
+        );
+      }
+    }
+    const bound = Math.min(a, 127.5 / a + 0.5);
+    for (let b = 0; b < bands.length; b++) {
+      if (a < bands[b].min || a > bands[b].max) continue;
+      const band = compositeBands[b];
+      band.pixels++;
+      compositeSums[b] += pixelError;
+      if (pixelError > band.maxError) band.maxError = pixelError;
+      if (pixelError > bound + 1) band.overBound++;
+      break;
+    }
+  }
+  for (let b = 0; b < compositeBands.length; b++) {
+    const band = compositeBands[b];
+    band.meanError = band.pixels ? Math.round((compositeSums[b] / band.pixels) * 1000) / 1000 : 0;
+  }
+
+  URL.revokeObjectURL(url);
+  return {
+    pageSize: { width: source.width, height: source.height },
+    pngBytes: png.length,
+    decodedSize: { width: twin.naturalWidth, height: twin.naturalHeight },
+    opaquePixels,
+    opaqueMismatches,
+    readBack: measured,
+    derivedMismatches,
+    derivedMaxDrift,
+    compositeMaxError,
+    composite: compositeBands,
+    compositeWorst: worst,
+  };
+}
+
+/**
+ * A whole-page region (the pass-through candidate) and a sub-rect that must be
+ * cut. The sub-rect spans the page's full height on purpose: alpha runs top to
+ * bottom, so its cut carries every alpha from 0 to 255 and no band of the
+ * comparison is empty.
+ */
+const PMA_RAMP_ATLAS = `ramp.png
+size: 64, 32
+whole
+bounds: 0, 0, 64, 32
+sub
+bounds: 8, 0, 32, 32
+`;
+
+/** Colour across, alpha down — every alpha from 0 to 255 appears. */
+function alphaRamp(width: number, height: number): Uint8ClampedArray {
+  const pixels = new Uint8ClampedArray(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    const a = Math.round((255 * y) / (height - 1));
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      pixels[i] = Math.round((255 * x) / (width - 1));
+      pixels[i + 1] = 255 - Math.round((255 * x) / (width - 1));
+      pixels[i + 2] = 128;
+      pixels[i + 3] = a;
+    }
+  }
+  return pixels;
+}
+
+export interface PmaCutSample {
+  /** Whether the whole-page region reused the page URL instead of cutting. */
+  wholePassedThrough: boolean;
+  /** Blob URLs unpackRegions minted, and whether revokeRegions freed them. */
+  mintedCount: number;
+  wholeAliveBefore: boolean;
+  wholeAliveAfter: boolean;
+  pageAliveAfter: boolean;
+}
+
+export interface PmaCutProbeResult {
+  straight: PmaCutSample;
+  pma: PmaCutSample;
+  /** |straight cut − pma cut| over the `sub` region, by alpha band. */
+  bands: PmaBand[];
+  /** Alpha is never divided, so it must come through untouched. */
+  maxAlphaError: number;
+}
+
+/**
+ * The rigid tier's pixels, on a page built here so the straight values are
+ * known exactly: the same artwork straight and premultiplied, cut both ways,
+ * compared texel by texel — plus what the whole-page pass-through does with a
+ * premultiplied page (it must not fire: that URL holds premultiplied pixels).
+ */
+async function pmaCutProbe(): Promise<PmaCutProbeResult> {
+  const width = 64;
+  const height = 32;
+  const straightPixels = alphaRamp(width, height);
+  const sources = {
+    straight: pngUrl(straightPixels, width, height),
+    pma: pngUrl(premultiplied(straightPixels), width, height),
+  };
+
+  async function run(variant: 'straight' | 'pma'): Promise<{
+    sample: PmaCutSample;
+    sub: Uint8ClampedArray;
+  }> {
+    const pageUrl = sources[variant];
+    const image = await loadImage(pageUrl);
+    const atlas = new TextureAtlas(
+      variant === 'pma' ? withPmaFlag(PMA_RAMP_ATLAS) : PMA_RAMP_ATLAS,
+    );
+    for (const page of atlas.pages) page.setTexture(new DomTexture(image));
+    const pageImages = new Map([['ramp.png', image]]);
+
+    const unpacked = await trackObjectUrls(() => unpackRegions(atlas, pageImages));
+    const whole = unpacked.result.get('whole');
+    const sub = unpacked.result.get('sub');
+    if (!whole || !sub) throw new Error('regions missing from the unpack');
+    const subPixels = readImagePixels(await loadImage(sub.url)).data;
+    const wholeAliveBefore = (await alive([whole.url]))[whole.url] ?? false;
+    revokeRegions(unpacked.result);
+    const after = await alive([whole.url, pageUrl]);
+
+    return {
+      sample: {
+        wholePassedThrough: whole.url === pageUrl,
+        mintedCount: unpacked.created.length,
+        wholeAliveBefore,
+        wholeAliveAfter: after[whole.url] ?? false,
+        pageAliveAfter: after[pageUrl] ?? false,
+      },
+      sub: subPixels,
+    };
+  }
+
+  const straight = await run('straight');
+  const pma = await run('pma');
+
+  const bands = [
+    { label: 'a = 255 (opaque)', min: 255, max: 255 },
+    { label: 'a 128–254', min: 128, max: 254 },
+    { label: 'a 32–127', min: 32, max: 127 },
+    { label: 'a 1–31', min: 1, max: 31 },
+  ];
+  const measured: PmaBand[] = bands.map((band) => ({
+    label: band.label,
+    pixels: 0,
+    maxError: 0,
+    meanError: 0,
+    overBound: 0,
+  }));
+  const sums = new Array<number>(bands.length).fill(0);
+  let maxAlphaError = 0;
+  for (let i = 0; i < straight.sub.length; i += 4) {
+    const a = straight.sub[i + 3];
+    maxAlphaError = Math.max(maxAlphaError, Math.abs(pma.sub[i + 3] - a));
+    if (a === 0) continue;
+    const error = Math.max(
+      Math.abs(pma.sub[i] - straight.sub[i]),
+      Math.abs(pma.sub[i + 1] - straight.sub[i + 1]),
+      Math.abs(pma.sub[i + 2] - straight.sub[i + 2]),
+    );
+    // Both sides are straight-alpha readings, so the ceiling is the canvas
+    // round trip's, carried up by the 255/a the un-premultiply applies.
+    const bound = Math.min(255, (127.5 / a + 0.5) * (255 / a) + 1);
+    for (let b = 0; b < bands.length; b++) {
+      if (a < bands[b].min || a > bands[b].max) continue;
+      const band = measured[b];
+      band.pixels++;
+      sums[b] += error;
+      if (error > band.maxError) band.maxError = error;
+      if (error > bound) band.overBound++;
+      break;
+    }
+  }
+  for (let b = 0; b < measured.length; b++) {
+    const band = measured[b];
+    band.meanError = band.pixels ? Math.round((sums[b] / band.pixels) * 1000) / 1000 : 0;
+  }
+
+  for (const url of Object.values(sources)) URL.revokeObjectURL(url);
+  return { straight: straight.sample, pma: pma.sample, bands: measured, maxAlphaError };
+}
+
+export interface PmaDerivationProbeResult {
+  /** Derivations a straight-alpha load and two renderers cause: must be 0. */
+  straightDerivations: number;
+  /** The same over a premultiplied page: must be 1, shared by all three. */
+  pmaDerivations: number;
+  /** Both backends must have actually run, or the count proves less. */
+  backendsActive: string[];
+  meshesDrawn: number[];
+}
+
+/**
+ * One derivation per page image, whoever asks for it.
+ *
+ * `unpackRegions` and every renderer on both backends go over the same
+ * premultiplied page; the counter must move by exactly one. Each run uses its
+ * own freshly loaded page element, so the weak cache starts empty however many
+ * probes ran before this one.
+ */
+async function pmaDerivationProbe(): Promise<PmaDerivationProbeResult> {
+  const atlasText = await (await fetch('/spineboy/spineboy.atlas')).text();
+  const twin = await pmaTwinPage(1);
+  const root = document.createElement('div');
+  root.style.cssText = 'position: absolute; left: 0; top: 0; visibility: hidden';
+  document.body.append(root);
+  const backendsActive: string[] = [];
+  const meshesDrawn: number[] = [];
+
+  async function run(variant: 'straight' | 'pma'): Promise<number> {
+    // A fresh element: the cache is keyed by the image, so a page another probe
+    // already derived would make this count nothing.
+    const image = await loadImage(variant === 'pma' ? twin.url : '/spineboy/spineboy.png');
+    const atlas = new TextureAtlas(variant === 'pma' ? withPmaFlag(atlasText) : atlasText);
+    const pageImages = new Map<string, HTMLImageElement>();
+    for (const page of atlas.pages) {
+      page.setTexture(new DomTexture(image));
+      pageImages.set(page.name, image);
+    }
+
+    const before = straightAlphaDerivations();
+    const regionImages = await unpackRegions(atlas, pageImages);
+    const data = await loadSkeletonJson({ atlas }, '/spineboy/spineboy-pro.json');
+    const skeleton = new Skeleton(data);
+    const state = new AnimationState(new AnimationStateData(data));
+    state.setAnimation(0, 'walk', true);
+    state.update(1.2);
+    state.apply(skeleton);
+    skeleton.update(1.2);
+    skeleton.updateWorldTransform(Physics.update);
+
+    const renderers = (['canvas2d', 'webgl'] as const).map((backend) => {
+      const renderer = new SpineHtmlRenderer(root, regionImages);
+      renderer.meshBackend = backend;
+      renderer.render(skeleton);
+      if (variant === 'pma') {
+        backendsActive.push(renderer.meshBackendActive);
+        meshesDrawn.push(renderer.meshCount);
+      }
+      return renderer;
+    });
+    const derivations = straightAlphaDerivations() - before;
+
+    for (const renderer of renderers) renderer.dispose();
+    root.replaceChildren();
+    revokeRegions(regionImages);
+    return derivations;
+  }
+
+  const straightDerivations = await run('straight');
+  const pmaDerivations = await run('pma');
+  root.remove();
+  return { straightDerivations, pmaDerivations, backendsActive, meshesDrawn };
+}
+
+/**
+ * A capturable stage for the same pose drawn from a straight page and from its
+ * premultiplied twin.
+ *
+ * Same geometry, same skeleton, same backend: the only variable is which alpha
+ * convention the page's texels are in and whether the atlas says so. Correctly
+ * handled, the two captures are the same picture — every difference left is the
+ * 8-bit un-premultiply at low alpha (see pmaFixtureProbe for its ceiling).
+ *
+ * `skeleton: 'ess'` is region attachments only, so it exercises the rigid tier
+ * (cuts in <img>); `'pro'` carries the meshes, on whichever backend is asked
+ * for. The specs screenshot `#pma-stage` between calls, so each call opens by
+ * tearing down what the previous one left.
+ */
+export interface PmaStageOptions {
+  /** Which page: the one that ships, or its premultiplied twin + `pma: true`. */
+  page: 'straight' | 'pma';
+  /** 'ess' = rigid tier only, 'pro' = mesh tier. */
+  skeleton: 'ess' | 'pro';
+  backend: 'canvas2d' | 'webgl';
+  animation: string;
+  time: number;
+  /** Page image resolution, as a multiple of the declared size. 1 = as shipped. */
+  pageScale: number;
+}
+
+export interface PmaStageResult {
+  /** What the atlas parsed to — the flag has to have arrived. */
+  pagePma: boolean;
+  pageSize: { width: number; height: number };
+  /** Rigid slots and mesh canvases in the root. */
+  imageCount: number;
+  canvasCount: number;
+  /** The backend that actually rasterized, and how many meshes it drew. */
+  backendActive: string;
+  meshesDrawn: number;
+  /** Union of the slot boxes, in stage coordinates — the stage must contain it. */
+  contentBox: { x: number; y: number; width: number; height: number };
+}
+
+const PMA_STAGE = {
+  width: 400,
+  height: 440,
+  originX: 180,
+  originY: 420,
+  scale: 0.5,
+  background: '#14161a',
+};
+
+let pmaStageEl: HTMLDivElement | null = null;
+let pmaLive: SpineHtmlRenderer | null = null;
+
+/** Atlas, region bitmaps and skeleton data for one page variant. */
+interface PmaScene {
+  atlas: TextureAtlas;
+  regionImages: Map<string, RegionImage>;
+  data: SkeletonData;
+}
+
+/**
+ * Scenes by page variant, scale and skeleton, built once per document.
+ *
+ * Above all the bitmaps: unpacking per call would hand every capture a blob the
+ * compositor has never rastered, and chromium raises the raster quality of a
+ * scaled image a frame or two after its first paint (the cut-rule stage
+ * measures that at 23,612 pixels). Cold-against-warm is then a difference
+ * between *captures*, not between pages. Kept for the document's lifetime on
+ * purpose: the bitmaps are the cache — and re-reading the skeleton export per
+ * capture was the rest of the wall clock.
+ */
+const pmaScenes = new Map<string, Promise<PmaScene>>();
+
+function pmaScene(options: PmaStageOptions): Promise<PmaScene> {
+  const key = `${options.page}@${options.pageScale}@${options.skeleton}`;
+  const cached = pmaScenes.get(key);
+  if (cached) return cached;
+  const built = (async (): Promise<PmaScene> => {
+    const { atlasText } = await cutRuleAssets();
+    const image =
+      options.page === 'pma'
+        ? (await pmaTwinPage(options.pageScale)).image
+        : await cutRulePageImage(options.pageScale);
+    const atlas = new TextureAtlas(options.page === 'pma' ? withPmaFlag(atlasText) : atlasText);
+    const pageImages = new Map<string, HTMLImageElement>();
+    for (const page of atlas.pages) {
+      page.setTexture(new DomTexture(image));
+      pageImages.set(page.name, image);
+    }
+    const regionImages = await unpackRegions(atlas, pageImages);
+    const data = await loadSkeletonJson({ atlas }, `/spineboy/spineboy-${options.skeleton}.json`);
+    return { atlas, regionImages, data };
+  })();
+  pmaScenes.set(key, built);
+  return built;
+}
+
+function pmaStageElement(): HTMLDivElement {
+  if (pmaStageEl) return pmaStageEl;
+  const stage = document.createElement('div');
+  stage.id = 'pma-stage';
+  stage.style.cssText =
+    `position: absolute; left: 0; top: 0; overflow: hidden;` +
+    `width: ${PMA_STAGE.width}px; height: ${PMA_STAGE.height}px;` +
+    `background: ${PMA_STAGE.background};`;
+  document.body.append(stage);
+  pmaStageEl = stage;
+  return stage;
+}
+
+async function pmaStage(options: PmaStageOptions): Promise<PmaStageResult> {
+  if (pmaLive) {
+    pmaLive.dispose();
+    pmaLive = null;
+  }
+
+  const { atlas, regionImages, data } = await pmaScene(options);
+  const image = atlas.pages[0]?.texture?.getImage() as HTMLImageElement;
+
+  const stage = pmaStageElement();
+  stage.replaceChildren();
+  const root = document.createElement('div');
+  root.style.cssText =
+    `position: absolute; left: ${PMA_STAGE.originX}px; top: ${PMA_STAGE.originY}px;` +
+    `transform-origin: 0 0; transform: scale(${PMA_STAGE.scale});`;
+  stage.append(root);
+
+  const skeleton = new Skeleton(data);
+  const state = new AnimationState(new AnimationStateData(data));
+  state.setAnimation(0, options.animation, true);
+  state.update(options.time);
+  state.apply(skeleton);
+  skeleton.update(options.time);
+  skeleton.updateWorldTransform(Physics.update);
+  const renderer = new SpineHtmlRenderer(root, regionImages);
+  renderer.meshBackend = options.backend;
+  // The stage is drawn at half scale, so raster at the resolution it shows at.
+  renderer.pixelRatio = (window.devicePixelRatio || 1) * PMA_STAGE.scale;
+  renderer.render(skeleton);
+  pmaLive = renderer;
+
+  const images = [...root.querySelectorAll('img')];
+  await Promise.all(images.map((img) => img.decode().catch(() => {})));
+  // Same settling as the cut-rule stage: a freshly decoded bitmap is not yet a
+  // settled raster, and a capture mid-escalation reads as a difference.
+  for (let frame = 0; frame < 8; frame++) {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+  }
+
+  const stageBox = stage.getBoundingClientRect();
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const el of root.children) {
+    const box = el.getBoundingClientRect();
+    minX = Math.min(minX, box.left - stageBox.left);
+    minY = Math.min(minY, box.top - stageBox.top);
+    maxX = Math.max(maxX, box.right - stageBox.left);
+    maxY = Math.max(maxY, box.bottom - stageBox.top);
+  }
+  const round = (value: number): number => Math.round(value * 100) / 100;
+
+  return {
+    pagePma: atlas.pages[0]?.pma ?? false,
+    pageSize: { width: image.naturalWidth, height: image.naturalHeight },
+    imageCount: images.length,
+    canvasCount: root.querySelectorAll('canvas').length,
+    backendActive: renderer.meshBackendActive,
+    meshesDrawn: renderer.meshCount,
+    contentBox: {
+      x: round(minX),
+      y: round(minY),
+      width: round(maxX - minX),
+      height: round(maxY - minY),
+    },
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
   passThroughProbe,
@@ -3221,4 +3993,8 @@ window.spineHtmlHarness = {
   clipCountersProbe,
   clipInverseProbe,
   cutRuleStage,
+  pmaFixtureProbe,
+  pmaCutProbe,
+  pmaDerivationProbe,
+  pmaStage,
 };

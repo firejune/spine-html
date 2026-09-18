@@ -299,6 +299,43 @@ what the atlas declares, so a page declared at a size its artwork was not
 packed at reads every region from the wrong place in both tiers — correct the
 `size:` line, which is what every other Spine runtime needs too.
 
+### Premultiplied pages (`pma: true`)
+
+The Spine texture packer premultiplies alpha by default, and says so with a page
+line:
+
+```
+hero.png
+size: 2048, 2048
+pma: true
+```
+
+Such a page's RGB is already multiplied by its alpha, and nothing is asked of
+you: the flag is read off the atlas and each tier is handed the page in the
+convention it actually consumes. The `webgl` mesh backend uploads the texels
+unconverted (its blend already expects premultiplied source — lossless). The DOM
+and canvas2d tiers cannot: an `<img>` and `drawImage` composite straight alpha by
+definition, so they read a straight-alpha derivation of the page —
+`rgb = round(rgb * 255 / a)`, computed once and shared by the region cuts and
+the mesh raster. Without it every semi-transparent texel is multiplied by its
+alpha a second time and draws darker than it was authored: soft edges, soft
+shadows, glows.
+
+What it costs: **one page-sized canvas per premultiplied page image**
+(width × height × 4 bytes — 1 MiB for a 1024×256 page, 16 MiB for a 2048×2048
+one), alive as long as you hold the page image and released with it; the cache
+is weak, so there is nothing to free by hand. A page with no `pma:` line derives
+nothing and takes exactly the path it always did. The division is 8-bit and
+starts from
+a canvas read, which has itself quantized a premultiplied texel, so a very
+transparent texel can land a few levels off — exact at alpha 0 and 255, within
+one level of 255 above alpha 128, worst ~12 around alpha 11, where the texel is
+~4% opaque. The `webgl` backend, having no such step, is exact.
+
+One consequence worth knowing if your atlas is one part per page: a whole-page
+region on a premultiplied page is **cut** rather than handed through, because
+the page's own URL holds premultiplied pixels (see below).
+
 ### What unloading frees
 
 `revokeRegions()` — and `assets.dispose()`, which just calls it — frees the blob
@@ -358,7 +395,11 @@ flag. Two things to know:
 - Regions like these cover their whole page, so `unpackRegions` hands the page
   image straight through instead of cutting and re-encoding it — at any image
   resolution, since covering the page is a statement about the declared size.
-  Load cost for this atlas shape is just the image loads.
+  Load cost for this atlas shape is just the image loads. The exception is a
+  page marked `pma: true`: its URL holds premultiplied pixels, which an `<img>`
+  would composite as straight alpha, so those regions are cut from the
+  straight-alpha derivation like any other (and the blob is revoked by
+  `revokeRegions` like any other).
 
 For a **rigid-only** skeleton you can skip atlas unpacking altogether and hand
 the renderer a map you build yourself — meshes cannot, because the deform tier

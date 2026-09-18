@@ -53,6 +53,25 @@ README.md for architecture and measured numbers.
   page. The page's declared size missing or zero still means "the image is its
   own declared size". `tests/regions.spec.ts` holds it, on artwork painted
   three times at 0.5×/1×/2× rather than resampled.
+- **Alpha convention is per tier, keyed off `page.pma`** (#37). The exporter
+  premultiplies by default, so most consumer atlases carry `pma: true` and the
+  file's RGB is already multiplied by its alpha. GL then uploads it *without*
+  `UNPACK_PREMULTIPLY_ALPHA_WEBGL` (its blend already wants premultiplied
+  source — lossless); the DOM and canvas2d tiers cannot take it at all, since
+  an `<img>` and `drawImage` composite straight alpha by definition, so they
+  read one weakly-cached un-premultiplied derivation per page image, shared by
+  the region cuts and the canvas2d mesh raster (`straightAlphaSource` in
+  DomTexture.ts). Deriving per consumer, or per frame, is the thing to not do.
+  The whole-page pass-through never fires for a `pma` page — its URL holds
+  premultiplied pixels and would go straight into an `<img>`. The caller's
+  image is never mutated, and the derivation is weak, so it needs no free.
+  The un-premultiply is 8-bit and starts from a canvas read that has already
+  quantized the texel, so it carries a residue no rewrite of the arithmetic
+  removes: `min(a, 127.5/a + 0.5)` of 255 — zero at alpha 0 and 255, ≤ 1 above
+  128, worst ~12 around alpha 11. `tests/pma.spec.ts` holds that ceiling per
+  alpha band and holds the direction, which is the part that matters: a doubled
+  premultiply can only darken, so the tests count darker and lighter pixels
+  separately rather than totalling them.
 - **The canvas2d path draws a per-triangle source sub-rect, never the whole
   page.** Linux WebKit garbles whole-page `drawImage` under steep per-triangle
   affines — measured (displaced texture on head/goggles/foot triangles while

@@ -10,7 +10,7 @@ import {
   type SlotPose,
   type TextureAtlasRegion,
 } from '@esotericsoftware/spine-core';
-import type { RegionImage } from './DomTexture.js';
+import { type PageSource, type RegionImage, straightAlphaSource } from './DomTexture.js';
 import { getMeshGlBlitter, type MeshBlitJob } from './MeshGlBlitter.js';
 
 /** Rasterizer used for the mesh (deform) tier. */
@@ -447,7 +447,16 @@ export class SpineHtmlRenderer {
         for (let i = 0; i < this.pendingJobs.length; i++) {
           const job = this.pendingJobs[i];
           this.pendingViews[i].meshBackendDrawn = 'canvas2d';
-          this.rasterizeMesh2d(job.canvas, job.page, job.vertices, job.uvs, job.triangles, job.ratio);
+          this.rasterizeMesh2d(
+            job.canvas,
+            // The 2d path wants straight alpha where the upload wanted it
+            // premultiplied; the derivation is cached, so this costs a lookup.
+            straightAlphaSource(job.page, job.pma),
+            job.vertices,
+            job.uvs,
+            job.triangles,
+            job.ratio,
+          );
         }
       }
       this.pendingJobs.length = 0;
@@ -550,10 +559,14 @@ export class SpineHtmlRenderer {
     const sequenceIndex = sequence.resolveIndex(pose);
     const region = sequence.regions[sequenceIndex] as TextureAtlasRegion | null;
     const page = region?.texture?.getImage() as HTMLImageElement | undefined;
-    if (!page) {
+    if (!region || !page) {
       this.hide(slot);
       return;
     }
+    // Which alpha convention the page's texels are in. The two backends consume
+    // opposite ones — GL wants them premultiplied, `drawImage` wants them
+    // straight — so this decides what each is handed, never what it does.
+    const pma = region.page.pma;
 
     const count = attachment.worldVerticesLength;
     if (this.scratchVertices.length < count) this.scratchVertices = new Float32Array(count);
@@ -668,6 +681,7 @@ export class SpineHtmlRenderer {
         this.pendingJobs.push({
           canvas,
           page,
+          pma,
           vertices: rel,
           uvs,
           triangles,
@@ -678,7 +692,7 @@ export class SpineHtmlRenderer {
         this.pendingViews.push(view);
         this.retainPage(page);
       } else {
-        this.rasterizeMesh2d(canvas, page, rel, uvs, triangles, ratio);
+        this.rasterizeMesh2d(canvas, straightAlphaSource(page, pma), rel, uvs, triangles, ratio);
       }
       this.meshCount++;
       this.triangleCount += triangles.length / 3;
@@ -708,7 +722,7 @@ export class SpineHtmlRenderer {
   /** The canvas2d raster path: clear the backing, map each triangle. */
   private rasterizeMesh2d(
     canvas: HTMLCanvasElement,
-    page: HTMLImageElement,
+    page: PageSource,
     vertices: Float64Array,
     uvs: ArrayLike<number>,
     triangles: ArrayLike<number>,
@@ -727,7 +741,9 @@ export class SpineHtmlRenderer {
     // [0, size] and texel i covers [i, i+1). drawImage-under-a-transform and
     // texture2D() both read that frame, so both backends land on the same
     // source pixels. (No half-texel term: the affine below *maps* corners, it
-    // does not sample — see drawTriangle.)
+    // does not sample — see drawTriangle.) `page` is the page image, or its
+    // straight-alpha derivation on a premultiplied one; the derivation is the
+    // image's own natural size, so the frame is the same either way.
     const uw = page.width;
     const uh = page.height;
     for (let t = 0; t < triangles.length; t += 3) {
@@ -803,7 +819,7 @@ export class SpineHtmlRenderer {
    * class of offset the `uv * size` addressing removes.
    */
   private drawTriangle(
-    ctx: CanvasRenderingContext2D, img: HTMLImageElement,
+    ctx: CanvasRenderingContext2D, img: PageSource,
     x0: number, y0: number, u0: number, v0: number,
     x1: number, y1: number, u1: number, v1: number,
     x2: number, y2: number, u2: number, v2: number,
