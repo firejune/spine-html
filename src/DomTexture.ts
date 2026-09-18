@@ -253,7 +253,8 @@ interface CutPlan {
  * `height × width` rect on the page — which is how spine-core reads it too
  * (`u2 = (x + height) / page.width` when `degrees === 90`). The cut canvas is
  * the rect turned back upright, so the bitmap comes out in artwork
- * orientation.
+ * orientation. *Which way* back is `cutRegion`'s, derived there from the UVs
+ * spine-core assigns such a region and not from this plan.
  *
  * Rounding: each *edge* is rounded to the nearest image pixel, rather than the
  * width being rounded on its own. Neighbouring regions share an edge, so
@@ -388,9 +389,39 @@ async function cutRegion(
 
   if (region.degrees === 90) {
     // The region is packed rotated. Turn the destination frame back so the
-    // source rect, drawn at its own size, lands upright and fills the canvas.
-    ctx.translate(0, plan.ch);
-    ctx.rotate(-Math.PI / 2);
+    // source rect, drawn at its own size, lands upright and fills the canvas —
+    // and turn it *clockwise*, which is derived from spine-core's UVs rather
+    // than from anything this file does.
+    //
+    // `TextureAtlas` takes `u`/`v` from the packed rect's top-left corner and,
+    // at `degrees === 90`, `u2`/`v2` from `x + height` / `y + width` — the
+    // rect's far edges. `RegionAttachment` then hands the artwork's corners out
+    // in the rigid tier's own order, BL, UL, UR, BR, as
+    //
+    //   BL (u2, v2)   UL (u, v2)   UR (u, v)   BR (u2, v)
+    //
+    // so the artwork's top-left corner is the packed rect's *bottom-left* and
+    // its top-right is the rect's *top-left*: the artwork's top edge runs up
+    // the rect's left edge, which is a packer that turned it counter-clockwise.
+    //
+    // `translate(cw, 0); rotate(+π/2)` maps a pixel (x, y) of the source rect —
+    // sw × sh on the page, and cw = sh, ch = sw — to canvas (cw − y, x), which
+    // is that turn undone:
+    //
+    //   packed bottom-left  (0, sh)   → (0, 0)    the cut's top-left     = UL
+    //   packed top-left     (0, 0)    → (cw, 0)   the cut's top-right    = UR
+    //   packed top-right    (sw, 0)   → (cw, ch)  the cut's bottom-right = BR
+    //   packed bottom-right (sw, sh)  → (0, ch)   the cut's bottom-left  = BL
+    //
+    // Until #49 this was `translate(0, ch); rotate(−π/2)`, mapping (x, y) to
+    // (y, ch − x): a *second* counter-clockwise turn, landing the artwork's
+    // top-left at the cut's bottom-right. The bitmap came out 180° round, and
+    // since `renderRegion` pins a bitmap's top-left to the attachment's UL
+    // corner either way, every rotated rigid part was drawn inverted — from the
+    // first commit of this package to 0.7.0. The mesh tier never was: it
+    // samples the page through the UVs above.
+    ctx.translate(plan.cw, 0);
+    ctx.rotate(Math.PI / 2);
   }
   // Straight alpha on a premultiplied page, since the cut is encoded to a PNG
   // and shown in an <img>. The rect was planned against the image, and the

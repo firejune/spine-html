@@ -166,3 +166,55 @@ test('spine-core region corner order stays BL, UL, UR, BR', () => {
 
   expect(Array.from(world)).toEqual(CORNERS);
 });
+
+test("spine-core puts a rotated region's artwork top-left at the packed rect's bottom-left", () => {
+  // The other half of the same read, and the source the rigid cut's rotation is
+  // derived from (#49): the corner *order* is BL, UL, UR, BR (above), and these
+  // are the UVs that order carries when the packer stored the region turned.
+  // Written down here, against whichever core is installed, because the cut
+  // must never derive its transform from itself — a reference that shares the
+  // convention agrees with the code under test whichever way both are wrong.
+  const region = new TextureRegion();
+  // Distinct, asymmetric, and exact in f32 (the 4.3 path fills a Float32Array):
+  // u is told from u2, v from v2, and neither axis from the other, so a
+  // transposed or half-turned assignment cannot match by accident.
+  region.u = 0.125;
+  region.v = 0.25;
+  region.u2 = 0.5;
+  region.v2 = 0.875;
+  region.width = 2;
+  region.height = 1;
+  region.originalWidth = 2;
+  region.originalHeight = 1;
+  region.offsetX = 0;
+  region.offsetY = 0;
+  region.degrees = 90;
+
+  // BL (u2, v2), UL (u, v2), UR (u, v), BR (u2, v). So the artwork's top-left
+  // corner (UL) carries the packed rect's near u and its far v — the rect's
+  // bottom-left — and the artwork's top edge, UL → UR, runs *up* the rect's
+  // left edge. Unpacking such a rect is therefore a clockwise turn, which is
+  // what `cutRegion` in src/DomTexture.ts does and writes out.
+  const ROTATED_UVS = [0.5, 0.875, 0.125, 0.875, 0.125, 0.25, 0.5, 0.25];
+
+  if (POSE_CORE_INSTALLED) {
+    const offsets: number[] = new Array<number>(8).fill(0);
+    const uvs = new Float32Array(8);
+    RegionAttachment.computeUVs(region, 0, 0, 1, 1, 0, 2, 1, offsets, uvs);
+    expect(Array.from(uvs)).toEqual(ROTATED_UVS);
+    // Packing is a fact about the page, not about the pose: the same corners
+    // come out in world space either way, only the texels they carry move.
+    expect(offsets).toEqual([-1, -0.5, -1, 0.5, 1, 0.5, 1, -0.5]);
+  } else {
+    const attachment = new (RegionAttachment as unknown as new (
+      name: string,
+      path: string,
+    ) => AnyRegionAttachment)('rotated-probe', 'rotated-probe');
+    attachment.region = region;
+    attachment.width = 2;
+    attachment.height = 1;
+    attachment.updateRegion();
+    expect(Array.from(attachment.uvs)).toEqual(ROTATED_UVS);
+    expect(Array.from(attachment.offset)).toEqual([-1, -0.5, -1, 0.5, 1, 0.5, 1, -0.5]);
+  }
+});
