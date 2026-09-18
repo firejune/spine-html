@@ -24,9 +24,18 @@ export interface RegionImage {
    * whole page, or anything the caller put there in a hand-built map.
    */
   url: string;
-  /** Unpacked width in atlas pixels. */
+  /**
+   * Unpacked width in **atlas units** — the region's own `width`, not the
+   * bitmap's pixel width. The two differ whenever the page image ships at a
+   * resolution its atlas `size:` line does not mention (see cutRegion): a
+   * half-resolution page yields a bitmap half this wide. This is the layout
+   * box the rigid tier writes onto its `<img>` and the denominator of the CSS
+   * matrix it builds, so it stays in the frame the skeleton is authored in
+   * and the browser scales the bitmap into it — the same thing a GPU does
+   * when it samples normalized UVs from a texture of any resolution.
+   */
   width: number;
-  /** Unpacked height in atlas pixels. */
+  /** Unpacked height in atlas units — see `width`. */
   height: number;
 }
 
@@ -50,9 +59,12 @@ function revokeOwned(url: string): void {
  * Backing pixels the cuts still waiting for their PNG encode may hold at once.
  *
  * A started cut keeps its canvas alive until `toBlob` calls back, so starting
- * every region at once peaks at Σ(region area) of canvas backing — on top of
- * the decoded pages, which stay resident throughout. Measured by counting the
- * simultaneously-alive cut canvases and their backing at `toBlob` (chromium):
+ * every region at once peaks at Σ(cut area) of canvas backing — on top of the
+ * decoded pages, which stay resident throughout. A cut is allocated at the
+ * page image's own resolution, so what is charged here is that area, not the
+ * region's atlas-unit area: a half-resolution page costs a quarter of it, an
+ * @2x page four times it. Measured by counting the simultaneously-alive cut
+ * canvases and their backing at `toBlob` (chromium, 1:1 pages):
  * the demo's 40-region 1024×256 atlas peaks at all 40 cuts and 194,742 px
  * (0.19 Mpx ≈ 0.74 MiB), which is nothing; a synthetic 256-region atlas on
  * four 2048×2048 pages peaks at 16.78 Mpx ≈ 64 MiB, which doubles that
@@ -68,9 +80,122 @@ function revokeOwned(url: string): void {
  */
 const CUT_BACKING_BUDGET_PX = 4 * 1024 * 1024;
 
+/** Where one region's pixels are on its page image, and how big its cut is. */
+interface CutPlan {
+  /** The region is its whole declared page, unrotated: hand the page through. */
+  passThrough: boolean;
+  /** Source rect on the page image, in the image's own pixels. */
+  sx: number;
+  sy: number;
+  sw: number;
+  sh: number;
+  /** Cut canvas size: that same rect, turned artwork-side up. */
+  cw: number;
+  ch: number;
+}
+
+/**
+ * Locates a region on its page image.
+ *
+ * **The rect is read in the image's own frame, not in declared atlas pixels.**
+ * An atlas `size:` line and the image that ships for the page need not agree:
+ * projects export textures at half resolution (or @2x) and leave the atlas
+ * alone. Every official Spine runtime absorbs that for free, because
+ * spine-core turns a region's bounds into *normalized* UVs against the
+ * declared page size (`region.u = region.x / page.width`) and a GPU samples
+ * normalized coordinates at whatever resolution the texture happens to have.
+ * So the rect here is the region's bounds relative to the declared page size,
+ * times the image's natural size — the continuous `uv * size` frame both mesh
+ * backends already address texels in. No `size - 1`, no half-texel term: this
+ * maps a rect, it does not sample.
+ *
+ * With a page that does ship at its declared size the scale is exactly 1 and
+ * every number below is the region's own integer bounds, unchanged.
+ *
+ * Rotation: a region packed at 90° lies on its side, so it occupies a
+ * `height × width` rect on the page — which is how spine-core reads it too
+ * (`u2 = (x + height) / page.width` when `degrees === 90`). The cut canvas is
+ * the rect turned back upright, so the bitmap comes out in artwork
+ * orientation.
+ *
+ * Rounding: each *edge* is rounded to the nearest image pixel, rather than the
+ * width being rounded on its own. Neighbouring regions share an edge, so
+ * rounding the edge keeps their cuts tiling the image exactly — no gap, no
+ * overlap, and at most half a pixel of either region's own content given up on
+ * a boundary that falls mid-pixel. Rounding outward would instead pull a whole
+ * neighbouring pixel into every cut on every side, which is bleed the caller
+ * can see. A rect that scales down below one pixel still gets a 1×1 bitmap,
+ * since a zero-sized canvas is not one.
+ */
+function planCut(region: TextureAtlasRegion, image: HTMLImageElement): CutPlan {
+  const iw = image.naturalWidth;
+  const ih = image.naturalHeight;
+  // A page with no `size:` line (or a malformed one) declares nothing, so the
+  // image is taken to be its own declared size — which is what this did for
+  // every page before the frame above existed.
+  const pageW = region.page.width > 0 ? region.page.width : iw;
+  const pageH = region.page.height > 0 ? region.page.height : ih;
+
+  const rotated = region.degrees === 90;
+  const packedW = rotated ? region.height : region.width;
+  const packedH = rotated ? region.width : region.height;
+
+  // Whole-page pass-through: an unrotated region covering its entire page
+  // would be cut into a pixel-for-pixel copy of the page image, so reuse the
+  // page URL instead — no canvas, no PNG re-encode, no second decoded copy in
+  // memory, and nothing to revoke afterwards. Atlases written as one part per
+  // page (the loose-part-PNG workflow, where every part is declared its own
+  // page) hit this for every single region.
+  //
+  // The test is against the declared page size, at any image resolution: a
+  // whole page is a whole page whether it ships at 1×, half or double, and the
+  // cut would copy the image either way. (It used to be tested against the
+  // image, which was the same rule as long as the two always agreed.)
+  if (!rotated && region.x === 0 && region.y === 0 && packedW === pageW && packedH === pageH) {
+    return { passThrough: true, sx: 0, sy: 0, sw: iw, sh: ih, cw: iw, ch: ih };
+  }
+
+  const scaleX = iw / pageW;
+  const scaleY = ih / pageH;
+  const x0 = Math.round(region.x * scaleX);
+  const y0 = Math.round(region.y * scaleY);
+  const sw = Math.max(1, Math.round((region.x + packedW) * scaleX) - x0);
+  const sh = Math.max(1, Math.round((region.y + packedH) * scaleY) - y0);
+
+  return {
+    passThrough: false,
+    sx: x0,
+    sy: y0,
+    sw,
+    sh,
+    cw: rotated ? sh : sw,
+    ch: rotated ? sw : sh,
+  };
+}
+
+/** Backing pixels one cut allocates — the charge against the budget above. */
+function cutBackingPixels(
+  region: TextureAtlasRegion,
+  pageImages: Map<string, HTMLImageElement>,
+): number {
+  const image = pageImages.get(region.page.name);
+  // No image: this region is about to fail in the cut. Charging its atlas
+  // units keeps the walk moving until it does.
+  if (!image) return region.width * region.height;
+  const plan = planCut(region, image);
+  return plan.cw * plan.ch;
+}
+
 /**
  * One region's bitmap: the whole-page pass-through, or a cut canvas encoded to
  * a blob URL this module then owns.
+ *
+ * The cut is a **1:1 copy of the source rect** planCut located — never a
+ * resample — so the bitmap has the native resolution of those pixels, while
+ * the `RegionImage` sizes reported alongside it stay in atlas units. A page
+ * shipped at half resolution therefore costs a quarter of the cut pixels and
+ * still poses identically; upscaling the cut back to declared size would only
+ * quadruple the pixels and add a resample.
  *
  * Everything before the `toBlob` await runs synchronously, so calling this is
  * what "starts" a cut: the canvas is painted and the encode is handed to the
@@ -85,42 +210,22 @@ async function cutRegion(
 
   const w = region.width;
   const h = region.height;
-
-  // Whole-page pass-through: an unrotated region covering its entire page
-  // would be cut into a pixel-for-pixel copy of the page image, so reuse
-  // the page URL instead — no canvas, no PNG re-encode, no second decoded
-  // copy in memory, and nothing to revoke afterwards. Atlases written as
-  // one part per page (the loose-part-PNG workflow, where every part is
-  // declared its own page) hit this for every single region.
-  //
-  // The test is against the image, not the atlas `size:` line: a page
-  // declared at the wrong size still goes through the cut, since the cut
-  // is what the region's coordinates actually describe.
-  if (
-    region.degrees === 0 &&
-    region.x === 0 &&
-    region.y === 0 &&
-    w === image.naturalWidth &&
-    h === image.naturalHeight
-  ) {
-    return { url: image.src, width: w, height: h };
-  }
+  const plan = planCut(region, image);
+  if (plan.passThrough) return { url: image.src, width: w, height: h };
 
   const canvas = document.createElement('canvas');
-  canvas.width = w;
-  canvas.height = h;
+  canvas.width = plan.cw;
+  canvas.height = plan.ch;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2d context unavailable');
 
   if (region.degrees === 90) {
-    // The region is packed rotated: it occupies an h×w rect in the page.
-    // Rotate it back so the bitmap is in artwork orientation.
-    ctx.translate(0, h);
+    // The region is packed rotated. Turn the destination frame back so the
+    // source rect, drawn at its own size, lands upright and fills the canvas.
+    ctx.translate(0, plan.ch);
     ctx.rotate(-Math.PI / 2);
-    ctx.drawImage(image, region.x, region.y, h, w, 0, 0, h, w);
-  } else {
-    ctx.drawImage(image, region.x, region.y, w, h, 0, 0, w, h);
   }
+  ctx.drawImage(image, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.sw, plan.sh);
 
   const blob = await new Promise<Blob>((resolve, reject) => {
     canvas.toBlob((b) => (b ? resolve(b) : reject(new Error('toBlob failed'))), 'image/png');
@@ -139,7 +244,23 @@ async function cutRegion(
  * rendering is pure DOM (one <img> per slot, one CSS matrix write per frame).
  *
  * A region that covers its whole page unrotated skips the cut and reuses the
- * page image URL — see the pass-through in cutRegion.
+ * page image URL — see the pass-through in planCut.
+ *
+ * **A page may ship at a resolution its atlas does not declare.** Half-size
+ * texture builds and @2x variants are normal, and no option is needed for
+ * them: a region's bounds are read relative to the declared page size and
+ * scaled onto the image's natural size, which is exactly how spine-core
+ * derives the UVs the mesh tier already samples with. Each bitmap comes out at
+ * the native resolution of the pixels it was cut from, and the `RegionImage`
+ * sizes beside it stay in atlas units, so nothing downstream has to know.
+ *
+ * *Behaviour change (0.5.1 → next).* An atlas whose `size:` line is simply
+ * wrong — bounds written in image pixels under a page declared some other size
+ * — used to be cut "as the coordinates say", because the cut read the image
+ * directly. It is now read the way every other Spine runtime reads it:
+ * relative to the declared size. Such an atlas rendered with a skewed mesh
+ * tier and an intact rigid tier before; now both tiers agree, and the fix is
+ * to correct the `size:` line.
  *
  * **The cuts run concurrently.** PNG encoding is asynchronous and the browser
  * does it off the main thread, so the encodes are started together and awaited
@@ -196,8 +317,8 @@ export async function unpackRegions(
     const region = regions[index];
     if (!region) continue;
     // A pass-through allocates no canvas, but it also resolves without waiting
-    // for anything, so charging it the region's area costs at most one drain.
-    const pixels = region.width * region.height;
+    // for anything, so charging it the page's area costs at most one drain.
+    const pixels = cutBackingPixels(region, pageImages);
 
     while (inFlight.length > 0 && inFlightPixels + pixels > CUT_BACKING_BUDGET_PX) {
       await Promise.race(inFlight.map((job) => job.promise));
