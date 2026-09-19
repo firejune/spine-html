@@ -10,6 +10,10 @@
     "url": "https://github.com/firejune/spine-html.git"
   },
   "homepage": "https://github.com/firejune/spine-html#readme",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/firejune"
+  },
   "bugs": "https://github.com/firejune/spine-html/issues",
   "keywords": [
     "spine",
