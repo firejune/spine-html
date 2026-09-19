@@ -9,13 +9,20 @@
     "rootDir": "src"
   },
   "include": ["src/**/*"],
-  // The demo entry lives in `src/` but is not part of the package: `index.html`
-  // loads it, nothing in the library imports it, and it is absent from the
-  // `exports` map. Left in this build it emitted anyway — `dist/main.*` shipped
-  // unreachable in 0.4.1 and 0.5.0. `exclude` only filters `include`, never a
-  // file that an included file imports, so this drops it from the package and
-  // from nothing else: `tsconfig.json` still typechecks it for `bun run build`,
-  // and vite still reads it from `index.html`. The emitted file list is pinned
-  // by `tests/package.spec.ts`.
-  "exclude": ["src/main.ts"]
+  // Two files live in `src/` but are not part of the package.
+  //
+  // `src/main.ts` is the demo entry: `index.html` loads it, nothing in the
+  // library imports it, and it is absent from the `exports` map. Left in this
+  // build it emitted anyway — `dist/main.*` shipped unreachable in 0.4.1 and
+  // 0.5.0. `src/coreOptional.ts` is the same category: the spine-core members
+  // that only *some* supported generations have, needed by everything that
+  // poses a skeleton (the demo, the harness, the oracle stage, the benchmark)
+  // and by nothing the library does.
+  //
+  // `exclude` only filters `include`, never a file that an included file
+  // imports, so this drops them from the package and from nothing else:
+  // `tsconfig.json` still typechecks both for `bun run build`, vite still
+  // reads them, and the day a shipped file imports one it is emitted again and
+  // the pinned file list in `tests/package.spec.ts` goes red.
+  "exclude": ["src/main.ts", "src/coreOptional.ts"]
 }

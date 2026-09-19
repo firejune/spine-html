@@ -52,9 +52,11 @@ printf '%s' "$BRANCH" > "$STAMP"
 # same bounds — so the same skeleton export reads against either. That is what
 # makes them the pixel oracle's premultiplied cell (tests/oracle.spec.ts): a real
 # `pma` page from the exporter, not a fixture this repository paints. They are
-# listed as required rather than best-effort because both branches of the CI
-# matrix ship them (checked on 4.2 and 4.3), so a 404 is a fact worth a loud
-# failure and not something to render around.
+# listed as required rather than best-effort because every branch of the CI
+# matrix ships them — all seven files below were checked on 4.0, 4.1, 4.2 and
+# 4.3 — so a 404 is a fact worth a loud failure and not something to render
+# around. If a future branch drops one, the cells that need it skip on the
+# file's absence and say so; they do not key on a version.
 for f in spineboy-ess.json spineboy-pro.json spineboy-pro.skel spineboy.atlas spineboy.png \
          spineboy-pma.atlas spineboy-pma.png; do
   if [ -s "$DEST/$f" ]; then

@@ -1,7 +1,6 @@
 import {
   AnimationState,
   AnimationStateData,
-  Physics,
   Skeleton,
   type SkeletonData,
   TextureAtlas,
@@ -12,6 +11,8 @@ import {
   SceneRenderer,
 } from '@esotericsoftware/spine-webgl';
 
+/** `Physics` is absent from 4.1's and 4.0's root entry — see `advance()`. */
+import { advanceSkeleton } from '../src/coreOptional';
 import { DomTexture, type RegionImage, unpackRegions } from '../src/DomTexture';
 import { loadSkeletonJson } from '../src/loadSkeletonAssets';
 import { type MeshBackend, SpineHtmlRenderer } from '../src/SpineHtmlRenderer';
@@ -187,8 +188,7 @@ function advance(players: Player[], delta: number): void {
   for (const player of players) {
     player.state.update(delta);
     player.state.apply(player.skeleton);
-    player.skeleton.update(delta);
-    player.skeleton.updateWorldTransform(Physics.update);
+    advanceSkeleton(player.skeleton, delta);
   }
 }
 

@@ -36,31 +36,79 @@ README.md for architecture and measured numbers.
   and older write `ik`/`transform`/`path`/`physics` (measured on a real-world
   corpus: 40% unparseable, 0 of 7,065 constraints loaded across the rest). So
   supporting 4.2 *data* means running on the 4.2 *runtime*, and the peer
-  dependency is how the consumer says which. The seam has two shapes: 4.3's pose
-  split (`drawOrder.appliedPose`, `slot.appliedPose`, `bone.appliedPose`,
-  `Sequence.resolveIndex`/`getUVs`, `RegionAttachment.getOffsets`, the `skeleton`
-  argument to `VertexAttachment.computeWorldVertices`, `ClippingAttachment.inverse`)
-  and the pre-4.3 one, where all of that sits on the slot, the bone and the
-  attachment. **The pre-4.3 shape therefore needs no wrapper object** — a `Slot`
-  *is* its own pose view, a `Bone` its own bone pose — which is what keeps the
-  seam out of the allocation path; do not "tidy" it into returning literals. The
-  shape is picked **once per renderer, from the live objects** (`drawOrder`
-  carrying an `appliedPose` array), never per slot by try/catch and never from a
-  version string, which a vendored copy need not carry. spine-core stays a single
-  4.3 devDependency and `dist/*.d.ts` keeps describing 4.3: the older shape is
-  typed by local structural interfaces reached through casts that never leave
-  that file, so `tsc --noEmit` is meaningful only in the typed column
-  (`SPINE_CORE_MINOR`, playwright.config.ts) while the *shipped* types are
+  dependency is how the consumer says which. The seam has three shapes, named
+  after the feature that moved rather than after a version (`CoreShape`):
+  `poses` is 4.3's pose split (`drawOrder.appliedPose`, `slot.appliedPose`,
+  `bone.appliedPose`, `Sequence.resolveIndex`/`getUVs`,
+  `RegionAttachment.getOffsets`, the `skeleton` argument to
+  `VertexAttachment.computeWorldVertices`, `ClippingAttachment.inverse`);
+  `sequences` is the pre-4.3 one (4.1, 4.2), where all of that sits on the slot,
+  the bone and the attachment; `pre-sequences` is 4.0, which is `sequences` with
+  **one** member replaced — `RegionAttachment.computeWorldVertices` took the
+  **bone** until 4.1 gave it the **slot**, because from 4.1 it may step a
+  sequence on the way. Nothing else the renderer reads moved: a 4.0 attachment
+  simply has no `sequence` and a 4.0 slot no `sequenceIndex`, and the shared
+  table already answers "no sequence" rather than reading an absent property, so
+  the third table is written as a spread of the second and not as a copy.
+  **The pre-4.3 shapes therefore need no wrapper object** — a `Slot` *is* its
+  own pose view, a `Bone` its own bone pose — which is what keeps the seam out
+  of the allocation path; do not "tidy" it into returning literals. The shape is
+  picked **once per renderer, from the live objects** (`drawOrder` carrying an
+  `appliedPose` array; then `updateRegion` on `RegionAttachment.prototype`,
+  which 4.1 introduced in the same release as the slot argument), never per slot
+  by try/catch and never from a version string, which a vendored copy need not
+  carry. Handing 4.0 a slot is the silent-and-total failure the 4.0 column
+  exists to catch: the method reads `worldX`/`a`/`b`/… off its argument, a
+  `Slot` has none of them, every rigid corner comes out `NaN`, nothing throws
+  and nothing draws — measured, 18 red cells, all of them in the oracle and the
+  clipping specs, while the parity suite stayed green because both backends were
+  equally wrong. One read that is **not** in the seam because it does not differ:
+  the mesh tier takes its page image from `region.page.texture`, never
+  `region.texture` — the latter is a 4.1-and-later convenience that 4.0 spells
+  `renderObject`, and the page is where the handle has always lived. spine-core
+  stays a single 4.3 devDependency and `dist/*.d.ts` keeps describing 4.3: the
+  older shapes are typed by local structural interfaces reached through casts
+  that never leave that file, so `tsc --noEmit` is meaningful only in the typed
+  column (`SPINE_CORE_MINOR`, playwright.config.ts) while the *shipped* types are
   checked against every column by `tests/package.spec.ts`. **Supported = a green
   CI column against that version's own exports**, and `peerDependencies` is that
   set and nothing wider — widening one without the other is the bug the matrix in
-  `.github/workflows/ci.yml` exists to prevent. Two upstream facts that are not
-  ours to fix and that decided the range: `Sequence` is absent from 4.2's root
-  entry (4.3 exports it), so a *value* import of it is a link error there — see
-  `tests/invariants.spec.ts`; and 4.1 and older ship extensionless relative
-  specifiers in their own `dist/`, so plain node cannot import 4.0 at all and
-  4.1's `.d.ts` fails a nodenext consumer typecheck — which is #16's defect, in
-  spine-core.
+  `.github/workflows/ci.yml` exists to prevent.
+- **spine-core members that only *some* supported generations have go through
+  `src/coreOptional.ts`, which ships nothing.** `Physics` is absent from the
+  root entry of 4.1 and 4.0 and `Sequence` from 4.2's and 4.1's, and a *named*
+  import of an export a core does not have is a **link error that fails the
+  whole build**, not a runtime `undefined` — that alone is why #40 left 4.1 and
+  4.0 out. So they are read by *string key* off the namespace object: written
+  out as `core.Physics` a bundler resolves the member statically and warns
+  `"Physics" is not exported by …` on every build against those two, which is
+  true of the core and misleading about this code. That file also owns
+  `advanceSkeleton`, the pose call the difference reaches (`skeleton.update` is
+  4.2's physics step and does not exist on 4.1; `updateWorldTransform` takes a
+  `Physics` from 4.2 and took nothing before). It is **excluded from
+  `tsconfig.build.json`** next to `src/main.ts`, because nothing the library
+  does poses a skeleton — only the demo, the harness, the oracle stage and the
+  benchmark do. If a shipped file ever imports it, it is emitted again and the
+  pinned file list in `tests/package.spec.ts` goes red, which is the guard.
+- **Two upstream packaging defects bound what the *tests* can assert, and they
+  are probed rather than keyed on a version** (spine-core's issue #16; invisible
+  to every bundler and to esm.sh, which is how these runtimes are consumed).
+  **4.0** ships extensionless relative specifiers *and* no `"type": "module"`,
+  so plain node cannot import it — while its `.d.ts` typechecks clean under
+  nodenext, since TypeScript reads a package without `"type"` as CommonJS.
+  **4.1** is the mirror image: node imports it fine, and one extensionless
+  specifier in its own `dist/SkeletonData.d.ts` is a TS2835 under nodenext with
+  `skipLibCheck` off. `tests/package.spec.ts` measures the **installed peer by
+  itself** — one child node process importing only the peer, one tsc run over a
+  consumer importing only the peer — and skips exactly the one assertion each
+  takes away, with that reason. Everything not needing the peer (the `exports`
+  map, the emitted file set, the import walk, "nothing shipped names
+  spine-webgl") runs everywhere, and the 4.3 and 4.2 columns skip neither.
+  The same defect is why **no spec file may import spine-core at module scope**:
+  Playwright resolves a spec's imports with node's own resolver, so on the 4.0
+  column that is not a skipped test, it is a run that never starts. The probes
+  that have to *construct* spine-core objects therefore live in
+  `tests/harness.ts` and are asserted from the browser.
 - **An export under any runtime but its own generation's is never a supported
   combination, and a clean parse is not evidence that it is.** Each
   generation's `SkeletonJson` simply stops looking for keys the format dropped:
@@ -76,11 +124,16 @@ README.md for architecture and measured numbers.
   consumes** against the keys the exports contain — not parsing, not counting,
   not rendering without an error.
 - Rigid-tier corner order from `computeWorldVertices` is **BL, UL, UR, BR**
-  (verified by execution on 4.2.98, 4.2.120 and 4.3.13; the br/bl/ul/ur comments
-  inside the upstream function are stale). A node-side test guards this against
-  upstream reorderings, on both generations — it is the one place that has to
-  *construct* spine-core objects rather than read them, and the constructors
-  differ where the seam's reads do not, so it detects the shape itself.
+  (verified by execution on 4.0.31, 4.1.56, 4.2.98, 4.2.120 and 4.3.13; the
+  br/bl/ul/ur comments inside the upstream function are stale). A test guards
+  this against upstream reorderings, on every generation — it is the one place
+  that has to *construct* spine-core objects rather than read them, and the
+  constructors differ where the seam's reads do not (4.3 computes the offsets
+  and UVs into caller arrays; 4.1 and 4.2 write them with `updateRegion()`; 4.0
+  splits that into `setRegion()` for the UVs and `updateOffset()` for the
+  offsets), so it detects the shape itself. The construction lives in
+  `tests/harness.ts` and the expectation in `tests/invariants.spec.ts`: it was
+  node-side until the 4.0 column, which plain node cannot load at all.
 - **Both raster backends address texels as `uv * size`**, the continuous frame
   where the page spans `[0, size]` — `drawImage` under an affine and
   `texture2D()` read the same frame. `uv * (size - 1)` (a discrete
@@ -322,9 +375,13 @@ README.md for architecture and measured numbers.
   `dependencies` nor `peerDependencies`. A column of the CI matrix installs the
   **matching generation** of it alongside its core, in one `bun add --no-save`
   so the pinned pair cannot resolve apart and strand a nested second spine-core
-  under spine-webgl. The reference's own 4.2/4.3 seam is four lines, read off
-  the live object like `src/coreCompat.ts` does: 4.2 takes the alpha convention
-  on `drawSkeleton` and 4.3 on `GLTexture`.
+  under spine-webgl. The reference's own seam is four lines, read off the live
+  object like `src/coreCompat.ts` does: 4.3 takes the alpha convention on
+  `GLTexture` and everything before it on `drawSkeleton`. That branch covers
+  4.0 and 4.1 unchanged — `SceneRenderer`, `ManagedWebGLRenderingContext`,
+  `GLTexture`, `camera`, `batcher.getDrawCalls()` and
+  `skeletonRenderer.premultipliedAlpha` are the same there as on 4.2 (checked
+  against 4.0.31 and 4.1.56), so the new columns needed nothing added to it.
 - Rendering is tested through the demo; the **loading path is tested through
   `tests/harness.html`** (a second vite build entry that exposes the library on
   `window.spineHtmlHarness`). Blob-URL ownership has no visual signature, so
@@ -342,7 +399,9 @@ README.md for architecture and measured numbers.
   exact set of files that build emits, because an unreachable file has no other
   signature: `src/main.ts` is the demo's entry, `tsconfig.build.json` compiled
   all of `src/`, and so `dist/main.*` shipped in 0.4.1 and 0.5.0 without any
-  resolver, import walk or consumer ever noticing (#24).
+  resolver, import walk or consumer ever noticing (#24). That pinned list is
+  also what keeps `src/coreOptional.ts` out of the package — see its bullet
+  above.
 - Keep `@playwright/test` pinned to a version whose browser revisions match the
   machine's `~/Library/Caches/ms-playwright` before bumping it.
 - **CI runs the whole suite once per supported spine-core minor**, each column
@@ -361,15 +420,25 @@ README.md for architecture and measured numbers.
   *while the run is starting*. The column then puts the 4.2 runtime in front of
   4.3 data, which is the one thing it was not meant to measure, and the red it
   produces looks like anything but an assets swap (the loading specs go first).
-  CI does not hit this because the matrix sets both variables at job level. **Do not
-  fork an expectation per version to make a column green.** The spineboy export
-  is structurally identical on all four branches (52 slots, 66 region + 12 mesh +
-  1 clipping attachment, the same 11 animations including `portal`), so slot
-  counts, mesh counts and animation names need no keying at all; what genuinely
-  moves is the *pose*, which is why the part-mask cell's non-vacuity guard is a
-  proportion of drawn content rather than a pixel count — it alone clips with the
-  asset's own polygon. An absent *feature* gets a feature test, not a version key
-  (`INVERSE_CLIPPING` in `tests/clipping.spec.ts`).
+  CI does not hit this because the matrix sets both variables at job level. The
+  matrix is **4.3, 4.2, 4.1, 4.0** since #53; all seven files the fetch script
+  wants exist on all four spine-runtimes branches (checked), so nothing there
+  skips. **Do not fork an expectation per version to make a column green.** The
+  spineboy export is structurally identical on all four branches (52 slots, 66
+  region + 12 mesh + 1 clipping attachment, the same 11 animations including
+  `portal`), so slot counts, mesh counts and animation names need no keying at
+  all; what genuinely moves is the *pose*, which is why the part-mask cell's
+  non-vacuity guard is a proportion of drawn content rather than a pixel count —
+  it alone clips with the asset's own polygon. An absent *feature* gets a
+  feature test, not a version key (`inverseClippingSupported` in
+  `tests/clipping.spec.ts`, the peer probes in `tests/package.spec.ts`). What
+  the branches *do* differ in is the export format's own key names, and that is
+  asserted rather than assumed: `generationProbe` reads whichever key this
+  branch's file uses for bone inheritance (`transform` before 4.2, `inherit`
+  from 4.2) and for mesh deform (`deform` on 4.0, `attachments` from 4.1), and
+  requires what the file declares to have arrived in the parsed `SkeletonData` —
+  one assertion, no version table, and the only thing that distinguishes a
+  column running the matching runtime from one quietly dropping half the data.
 
 ## Workflow
 

@@ -21,6 +21,17 @@
 # (verified by the guard step). The repository keeps ONE spine-core
 # devDependency; nothing here commits a second.
 #
+# A column may also be green with *fewer* tests than another, and when it is,
+# the reason is always a fact about the installed peer that this repository
+# measures in the run rather than a version listed here. Today that is
+# tests/package.spec.ts: plain node cannot import spine-core 4.0 (extensionless
+# relative specifiers, no `"type": "module"`), and spine-core 4.1's own `.d.ts`
+# does not typecheck under `nodenext` (one extensionless specifier in
+# SkeletonData.d.ts). Both are upstream defects, both are invisible to every
+# bundler and to esm.sh — which is how those runtimes are actually consumed —
+# and the spec probes the peer *by itself* before skipping the one assertion
+# each takes away. See that file's header.
+#
 # The pixel oracle (tests/oracle.spec.ts) draws the same skeleton with
 # `@esotericsoftware/spine-webgl` and diffs the two pictures, so a column needs
 # its reference of the *same* generation — a 4.3 reference over 4.2 data would
@@ -69,6 +80,19 @@ jobs:
           - core: '4.3'
             typed: true
           - core: '4.2'
+            typed: false
+          # 4.1 and 4.0 are #53. They were left out of #40 for packaging
+          # reasons and not rendering ones, and both are still true of them:
+          # `Physics` is absent from their root entry (so every page here
+          # reaches it through the namespace and feature-tests it), plain node
+          # cannot import 4.0, and 4.1's own `.d.ts` fails a nodenext consumer
+          # typecheck. Those last two are upstream's, and tests/package.spec.ts
+          # skips exactly the two assertions that need them — by probing the
+          # installed peer alone, never by naming a version, and never by
+          # loosening anything in the columns above.
+          - core: '4.1'
+            typed: false
+          - core: '4.0'
             typed: false
     env:
       # Which minor this run is against: turns off `tsc --noEmit` outside the

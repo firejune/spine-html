@@ -37,6 +37,34 @@ import { UNTYPED_CORE } from '../playwright.config';
  * also the only way to exercise the `exports` map: resolution by *package
  * name* is the thing under test, and a relative import of `../dist/index.js`
  * would not touch `exports` at all.
+ *
+ * ## Two assertions the peer can take away, and how that is reported
+ *
+ * Importing `spine-html` by package name in node pulls in the peer, and
+ * typechecking a consumer of it with `skipLibCheck: false` typechecks the
+ * peer's own `.d.ts`. Both therefore fail on a peer that node or `nodenext`
+ * cannot read — which two supported spine-core minors are, for reasons that are
+ * upstream's (issue #16 there) and cannot be fixed from here:
+ *
+ * - **spine-core 4.0** ships extensionless relative specifiers *and* no
+ *   `"type": "module"`, so `import('@esotericsoftware/spine-core')` fails in
+ *   plain node. Its `.d.ts` typechecks clean under nodenext, though —
+ *   TypeScript reads a package without `"type"` as CommonJS, where an
+ *   extensionless specifier is legal.
+ * - **spine-core 4.1** is the mirror image: it is a module with `.js` on every
+ *   specifier but one, so node imports it fine, while that one —
+ *   `dist/SkeletonData.d.ts` importing `"./Animation"` — is a TS2835 under
+ *   nodenext, inside the peer, with `skipLibCheck` off.
+ *
+ * Neither is a fact about *this* package, and neither is keyed on a version.
+ * `beforeAll` measures the installed peer **by itself** — one child node
+ * process that imports only the peer, one tsc run over a consumer that imports
+ * only the peer — and the two dependent tests skip with that reason when the
+ * peer alone already fails. Everything that does not need to load or typecheck
+ * the peer (the `exports` map's shape, the emitted file set, the import walk,
+ * the reachability of the binary reader, "nothing shipped names spine-webgl")
+ * runs in every column regardless, and no assertion is relaxed anywhere: a
+ * probe that passes leaves its test exactly as strict as it has always been.
  */
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -46,6 +74,17 @@ const tscBin = resolve(repoRoot, 'node_modules', 'typescript', 'bin', 'tsc');
 let sandbox = '';
 /** The built package's `dist` inside that sandbox. */
 let pkgDist = '';
+/**
+ * Whether the *installed peer, on its own* can be imported by plain node and
+ * typechecked by a `nodenext` consumer — measured in `beforeAll`, never
+ * inferred from a version. See the header: what these gate is the two
+ * assertions that cannot run without them, and nothing else.
+ */
+let peerImportsInNode = true;
+let peerTypechecksUnderNodeNext = true;
+/** What the failing probe said, quoted into the skip reason. */
+let peerImportError = '';
+let peerTypecheckError = '';
 
 /**
  * `process.execPath` is the node that runs the Playwright worker — real node
@@ -79,6 +118,49 @@ function probe(name: string, source: string) {
   const file = resolve(sandbox, name);
   writeFileSync(file, source);
   return node([file], sandbox);
+}
+
+/** The two resolution modes a consumer can meet the shipped types through. */
+const MODULE_MODES = {
+  bundler: 'ESNext',
+  nodenext: 'NodeNext',
+} as const;
+type ModuleMode = keyof typeof MODULE_MODES;
+
+/**
+ * Writes `<name>.ts` plus a tsconfig for it in the sandbox and returns the path
+ * of the tsconfig. One writer for the shipped-types check and for the
+ * peer-alone probe that decides whether the `nodenext` half of it can run, so
+ * the probe measures the peer under exactly the settings the check uses.
+ */
+function writeConsumer(name: string, source: string, mode: ModuleMode): string {
+  writeFileSync(resolve(sandbox, `${name}.ts`), source);
+  const config = resolve(sandbox, `tsconfig.${name}.${mode}.json`);
+  writeFileSync(
+    config,
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: 'ES2022',
+          module: MODULE_MODES[mode],
+          moduleResolution: mode,
+          lib: ['ES2022', 'DOM', 'DOM.Iterable'],
+          strict: true,
+          noEmit: true,
+          // Deliberately NOT skipped. Measured: with skipLibCheck on, a
+          // fully extensionless dist/ typechecks clean under nodenext too —
+          // the TS2835s are raised inside the shipped .d.ts, and that is
+          // precisely the file skipLibCheck stops reading. Turning it on
+          // here would cost ~3× less time and catch nothing.
+          skipLibCheck: false,
+        },
+        files: [`${name}.ts`],
+      },
+      null,
+      2,
+    ),
+  );
+  return config;
 }
 
 test.beforeAll(() => {
@@ -133,6 +215,39 @@ test.beforeAll(() => {
     resolve(sandbox, 'package.json'),
     `${JSON.stringify({ name: 'spine-html-consumer', private: true, type: 'module' }, null, 2)}\n`,
   );
+
+  // --- what the installed peer can do, by itself -----------------------------
+  //
+  // See the header. These two probes name *only* the peer, so a failure is
+  // upstream's and provably not this package's: the same sandbox, the same
+  // node, the same tsc settings the dependent checks use, with spine-html
+  // taken out of the picture.
+  const peerImport = probe(
+    'probe-peer.mjs',
+    "await import('@esotericsoftware/spine-core');\nconsole.log('ok');\n",
+  );
+  peerImportsInNode = peerImport.status === 0;
+  peerImportError = `${peerImport.stdout}${peerImport.stderr}`.trim().split('\n')[0] ?? '';
+
+  const peerTypecheck = node(
+    [
+      tscBin,
+      '--noEmit',
+      '-p',
+      writeConsumer(
+        'peer-consumer',
+        [
+          "import type { Skeleton } from '@esotericsoftware/spine-core';",
+          'export type Peer = Skeleton;',
+          '',
+        ].join('\n'),
+        'nodenext',
+      ),
+    ],
+    sandbox,
+  );
+  peerTypechecksUnderNodeNext = peerTypecheck.status === 0;
+  peerTypecheckError = `${peerTypecheck.stdout}${peerTypecheck.stderr}`.trim().split('\n')[0] ?? '';
 });
 
 test.afterAll(() => {
@@ -140,6 +255,10 @@ test.afterAll(() => {
 });
 
 test('the package entry resolves by name in node and exposes its public API', () => {
+  test.skip(
+    !peerImportsInNode,
+    `upstream: the installed spine-core cannot be imported by plain node — ${peerImportError}`,
+  );
   const run = probe(
     'probe-index.mjs',
     "const m = await import('spine-html');\nconsole.log(JSON.stringify(Object.keys(m).sort()));\n",
@@ -159,6 +278,10 @@ test('the package entry resolves by name in node and exposes its public API', ()
 });
 
 test('the binary entry resolves by name in node and exposes loadSkeletonBinary', () => {
+  test.skip(
+    !peerImportsInNode,
+    `upstream: the installed spine-core cannot be imported by plain node — ${peerImportError}`,
+  );
   const run = probe(
     'probe-binary.mjs',
     "const m = await import('spine-html/binary');\nconsole.log(JSON.stringify(Object.keys(m).sort()));\n",
@@ -404,67 +527,42 @@ test('nothing reachable from the root entry carries the binary reader', () => {
   ]);
 });
 
-test('the emitted types resolve under both bundler and nodenext', async () => {
+/**
+ * The consumer both typecheck modes compile: every name the `exports` map
+ * offers, reached by package name through the shipped `.d.ts`.
+ */
+const CONSUMER_SOURCE = [
+  "import { DomTexture, loadAtlasAssets, loadSkeletonAssets, loadSkeletonJson, revokeRegions, SpineHtmlRenderer, unpackRegions } from 'spine-html';",
+  "import { loadSkeletonBinary } from 'spine-html/binary';",
+  'export const surface = [SpineHtmlRenderer, DomTexture, unpackRegions, revokeRegions, loadAtlasAssets, loadSkeletonAssets, loadSkeletonJson, loadSkeletonBinary];',
+  '',
+].join('\n');
+
+test('the emitted types resolve under bundler', async () => {
+  const result = await nodeAsync(
+    [tscBin, '--noEmit', '-p', writeConsumer('consumer', CONSUMER_SOURCE, 'bundler')],
+    sandbox,
+  );
+  expect(result.status, `tsc under moduleResolution=bundler failed:\n${result.output}`).toBe(0);
+});
+
+test('the emitted types resolve under nodenext', async () => {
   // The .js in the source specifiers has to survive into the .d.ts too: a
   // node16/nodenext consumer resolves `./DomTexture.js` to `./DomTexture.d.ts`
-  // and rejects the extensionless form with TS2835.
-  writeFileSync(
-    resolve(sandbox, 'consumer.ts'),
-    [
-      "import { DomTexture, loadAtlasAssets, loadSkeletonAssets, loadSkeletonJson, revokeRegions, SpineHtmlRenderer, unpackRegions } from 'spine-html';",
-      "import { loadSkeletonBinary } from 'spine-html/binary';",
-      'export const surface = [SpineHtmlRenderer, DomTexture, unpackRegions, revokeRegions, loadAtlasAssets, loadSkeletonAssets, loadSkeletonJson, loadSkeletonBinary];',
-      '',
-    ].join('\n'),
+  // and rejects the extensionless form with TS2835. That is this package's
+  // half. The peer's half is not ours — see the header — so this runs only
+  // where a consumer of the peer *alone* already typechecks, and says so when
+  // it does not. The two modes are separate tests rather than a loop because
+  // only one of them can be taken away by the peer, and a suite should report
+  // "one mode was not checked, because of the peer" rather than either
+  // silently checking less or reddening on someone else's package.
+  test.skip(
+    !peerTypechecksUnderNodeNext,
+    `upstream: the installed spine-core's own .d.ts does not typecheck under nodenext — ${peerTypecheckError}`,
   );
-
-  const modes = [
-    ['ESNext', 'bundler'],
-    ['NodeNext', 'nodenext'],
-  ] as const;
-
-  for (const [moduleKind, moduleResolution] of modes) {
-    writeFileSync(
-      resolve(sandbox, `tsconfig.${moduleResolution}.json`),
-      JSON.stringify(
-        {
-          compilerOptions: {
-            target: 'ES2022',
-            module: moduleKind,
-            moduleResolution,
-            lib: ['ES2022', 'DOM', 'DOM.Iterable'],
-            strict: true,
-            noEmit: true,
-            // Deliberately NOT skipped. Measured: with skipLibCheck on, a
-            // fully extensionless dist/ typechecks clean under nodenext too —
-            // the TS2835s are raised inside the shipped .d.ts, and that is
-            // precisely the file skipLibCheck stops reading. Turning it on
-            // here would cost ~3× less time and catch nothing.
-            skipLibCheck: false,
-          },
-          files: ['consumer.ts'],
-        },
-        null,
-        2,
-      ),
-    );
-  }
-
-  // Concurrent: two independent tsc processes, so the slow assertion in this
-  // file costs one typecheck of wall time rather than two.
-  const runs = await Promise.all(
-    modes.map(async ([, moduleResolution]) => ({
-      moduleResolution,
-      result: await nodeAsync(
-        [tscBin, '--noEmit', '-p', resolve(sandbox, `tsconfig.${moduleResolution}.json`)],
-        sandbox,
-      ),
-    })),
+  const result = await nodeAsync(
+    [tscBin, '--noEmit', '-p', writeConsumer('consumer', CONSUMER_SOURCE, 'nodenext')],
+    sandbox,
   );
-  for (const { moduleResolution, result } of runs) {
-    expect(
-      result.status,
-      `tsc under moduleResolution=${moduleResolution} failed:\n${result.output}`,
-    ).toBe(0);
-  }
+  expect(result.status, `tsc under moduleResolution=nodenext failed:\n${result.output}`).toBe(0);
 });

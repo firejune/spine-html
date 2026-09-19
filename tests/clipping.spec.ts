@@ -1,6 +1,5 @@
 import { writeFileSync } from 'node:fs';
 
-import { ClippingAttachment } from '@esotericsoftware/spine-core';
 import { expect, type Page, test } from '@playwright/test';
 import type { ClipCapture } from './harness';
 
@@ -117,8 +116,15 @@ const CONTENT_ALPHA = 64;
  * behaviour. Detected off the class rather than off a version string, for the
  * same reason the seam is, and phrased as a *feature* so that the day the
  * supported range's floor moves, this simply starts running again.
+ *
+ * Asked of the *page* rather than constructed here, because plain node cannot
+ * import spine-core 4.0 at all and Playwright loads a spec file's imports with
+ * node's resolver — see the header of tests/invariants.spec.ts.
  */
-const INVERSE_CLIPPING = 'inverse' in new ClippingAttachment('inverse-support-probe');
+async function inverseClippingSupported(page: Page): Promise<boolean> {
+  return (await page.evaluate(() => window.spineHtmlHarness.regionGeometryProbe()))
+    .inverseClipping;
+}
 
 interface MaskMetrics {
   width: number;
@@ -773,7 +779,10 @@ test('whole-skeleton clip: one clip-path on the root, and the root style given b
 });
 
 test('inverse clip: even-odd against the element box keeps what is outside', async ({ page }) => {
-  test.skip(!INVERSE_CLIPPING, 'the installed spine-core has no inverse clipping');
+  test.skip(
+    !(await inverseClippingSupported(page)),
+    'the installed spine-core has no inverse clipping',
+  );
   const result = await page.evaluate(() => window.spineHtmlHarness.clipInverseProbe());
 
   expect(result.counters.clipCount).toBe(1);
