@@ -87,6 +87,23 @@
         overflow: hidden;
         background: linear-gradient(#14161a 96%, #2a2e37 96%) 0 0 / 100% 100%;
       }
+      /*
+        The embedding. Each rig is drawn inside a box that covers exactly the
+        rect the reference's canvas covers for that rig — its own cell when the
+        reference has a canvas per player, the whole pane when it shares one —
+        so the two sides show the same visible area. Without it the DOM rigs
+        composite over their neighbours while the reference's viewport throws
+        the same pixels away for free, which is half of what made the first
+        runs of this page unfair (#39). `overflow: hidden` and nothing more:
+        paint containment clips to the same edge this already does, and what it
+        adds past the clip — a stacking context, a containing block, an
+        independent formatting context — changes how this side is composited
+        and buys the comparison nothing. See bench/bench.ts.
+      */
+      .cell-clip {
+        position: absolute;
+        overflow: hidden;
+      }
       .skeleton-root {
         position: absolute;
         transform-origin: 0 0;
@@ -106,7 +123,10 @@
       development dependency and has no business in the demo's bundle.
 
       Query string: ?scene=mesh|held|rigid|many &count=N &backend=canvas2d|webgl
-      &runtime=both|dom|reference &dpr=N. See bench/bench.ts.
+      &runtime=both|dom|reference &dpr=N &timescale=N. See bench/bench.ts —
+      which also carries why the reference has two shapes (one shared canvas
+      for a grid of rigs, one context per player for `many`) and why each rig
+      is clipped to the rect its reference canvas covers.
     -->
     <header>
       <h1>spine-html vs spine-webgl</h1>
