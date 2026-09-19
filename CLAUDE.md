@@ -61,6 +61,20 @@ README.md for architecture and measured numbers.
   specifiers in their own `dist/`, so plain node cannot import 4.0 at all and
   4.1's `.d.ts` fails a nodenext consumer typecheck — which is #16's defect, in
   spine-core.
+- **An export under any runtime but its own generation's is never a supported
+  combination, and a clean parse is not evidence that it is.** Each
+  generation's `SkeletonJson` simply stops looking for keys the format dropped:
+  4.2 reads a bone's `inherit` and never `transform` (what 4.0 and 4.1 write),
+  4.1 and 4.2 read an animation's `attachments` and never `deform` (what 4.0
+  writes), 4.3 reads `constraints` and never `ik`/`transform`/`path`/`physics`,
+  and a 3.8 export parses under 4.0 and then poses its bones at non-finite
+  transforms. None of it throws, every constraint count still matches, and the
+  rig renders. The README once told 4.1 / 4.0 users to install 4.2 on the
+  strength of exactly that evidence (1,454 of 1,454 parsed, 14,022 of 14,022
+  constraints, a 60-rig render with no error) and had to be corrected. The
+  check that settles it is a **diff of the keys each generation's reader
+  consumes** against the keys the exports contain — not parsing, not counting,
+  not rendering without an error.
 - Rigid-tier corner order from `computeWorldVertices` is **BL, UL, UR, BR**
   (verified by execution on 4.2.98, 4.2.120 and 4.3.13; the br/bl/ul/ur comments
   inside the upstream function are stale). A node-side test guards this against
