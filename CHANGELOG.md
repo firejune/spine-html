@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/firejune/spine-html/compare/v0.7.1...v0.8.0) (2026-09-19)
+
+
+### Features
+
+* **core:** run on spine-core 4.1 and 4.0, each held by a CI column ([#54](https://github.com/firejune/spine-html/issues/54)) ([0db050b](https://github.com/firejune/spine-html/commit/0db050b97882032bd634f1af07238e4b73f87187)), closes [#53](https://github.com/firejune/spine-html/issues/53)
+
 ## [0.7.1](https://github.com/firejune/spine-html/compare/v0.7.0...v0.7.1) (2026-09-18)
 
 
