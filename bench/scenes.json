@@ -5,30 +5,90 @@
     "and two panes animating together would report the page's fps rather than",
     "either runtime's (bench/bench.ts explains it in full).",
     "",
+    "Counts are stepped because a single rig says nothing on a fast desktop",
+    "GPU: the first runs of this instrument pegged both sides at the display's",
+    "refresh rate in every scene but the 20-player one, which can show no",
+    "crossover at all. The page caps count at 64 (8 columns of 8, about 80 CSS",
+    "px per cell at a 1280-wide window); a denser grid would be measuring",
+    "thumbnails. A rig's stage scale is the scene's one-per-pane scale divided",
+    "by the column count, so a step raises the number of rigs rather than the",
+    "amount of each one that is cropped away.",
+    "",
+    "The reference draws a grid scene (mesh / held / rigid) into ONE canvas",
+    "through one batched SceneRenderer — its home ground, and the shape a",
+    "spine-webgl application is written in — and `many` into one canvas and one",
+    "WebGL context per player, which is what meets the browser's ~16-context",
+    "cap. Each row's stats line says which.",
+    "",
     "`--corpus <dir>` points the script at a directory holding a file of this",
     "shape plus the rigs it names, for real-world skeletons that never enter",
     "this repository."
   ],
   "scenes": [
     {
-      "name": "meshed rig animating",
+      "name": "1 meshed rig animating",
       "query": { "scene": "mesh", "count": 1, "backend": "webgl" },
       "why": "the deform tier working every frame — the cost this approach was doubted on"
     },
     {
-      "name": "meshed rig animating (canvas2d)",
+      "name": "4 meshed rigs animating",
+      "query": { "scene": "mesh", "count": 4, "backend": "webgl" },
+      "why": "the first step where the reference gets to batch several skeletons into one canvas"
+    },
+    {
+      "name": "16 meshed rigs animating",
+      "query": { "scene": "mesh", "count": 16, "backend": "webgl" },
+      "why": "an all-mesh grid — spine-webgl's home ground, and where this package should expect to lose"
+    },
+    {
+      "name": "36 meshed rigs animating",
+      "query": { "scene": "mesh", "count": 36, "backend": "webgl" },
+      "why": "between 16 and 64, so a crossover has somewhere to be seen rather than jumped over"
+    },
+    {
+      "name": "64 meshed rigs animating",
+      "query": { "scene": "mesh", "count": 64, "backend": "webgl" },
+      "why": "the page's cap: the heaviest deform load either side is asked for here"
+    },
+    {
+      "name": "1 meshed rig animating (canvas2d)",
       "query": { "scene": "mesh", "count": 1, "backend": "canvas2d" },
       "why": "the default backend, and the one real Safari struggles with"
     },
     {
-      "name": "held pose",
+      "name": "16 meshed rigs animating (canvas2d)",
+      "query": { "scene": "mesh", "count": 16, "backend": "canvas2d" },
+      "why": "the default backend under a grid — the per-triangle path's own scaling"
+    },
+    {
+      "name": "1 held pose",
       "query": { "scene": "held", "count": 1, "backend": "webgl" },
       "why": "dirty-skip home ground: unchanged meshes reuse their raster, the reference redraws regardless"
     },
     {
-      "name": "rigid rig animating",
-      "query": { "scene": "rigid", "count": 10, "backend": "webgl" },
+      "name": "16 held poses",
+      "query": { "scene": "held", "count": 16, "backend": "webgl" },
+      "why": "dirty-skip multiplied by 16 against 16 skeletons the reference must redraw every frame"
+    },
+    {
+      "name": "64 held poses",
+      "query": { "scene": "held", "count": 64, "backend": "webgl" },
+      "why": "the same at the cap, where a redraw-everything renderer pays the most"
+    },
+    {
+      "name": "1 rigid rig animating",
+      "query": { "scene": "rigid", "count": 1, "backend": "webgl" },
       "why": "region attachments only — pure <img> and one CSS matrix per slot on this side"
+    },
+    {
+      "name": "16 rigid rigs animating",
+      "query": { "scene": "rigid", "count": 16, "backend": "webgl" },
+      "why": "a grid of rigid rigs: element count and compositing against one batched draw"
+    },
+    {
+      "name": "64 rigid rigs animating",
+      "query": { "scene": "rigid", "count": 64, "backend": "webgl" },
+      "why": "the cap, where this side is holding roughly four thousand elements"
     },
     {
       "name": "8 small players",

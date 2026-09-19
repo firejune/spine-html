@@ -22,6 +22,18 @@
  * has no automation that preserves the thing being measured, so it stays a
  * person, a device and the page's clickable stats line.
  *
+ * ## What each row says it compared
+ *
+ * Two runtimes are only comparable if they drew the same picture, each in the
+ * shape it is actually written in, so every row carries both: the `mode`
+ * column names how the reference drew (one shared, batched canvas for a grid
+ * of rigs; one canvas and one WebGL context per player for `many`) and what
+ * the DOM side was clipped to, which is that canvas's own rect. `origin Δpx`
+ * is the largest gap between where the page's grid put a rig and where that
+ * side drew it — a counter rather than a timing, so it means the same thing on
+ * any machine, and anything but ~0 says the row is comparing two placements
+ * rather than two runtimes. `bench/bench.ts` carries the reasoning.
+ *
  * ## The INVALID stamp
  *
  * A benchmark on a loaded machine measures the load. Every run records the
@@ -250,6 +262,18 @@ async function main() {
   process.exitCode = invalid ? 1 : 0;
 }
 
+/**
+ * What this row compared: how the reference drew, or what the DOM side was
+ * clipped to — the two halves of the same rule, since the clip rect *is* the
+ * reference canvas's rect. A reading from before the page reported either is
+ * left as a dash rather than guessed at.
+ */
+function mode(reading, dom) {
+  if (dom) return reading.clipTarget ? `clipped to ${reading.clipTarget}` : '—';
+  if (!reading.referenceMode) return '—';
+  return reading.referenceMode === 'shared' ? 'shared canvas' : 'context per player';
+}
+
 function markdown(report) {
   const { conditions, rows, invalid } = report;
   const lines = [];
@@ -271,16 +295,20 @@ function markdown(report) {
   );
   lines.push('## Readings', '');
   lines.push(
-    '| scene | runtime | fps | stats line | contexts refused | contexts lost |',
-    '| --- | --- | --- | --- | --- | --- |',
+    '| scene | runtime | mode | fps | stats line | origin Δpx | contexts refused | contexts lost |',
+    '| --- | --- | --- | --- | --- | --- | --- | --- |',
   );
   for (const row of rows) {
     const r = row.reading;
-    const fps = row.runtime === 'dom' ? r.domFps : r.referenceFps;
-    const stats = row.runtime === 'dom' ? r.domStats : r.referenceStats;
+    const dom = row.runtime === 'dom';
+    const fps = dom ? r.domFps : r.referenceFps;
+    const stats = dom ? r.domStats : r.referenceStats;
+    const delta = dom ? r.domOriginDeltaPx : r.referenceOriginDeltaPx;
     lines.push(
-      `| ${row.scene} | ${row.runtime} | ${fps === null ? '—' : fps.toFixed(1)} | ` +
-        `${stats} | ${r.contextsRefused} | ${r.contextsLost} |`,
+      `| ${row.scene} | ${row.runtime} | ${mode(r, dom)} | ` +
+        `${fps === null ? '—' : fps.toFixed(1)} | ${stats} | ` +
+        `${delta === null || delta === undefined ? '—' : delta} | ` +
+        `${r.contextsRefused} | ${r.contextsLost} |`,
     );
   }
   lines.push('');
@@ -288,6 +316,13 @@ function markdown(report) {
     'Each row is its own page load with only that runtime animating, because',
     'requestAnimationFrame has one cadence per document — two panes running',
     'together report the page\'s fps, not either runtime\'s.',
+    '',
+    'Both sides place rigs on one grid and each is clipped to the rect the',
+    'reference\'s canvas covers for it, so the two draw the same visible area;',
+    '`origin Δpx` is how far either side landed from that grid. The reference',
+    'draws a grid of rigs the way an application would — one canvas, one',
+    'context, one batched pass — and takes a context per player only in the',
+    '`many` scene, which is about the browser\'s ~16-context cap.',
     '',
   );
   return `${lines.join('\n')}\n`;

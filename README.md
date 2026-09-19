@@ -728,10 +728,37 @@ by side, each with its own stats line in the demo's style. Scenes by query
 string: `?scene=mesh` (the deform tier working every frame), `?scene=held` (a
 frozen pose, where unchanged meshes reuse their raster and the reference
 redraws regardless), `?scene=rigid`, and `?scene=many&count=N` independent
-players — which is also where the architectural difference shows, since the
-reference needs one WebGL context per player against browsers' cap of ~16 and
-this package shares a single one however many there are. The page reports
-reaching that cap rather than dying at it.
+players. All four take `&count=N` up to 64 (a page limit, so that a cell stays
+something you can see), laid out on one grid whose per-rig scale shrinks with
+the column count, so a step up in count adds rigs rather than cropping the ones
+already there.
+
+**The two sides draw the same picture, and each draws it the way its own
+runtime is written.** Those are separate rules and the first runs of this page
+broke both:
+
+- **One grid, one clip.** A rig is clipped to exactly the rect the reference's
+  canvas covers for it — `overflow: hidden` on a box, the way a page embeds a
+  player. Without it the DOM rigs composite over their neighbours while the
+  reference's viewport discards the same pixels for free, so the two sides
+  aren't showing the same picture and the DOM side is carrying layers the
+  reference never pays for. Placement is derived once and read by both sides,
+  and then *checked*: each side reports `origin Δpx`, the largest gap between
+  where the grid puts a rig and where that side drew it, and the report table
+  carries it per row. (`contain: layout paint` is deliberately not used: paint
+  containment clips to the same edge `overflow: hidden` does, and what it adds
+  past the clip — a stacking context, a containing block, an independent
+  formatting context — changes how one side is composited and buys the
+  comparison nothing. Skipping work outside the box is `content-visibility`,
+  not containment.)
+- **The reference gets its own architecture.** For a grid of rigs it draws into
+  **one** canvas through one batched `SceneRenderer`, which is how a spine-webgl
+  application is written and is its home ground; 64 rigs leave as a handful of
+  draw calls. One WebGL context per player is right only for `?scene=many`,
+  which is *about* the browser's ~16-context cap — the page counts the contexts
+  it was refused and the ones the browser took back, says so in the header, and
+  keeps going rather than dying at the cap. Each stats line names which shape it
+  is in: `shared canvas` or `context per player`, with the alive count.
 
 `scripts/bench.mjs` walks `bench/scenes.json`, opens each scene in a **headed**
 Chromium (a hidden page throttles `requestAnimationFrame`, so a headless
@@ -744,13 +771,16 @@ whole report `INVALID: load average too high` and exits non-zero, because a
 benchmark on a busy machine measures the machine. `--corpus <dir>` points it at
 local rigs that never enter this repository.
 
-> **Numbers pending.** No comparison table is published yet, and one taken on a
-> loaded CI runner or in a headless browser would not be worth reading. The
-> table will be taken the way every other number in this README was: the two
-> stats lines read on a real device, on a quiet machine, per scene and per
-> engine — including Safari, which stays manual because no automation preserves
-> what is being measured there. Until then the instrument exists and the
-> measurement does not.
+> **Numbers pending.** No comparison table is published yet. The instrument is
+> fair in both directions now and its scenes step far enough to leave a desktop
+> GPU's vsync ceiling, but a reading taken on a loaded machine, a CI runner or
+> a headless browser would not be worth printing — and every reading taken
+> while the instrument was being repaired has been discarded rather than
+> quoted. The table will be taken the way every other number in this README
+> was: the two stats lines read on a real device, on a quiet machine, per scene
+> and per engine — including Safari, which stays manual because no automation
+> preserves what is being measured there. Until then the instrument exists and
+> the measurement does not.
 
 The server is part of the test: a run tests whatever is being served on its
 port. Two checkouts of this repository on one machine (a worktree, a second
