@@ -2,12 +2,15 @@ import {
   AnimationState,
   AnimationStateData,
   AtlasAttachmentLoader,
-  Physics,
   Skeleton,
   type SkeletonData,
   SkeletonJson,
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
+// `Physics` arrived in 4.2 and is absent from 4.1's and 4.0's root entry, where
+// a *named* import of it is a link error that fails this build outright. See
+// coreOptional.ts — which, like this file, ships nothing.
+import { advanceSkeleton } from './coreOptional.js';
 import { DomTexture, type RegionImage, unpackRegions } from './DomTexture.js';
 import { type MeshBackend, SpineHtmlRenderer } from './SpineHtmlRenderer.js';
 
@@ -214,8 +217,7 @@ function main(
     for (const inst of instances) {
       inst.state.update(delta);
       inst.state.apply(inst.skeleton);
-      inst.skeleton.update(delta);
-      inst.skeleton.updateWorldTransform(Physics.update);
+      advanceSkeleton(inst.skeleton, delta);
     }
     const t1 = performance.now();
     for (const inst of instances) inst.renderer.render(inst.skeleton);

@@ -566,7 +566,14 @@ export class SpineHtmlRenderer {
     const core = this.core as CoreCompat;
     const sequenceIndex = core.sequenceIndex(attachment, pose);
     const region = core.regionAt(attachment, slot, sequenceIndex);
-    const page = region?.texture?.getImage() as HTMLImageElement | undefined;
+    // The page image comes off the *page*, not off the region. A region's own
+    // `texture` is a 4.1-and-later convenience — `TextureAtlasPage.setTexture`
+    // copies the page's texture onto each of its regions — and 4.0 has no such
+    // field at all (it carries a `renderObject` back-reference instead, which
+    // is why spine-webgl 4.0 reads `region.renderObject.page.texture`). The
+    // page is where the handle has always lived, so reading it there needs no
+    // seam entry and is the same object on every supported generation.
+    const page = region?.page.texture?.getImage() as HTMLImageElement | undefined;
     if (!region || !page) {
       this.hide(slot);
       return;

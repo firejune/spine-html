@@ -1,9 +1,9 @@
+import { RegionAttachment } from '@esotericsoftware/spine-core';
 import type {
   Attachment,
   Bone,
   ClippingAttachment,
   MeshAttachment,
-  RegionAttachment,
   Skeleton,
   Slot,
   SlotPose,
@@ -26,9 +26,9 @@ import type {
  * from whichever one that is. spine-core is a peer dependency precisely so that
  * choice is the consumer's.
  *
- * ## What the two shapes are
+ * ## What the three shapes are
  *
- * 4.3 split every animatable object into data + poses: `Skeleton.drawOrder`
+ * **4.3** split every animatable object into data + poses: `Skeleton.drawOrder`
  * became a `DrawOrder` carrying an `appliedPose`, a slot's current attachment
  * and colour moved onto a `SlotPose`, a bone's world transform onto a
  * `BonePose`, and a region attachment's per-frame UVs and vertex offsets onto
@@ -38,12 +38,23 @@ import type {
  * own pose view and a `Bone` *is* its own bone-pose view. That is what keeps
  * the seam free of per-frame allocation.
  *
+ * **4.1 and 4.2** are that pre-pose shape.
+ *
+ * **4.0** is the pre-pose shape minus sequences, which arrived in 4.1 and moved
+ * exactly one call: `RegionAttachment.computeWorldVertices` takes the **slot**
+ * from 4.1 on, because it may have to step the sequence on the way, and took
+ * the **bone** before that. Nothing else the renderer reads moved — a 4.0
+ * attachment simply has no `sequence` and a 4.0 slot no `sequenceIndex`, which
+ * the shared table already answers with "no sequence" rather than by reading an
+ * absent property. So the third table is the second one with that single member
+ * replaced, and it is written that way.
+ *
  * ## How the shape is chosen
  *
  * Once per renderer, by looking at the live objects ({@link coreCompatFor}) —
  * never per slot by try/catch, and never by reading a version string, which a
  * bundled, patched or vendored copy need not carry. The result is one of the
- * two tables below, so a render loop pays one property load per call and
+ * three tables below, so a render loop pays one property load per call and
  * allocates nothing.
  *
  * ## What this package still compiles against
@@ -84,14 +95,25 @@ export interface BonePoseView {
   worldY: number;
 }
 
-/** The spine-core access seam. One table per generation, chosen once. */
+/**
+ * Which shape the installed spine-core has, named after the feature that moved
+ * rather than after a version: `poses` is 4.3's pose split, `sequences` is the
+ * pre-pose shape as 4.1 and 4.2 have it, and `pre-sequences` is 4.0, before
+ * sequences existed. A consumer's copy may be vendored, patched or renamed, so
+ * these are what was *detected*, never what a package.json said.
+ */
+export type CoreShape = 'poses' | 'sequences' | 'pre-sequences';
+
+/** The spine-core access seam. One table per shape, chosen once. */
 export interface CoreCompat {
   /**
-   * True on the pre-4.3 shape. Exposed so a test can say which shape it
-   * measured, and so a probe that must *construct* spine-core objects (rather
-   * than read them) can build the right ones.
+   * Which shape this table is for. Exposed so a test can say which one it
+   * measured — a column that quietly fell back to another shape would otherwise
+   * look exactly like a column that is passing — and so a probe that must
+   * *construct* spine-core objects (rather than read them) can build the right
+   * ones.
    */
-  readonly prePose: boolean;
+  readonly shape: CoreShape;
   /** The draw order to render: 4.3's applied pose, or the array itself. */
   drawOrder(skeleton: Skeleton): Slot[];
   /** The slot's current pose view — the slot itself on the pre-pose shape. */
@@ -166,10 +188,19 @@ interface PrePoseTextured {
   uvs?: ArrayLike<number>;
 }
 
-/** A pre-4.3 `RegionAttachment`: its `computeWorldVertices` takes no offsets. */
+/**
+ * A pre-4.3 `RegionAttachment`: its `computeWorldVertices` takes no offsets —
+ * they live on the attachment, written by `updateRegion()` (4.1, 4.2) or by
+ * `updateOffset()` (4.0).
+ *
+ * The first argument is `unknown` because it is the one thing that moved inside
+ * the pre-pose range: 4.1 and 4.2 want the **slot** (the call may step a
+ * sequence), 4.0 wants the **bone**. The two tables below differ by which they
+ * hand it, and by nothing else.
+ */
 interface PrePoseRegion {
   computeWorldVertices(
-    slot: unknown,
+    slotOrBone: unknown,
     worldVertices: Float32Array,
     offset: number,
     stride: number,
@@ -196,7 +227,7 @@ const textured = (a: RegionAttachment | MeshAttachment): PrePoseTextured =>
  * own the per-frame regions, UVs and vertex offsets.
  */
 const POSE_CORE: CoreCompat = {
-  prePose: false,
+  shape: 'poses',
   drawOrder: (skeleton) => skeleton.drawOrder.appliedPose,
   pose: (slot) => slot.appliedPose,
   bonePose: (bone) => bone.appliedPose,
@@ -223,9 +254,16 @@ const POSE_CORE: CoreCompat = {
  * is idempotent — it rewrites `attachment.region` only when the frame actually
  * changed — so doing it a beat earlier costs one comparison and lets the
  * renderer keep resolving the region before it commits to drawing.
+ *
+ * Every member here is also 4.0's, bar one — see {@link PRE_SEQUENCE_CORE}. The
+ * sequence reads are written as "if there is a sequence", not as "if this is
+ * 4.1 or newer", so a core that never had the feature needs no branch of its
+ * own: a 4.0 attachment has no `sequence`, {@link CoreCompat.sequenceIndex}
+ * answers -1 before it would touch the absent `slot.sequenceIndex`, and
+ * `regionAt` reads the attachment's own region the way 4.0's own renderer does.
  */
 const PRE_POSE_CORE: CoreCompat = {
-  prePose: true,
+  shape: 'sequences',
   drawOrder: (skeleton) => skeleton.drawOrder as unknown as Slot[],
   pose: (slot) => slot as unknown as SlotPoseView,
   bonePose: (bone) => bone as unknown as BonePoseView,
@@ -266,12 +304,53 @@ const PRE_POSE_CORE: CoreCompat = {
 };
 
 /**
+ * The seam for 4.0 — the pre-pose shape before sequences existed.
+ *
+ * One member differs, and it is spelled out here rather than branched inside
+ * the shared one: `RegionAttachment.computeWorldVertices` took the **bone**
+ * until 4.1 gave it the **slot**, because from 4.1 on the call may have to step
+ * a sequence and a bone cannot reach one. Handing a 4.0 core a slot is silent
+ * and total — the method reads `worldX`/`worldY`/`a`/`b`/`c`/`d` straight off
+ * its argument, a `Slot` has none of them, and every rigid corner comes out
+ * `NaN`, so nothing throws and nothing draws. That is the mutant the 4.0
+ * column exists to catch.
+ *
+ * Written as a spread because the relationship *is* "the same table with that
+ * one call changed", and a copy would be a second place to keep in step. It is
+ * built once at module load, not per renderer and not per frame.
+ */
+const PRE_SEQUENCE_CORE: CoreCompat = {
+  ...PRE_POSE_CORE,
+  shape: 'pre-sequences',
+  regionWorldVertices: (attachment, slot, _pose, out) => {
+    (attachment as unknown as PrePoseRegion).computeWorldVertices(slot.bone, out, 0, 2);
+  },
+};
+
+/**
+ * Whether the installed `RegionAttachment` is 4.1's or newer.
+ *
+ * Sequences arrived in 4.1, and the same release replaced the pair
+ * `setRegion()` + `updateOffset()` with a single `updateRegion()` *and* changed
+ * `computeWorldVertices` from taking a bone to taking a slot. One release, one
+ * boundary: the presence of `updateRegion` on the prototype is therefore a test
+ * of the argument this seam has to get right, not a proxy for a version number.
+ * (`slot.sequenceIndex` is the same boundary seen from the data side, but a
+ * skeleton with no slots could not be asked, and the prototype always can be.)
+ *
+ * Read once, at module load, off the live class — not from a version string,
+ * which a vendored or bundled copy need not carry.
+ */
+const REGION_TAKES_SLOT = 'updateRegion' in RegionAttachment.prototype;
+
+/**
  * Picks the seam for the spine-core that produced `skeleton`.
  *
- * The test is the pose split itself: 4.3's `Skeleton.drawOrder` is a
+ * The first test is the pose split itself: 4.3's `Skeleton.drawOrder` is a
  * `DrawOrder` object carrying an `appliedPose` array, where every earlier
  * generation has a plain `Slot[]`. A version string would be the wrong oracle —
- * what matters is the object graph, not the label on it.
+ * what matters is the object graph, not the label on it. The second splits the
+ * pre-pose range at the arrival of sequences; see {@link REGION_TAKES_SLOT}.
  *
  * Called once per renderer, on the first skeleton it is handed.
  */
@@ -282,5 +361,6 @@ export function coreCompatFor(skeleton: Skeleton): CoreCompat {
     typeof drawOrder === 'object' &&
     !Array.isArray(drawOrder) &&
     Array.isArray((drawOrder as { appliedPose?: unknown }).appliedPose);
-  return posed ? POSE_CORE : PRE_POSE_CORE;
+  if (posed) return POSE_CORE;
+  return REGION_TAKES_SLOT ? PRE_POSE_CORE : PRE_SEQUENCE_CORE;
 }

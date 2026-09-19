@@ -1,9 +1,16 @@
+// Every name here is on the root entry of all four supported spine-core
+// minors (checked), so these stay ordinary named imports. The ones that are
+// not — `Physics`, `Sequence` — live behind `src/coreOptional.ts`, because a
+// named import of an export a core does not have is a link error that would
+// take this whole file down in that column.
 import {
   AnimationState,
   AnimationStateData,
-  Physics,
+  DeformTimeline,
+  RegionAttachment,
   Skeleton,
   TextureAtlas,
+  TextureRegion,
 } from '@esotericsoftware/spine-core';
 import {
   DomTexture,
@@ -19,6 +26,7 @@ import type { SkeletonData } from '@esotericsoftware/spine-core';
 import { loadSkeletonBinary } from '../src/binary';
 import { getMeshGlBlitter } from '../src/MeshGlBlitter';
 import { type BonePoseView, coreCompatFor, type SlotPoseView } from '../src/coreCompat';
+import { advanceSkeleton, OPTIONAL_SEQUENCE } from '../src/coreOptional';
 import { straightAlphaDerivations, straightAlphaSource } from '../src/DomTexture';
 // The pixel oracle's reference runtime. It is a separate module because it is
 // the one place `@esotericsoftware/spine-webgl` is named — keeping that import
@@ -161,8 +169,75 @@ export interface BackingProbeResult {
   holdAfter: BackingSnapshot;
 }
 
+/**
+ * What the export on disk declares about bone inheritance and mesh deform, and
+ * what the installed spine-core actually built out of it.
+ *
+ * The two halves are the point. An export read by a runtime of another
+ * generation parses cleanly, counts the same constraints and renders without an
+ * error while silently dropping whatever the format renamed — 4.0 and 4.1 write
+ * a bone's `transform` where 4.2 reads only `inherit`, and 4.0 writes an
+ * animation's `deform` where 4.1 and later read only `attachments`. So a parse
+ * is not evidence; the key the file uses landing in the parsed data is.
+ * Everything here is keyed off the key the *file* carries, never off a version,
+ * so one assertion holds in every column.
+ */
+export interface GenerationProbeResult {
+  /** The `skeleton.spine` string the exporter stamped — reported, never keyed on. */
+  exportedBy: string;
+  /** Which seam `src/coreCompat.ts` picked from the live objects. */
+  coreShape: string;
+  /** The key this export uses for bone inheritance: `transform`, `inherit`, or ''. */
+  inheritKey: string;
+  /** Bones the file gives a non-default inheritance mode, name → the file's word. */
+  fileInherit: Record<string, string>;
+  /** The same bones as the installed runtime loaded them, name → numeric mode. */
+  loadedInherit: Record<string, number>;
+  /** Bones the runtime loaded at a mode other than Normal — the total, all bones. */
+  loadedNonNormalBones: number;
+  /** Which key this export uses for mesh deform: `deform`, `attachments`, or ''. */
+  deformKey: string;
+  /** Deform timelines the file declares, per animation that has any. */
+  fileDeform: Record<string, number>;
+  /** Deform timelines the installed runtime built, per animation that has any. */
+  loadedDeform: Record<string, number>;
+}
+
+/**
+ * The one probe that has to *construct* spine-core objects rather than read
+ * them — where a region attachment's corner offsets and UVs come from, which
+ * is the convention `src/DomTexture.ts` cuts a packed rect against and
+ * `SpineHtmlRenderer` builds its CSS matrix from.
+ *
+ * It lives in the harness rather than node-side, where it began, for one
+ * reason: **plain node cannot import spine-core 4.0 at all** (extensionless
+ * relative specifiers, no `"type": "module"` — upstream's issue #16), and
+ * Playwright loads spec files with node's own resolver, so a spec that names
+ * the core at module scope does not skip in that column, it fails to load and
+ * takes the run down. A bundler resolves those specifiers without noticing,
+ * which is how these runtimes are consumed in the first place, so the guard
+ * follows the code into the browser and keeps running on every generation —
+ * including the one it now covers for the first time. The assertions stay in
+ * `tests/invariants.spec.ts`; only the construction moved.
+ */
+export interface RegionGeometryProbeResult {
+  /** 4.3: the offsets and UVs are computed into caller arrays by `computeUVs`. */
+  poseCore: boolean;
+  /** 4.1 and later: `computeWorldVertices` takes the slot, and `updateRegion()`
+   *  replaced 4.0's `setRegion()` + `updateOffset()` pair. */
+  regionTakesSlot: boolean;
+  /** An unrotated 2×1 region: local corner offsets, UVs, and world corners. */
+  straight: { offset: number[]; uvs: number[]; world: number[] };
+  /** The same region stored `rotate: 90`: local corner offsets and UVs. */
+  rotated: { offset: number[]; uvs: number[] };
+  /** `ClippingAttachment.inverse` — 4.3 and later. A feature test, not a version. */
+  inverseClipping: boolean;
+}
+
 export interface SpineHtmlHarness {
   unpackProbe(): Promise<UnpackProbeResult>;
+  generationProbe(): Promise<GenerationProbeResult>;
+  regionGeometryProbe(): RegionGeometryProbeResult;
   passThroughProbe(): Promise<PassThroughProbeResult>;
   rotatedCutProbe(): Promise<RotatedCutProbeResult>;
   unpackFailureProbe(): Promise<UnpackFailureProbeResult>;
@@ -569,8 +644,7 @@ async function loaderProbe(): Promise<LoaderProbeResult> {
   state.setAnimation(0, 'walk', true);
   state.update(1.2);
   state.apply(skeleton);
-  skeleton.update(1.2);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, 1.2);
   const renderer = new SpineHtmlRenderer(root, assets.regionImages);
   renderer.render(skeleton);
   const imageCount = root.querySelectorAll('img').length;
@@ -641,8 +715,7 @@ async function backingProbe(): Promise<BackingProbeResult> {
   state.setAnimation(0, 'walk', true);
   state.update(1.2);
   state.apply(skeleton);
-  skeleton.update(1.2);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, 1.2);
 
   const roots: HTMLElement[] = [];
   const renderers: SpineHtmlRenderer[] = [];
@@ -704,7 +777,7 @@ async function backingProbe(): Promise<BackingProbeResult> {
   const holdBefore = snapshot(hold.renderer, hold.root);
   skeleton.scaleX = 0.5;
   skeleton.scaleY = 0.5;
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton);
   hold.renderer.render(skeleton);
   const holdAfter = snapshot(hold.renderer, hold.root);
 
@@ -843,8 +916,7 @@ function renderOnce(
   state.setAnimation(0, 'walk', true);
   state.update(1.2);
   state.apply(skeleton);
-  skeleton.update(1.2);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, 1.2);
   const renderer = new SpineHtmlRenderer(root, regionImages);
   renderer.render(skeleton);
   const counts = {
@@ -1009,8 +1081,7 @@ async function scaledStageProbe(): Promise<ScaledStageProbeResult> {
   state.setAnimation(0, 'walk', true);
   state.update(1.2);
   state.apply(skeleton);
-  skeleton.update(1.2);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, 1.2);
 
   const ZOOM = 0.25;
   const PROBE_PX = 100;
@@ -1251,8 +1322,7 @@ function posedSkeleton(assets: LoadedAssets): Skeleton {
   state.setAnimation(0, 'walk', true);
   state.update(1.2);
   state.apply(skeleton);
-  skeleton.update(1.2);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, 1.2);
   return skeleton;
 }
 
@@ -1530,8 +1600,7 @@ async function binaryProbe(): Promise<BinaryProbeResult> {
     state.setAnimation(0, 'walk', true);
     state.update(1.2);
     state.apply(skeleton);
-    skeleton.update(1.2);
-    skeleton.updateWorldTransform(Physics.update);
+    advanceSkeleton(skeleton, 1.2);
     const renderer = new SpineHtmlRenderer(root, shared.regionImages);
     renderer.render(skeleton);
     const summary = {
@@ -2194,20 +2263,23 @@ export interface ScaledPageProbeResult {
  * resolution is painted from the region table, never resampled from another
  * one, so a bitmap that came out of the wrong rectangle cannot be excused as a
  * filtering artefact.
+ *
+ * The page's regions are handed in rather than read off `page.regions`: that
+ * back-reference is 4.1 and later, while `TextureAtlas.regions` plus
+ * `region.page` is the arrangement every supported generation has (4.0's page
+ * carries no region list at all, and reading one there is a `TypeError` that
+ * reddened eight cells the first time this ran on it).
  */
 async function paintScaledPage(
-  page: {
+  page: { width: number; height: number },
+  regions: ReadonlyArray<{
+    name: string;
+    x: number;
+    y: number;
     width: number;
     height: number;
-    regions: ReadonlyArray<{
-      name: string;
-      x: number;
-      y: number;
-      width: number;
-      height: number;
-      degrees: number;
-    }>;
-  },
+    degrees: number;
+  }>,
   scale: number,
 ): Promise<{ image: HTMLImageElement; url: string; width: number; height: number }> {
   const width = Math.round(page.width * scale);
@@ -2217,7 +2289,7 @@ async function paintScaledPage(
   canvas.height = height;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2d context unavailable');
-  for (const region of page.regions) {
+  for (const region of regions) {
     const rotated = region.degrees === 90;
     const packedW = rotated ? region.height : region.width;
     const packedH = rotated ? region.width : region.height;
@@ -2278,7 +2350,11 @@ async function scaledPageProbe(): Promise<ScaledPageProbeResult> {
     const pageUrls: string[] = [];
     const pageSizes: Record<string, { width: number; height: number }> = {};
     for (const page of atlas.pages) {
-      const painted = await paintScaledPage(page, scale);
+      const painted = await paintScaledPage(
+        page,
+        atlas.regions.filter((region) => region.page === page),
+        scale,
+      );
       page.setTexture(new DomTexture(painted.image));
       pageImages.set(page.name, painted.image);
       pageUrls.push(painted.url);
@@ -2379,8 +2455,7 @@ async function halfResRenderProbe(): Promise<HalfResRenderProbeResult> {
     state.setAnimation(0, 'walk', true);
     state.update(1.2);
     state.apply(skeleton);
-    skeleton.update(1.2);
-    skeleton.updateWorldTransform(Physics.update);
+    advanceSkeleton(skeleton, 1.2);
     const renderer = new SpineHtmlRenderer(root, assets.regionImages);
     renderer.render(skeleton);
 
@@ -2702,8 +2777,7 @@ async function cutRuleStage(options: CutRuleStageOptions): Promise<CutRuleStageR
   state.setAnimation(0, options.animation, true);
   state.update(options.time);
   state.apply(skeleton);
-  skeleton.update(options.time);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, options.time);
   const renderer = new SpineHtmlRenderer(root, cut.images);
   renderer.render(skeleton);
   cutRuleLive = { renderer, release: cut.release };
@@ -2956,8 +3030,7 @@ function posedFor(assets: LoadedAssets, animation: string, time: number): Skelet
   state.setAnimation(0, animation, true);
   state.update(time);
   state.apply(skeleton);
-  skeleton.update(time);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, time);
   return skeleton;
 }
 
@@ -4347,8 +4420,7 @@ async function pmaDerivationProbe(): Promise<PmaDerivationProbeResult> {
     state.setAnimation(0, 'walk', true);
     state.update(1.2);
     state.apply(skeleton);
-    skeleton.update(1.2);
-    skeleton.updateWorldTransform(Physics.update);
+    advanceSkeleton(skeleton, 1.2);
 
     const renderers = (['canvas2d', 'webgl'] as const).map((backend) => {
       const renderer = new SpineHtmlRenderer(root, regionImages);
@@ -4505,8 +4577,7 @@ async function pmaStage(options: PmaStageOptions): Promise<PmaStageResult> {
   state.setAnimation(0, options.animation, true);
   state.update(options.time);
   state.apply(skeleton);
-  skeleton.update(options.time);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, options.time);
   const renderer = new SpineHtmlRenderer(root, regionImages);
   renderer.meshBackend = options.backend;
   // The stage is drawn at half scale, so raster at the resolution it shows at.
@@ -4552,8 +4623,250 @@ async function pmaStage(options: PmaStageOptions): Promise<PmaStageResult> {
   };
 }
 
+/**
+ * Reads the export twice — as JSON text, and as the installed spine-core parsed
+ * it — and reports both, so a spec can require the second to contain the first.
+ *
+ * The three reads that have to be generation-aware are written as "wherever
+ * this value lives now", which is what keeps the probe free of version keys:
+ *
+ * - a bone's inheritance mode is `BoneData.transformMode` on 4.0 and 4.1,
+ *   `BoneData.inherit` on 4.2, and `BoneData.setupPose.inherit` on 4.3, and the
+ *   enum has carried the same numbering throughout (0 = Normal);
+ * - the JSON key is `transform` before 4.2 and `inherit` from 4.2;
+ * - the deform section is `animations.<name>.deform` on 4.0 and
+ *   `animations.<name>.attachments.<skin>.<slot>.<attachment>.deform` from 4.1.
+ *
+ * The runtime's own side is one `instanceof`: `DeformTimeline` is on the root
+ * entry of all four generations (checked), reached through the namespace for
+ * the same reason `Physics` is — a named import of an export a core does not
+ * have is a link error that takes the whole file down. Not `constructor.name`:
+ * the harness is served from a production vite build, where the minifier is
+ * free to rename a class and that read would quietly count zero.
+ */
+async function generationProbe(): Promise<GenerationProbeResult> {
+  const url = '/spineboy/spineboy-pro.json';
+  const text = await (await fetch(url)).text();
+  const json = JSON.parse(text) as {
+    skeleton?: { spine?: string };
+    bones?: Array<Record<string, unknown>>;
+    animations?: Record<string, Record<string, unknown>>;
+  };
+
+  const bones = json.bones ?? [];
+  const inheritKey = bones.some((bone) => 'inherit' in bone)
+    ? 'inherit'
+    : bones.some((bone) => 'transform' in bone)
+      ? 'transform'
+      : '';
+  const fileInherit: Record<string, string> = {};
+  for (const bone of bones) {
+    const mode = inheritKey ? bone[inheritKey] : undefined;
+    if (typeof mode === 'string') fileInherit[String(bone.name)] = mode;
+  }
+
+  const animations = json.animations ?? {};
+  const deformKey = Object.values(animations).some((anim) => 'deform' in anim)
+    ? 'deform'
+    : Object.values(animations).some((anim) => 'attachments' in anim)
+      ? 'attachments'
+      : '';
+  const fileDeform: Record<string, number> = {};
+  for (const [name, anim] of Object.entries(animations)) {
+    const section = deformKey ? (anim[deformKey] as Record<string, unknown> | undefined) : undefined;
+    if (!section) continue;
+    let count = 0;
+    for (const slots of Object.values(section)) {
+      for (const attachments of Object.values(slots as Record<string, unknown>)) {
+        for (const body of Object.values(attachments as Record<string, unknown>)) {
+          // 4.0 puts the frame array straight under the attachment name; 4.1
+          // and later wrap it in a `deform` member alongside other
+          // attachment-level timelines.
+          if (Array.isArray(body) || (body && typeof body === 'object' && 'deform' in body)) {
+            count += 1;
+          }
+        }
+      }
+    }
+    if (count) fileDeform[name] = count;
+  }
+
+  const assets = await loadSkeletonAssets({ atlasUrl: '/spineboy/spineboy.atlas', skeletonUrl: url });
+  try {
+    const data = assets.data as unknown as {
+      bones: Array<{
+        name: string;
+        transformMode?: number;
+        inherit?: number;
+        setupPose?: { inherit?: number };
+      }>;
+      animations: Array<{ name: string; timelines: Array<object> }>;
+    };
+    const modeOf = (bone: (typeof data.bones)[number]): number =>
+      bone.inherit ?? bone.setupPose?.inherit ?? bone.transformMode ?? 0;
+    const loadedInherit: Record<string, number> = {};
+    let loadedNonNormalBones = 0;
+    for (const bone of data.bones) {
+      const mode = modeOf(bone);
+      if (mode !== 0) loadedNonNormalBones += 1;
+      if (bone.name in fileInherit) loadedInherit[bone.name] = mode;
+    }
+
+    const loadedDeform: Record<string, number> = {};
+    for (const animation of data.animations) {
+      const count = animation.timelines.filter(
+        (timeline) => timeline instanceof DeformTimeline,
+      ).length;
+      if (count) loadedDeform[animation.name] = count;
+    }
+
+    return {
+      exportedBy: json.skeleton?.spine ?? '',
+      coreShape: coreCompatFor(new Skeleton(assets.data)).shape,
+      inheritKey,
+      fileInherit,
+      loadedInherit,
+      loadedNonNormalBones,
+      deformKey,
+      fileDeform,
+      loadedDeform,
+    };
+  } finally {
+    assets.dispose();
+  }
+}
+
+/** A region attachment in whichever shape the installed spine-core has. */
+interface AnyRegionAttachment {
+  width: number;
+  height: number;
+  region: unknown;
+  offset: ArrayLike<number>;
+  uvs: ArrayLike<number>;
+  /** 4.1 and later. */
+  updateRegion?(): void;
+  /** 4.0 only — the pair `updateRegion` replaced. */
+  updateOffset?(): void;
+  setRegion?(region: unknown): void;
+  computeWorldVertices(
+    slotOrBone: unknown,
+    world: Float32Array,
+    offset: number,
+    stride: number,
+  ): void;
+}
+
+/** A 2×1 texture region with the UV corners a caller chooses. */
+function probeRegion(u: number, v: number, u2: number, v2: number, degrees: number): TextureRegion {
+  const region = new TextureRegion();
+  region.u = u;
+  region.v = v;
+  region.u2 = u2;
+  region.v2 = v2;
+  region.width = 2;
+  region.height = 1;
+  region.originalWidth = 2;
+  region.originalHeight = 1;
+  region.offsetX = 0;
+  region.offsetY = 0;
+  region.degrees = degrees;
+  return region;
+}
+
+/**
+ * Builds the pre-4.3 attachment the installed core wants, with its region set
+ * and its offsets and UVs computed — one step on 4.1 and 4.2, two on 4.0.
+ */
+function prePoseAttachment(name: string, region: TextureRegion): AnyRegionAttachment {
+  if ('updateRegion' in RegionAttachment.prototype) {
+    const attachment = new (RegionAttachment as unknown as new (
+      name: string,
+      path: string,
+    ) => AnyRegionAttachment)(name, name);
+    attachment.region = region;
+    attachment.width = 2;
+    attachment.height = 1;
+    (attachment.updateRegion as () => void)();
+    return attachment;
+  }
+  const attachment = new (RegionAttachment as unknown as new (
+    name: string,
+  ) => AnyRegionAttachment)(name);
+  attachment.width = 2;
+  attachment.height = 1;
+  // 4.0 splits the one step: setRegion writes the UVs, updateOffset the
+  // offsets — and updateOffset reads `this.region`, so the order is not
+  // optional.
+  (attachment.setRegion as (r: unknown) => void)(region);
+  (attachment.updateOffset as () => void)();
+  return attachment;
+}
+
+function regionGeometryProbe(): RegionGeometryProbeResult {
+  const poseCore = 'getOffsets' in RegionAttachment.prototype;
+  const regionTakesSlot = 'updateRegion' in RegionAttachment.prototype;
+  const world = new Float32Array(8);
+
+  // Distinct, asymmetric, and exact in f32 (the 4.3 path fills a
+  // Float32Array): u is told from u2, v from v2, and neither axis from the
+  // other, so a transposed or half-turned assignment cannot match by accident.
+  const straightRegion = probeRegion(0, 0, 1, 1, 0);
+  const rotatedRegion = probeRegion(0.125, 0.25, 0.5, 0.875, 90);
+
+  let straight: RegionGeometryProbeResult['straight'];
+  let rotated: RegionGeometryProbeResult['rotated'];
+
+  if (poseCore) {
+    const offsets: number[] = new Array<number>(8).fill(0);
+    const uvs = new Float32Array(8);
+    RegionAttachment.computeUVs(straightRegion, 0, 0, 1, 1, 0, 2, 1, offsets, uvs);
+    // An identity bone pose must preserve that order through
+    // computeWorldVertices (which reads only slot.bone.appliedPose).
+    const Sequence = OPTIONAL_SEQUENCE as new (count: number, wrap: boolean) => never;
+    const attachment = new RegionAttachment('corner-probe', new Sequence(1, false));
+    attachment.computeWorldVertices(
+      { bone: { appliedPose: { worldX: 0, worldY: 0, a: 1, b: 0, c: 0, d: 1 } } } as unknown as Slot,
+      offsets,
+      world,
+      0,
+      2,
+    );
+    straight = { offset: [...offsets], uvs: Array.from(uvs), world: Array.from(world) };
+
+    const rotatedOffsets: number[] = new Array<number>(8).fill(0);
+    const rotatedUvs = new Float32Array(8);
+    RegionAttachment.computeUVs(rotatedRegion, 0, 0, 1, 1, 0, 2, 1, rotatedOffsets, rotatedUvs);
+    rotated = { offset: [...rotatedOffsets], uvs: Array.from(rotatedUvs) };
+  } else {
+    const attachment = prePoseAttachment('corner-probe', straightRegion);
+    // Pre-4.3 the bone IS its own applied pose, and the offsets are read off
+    // the attachment rather than handed in. 4.1 and 4.2 are given the slot,
+    // 4.0 the bone — the seam's one pre-pose difference, driven here too.
+    const bone = { worldX: 0, worldY: 0, a: 1, b: 0, c: 0, d: 1 };
+    attachment.computeWorldVertices(regionTakesSlot ? { bone } : bone, world, 0, 2);
+    straight = {
+      offset: Array.from(attachment.offset),
+      uvs: Array.from(attachment.uvs),
+      world: Array.from(world),
+    };
+
+    const turned = prePoseAttachment('rotated-probe', rotatedRegion);
+    rotated = { offset: Array.from(turned.offset), uvs: Array.from(turned.uvs) };
+  }
+
+  return {
+    poseCore,
+    regionTakesSlot,
+    straight,
+    rotated,
+    inverseClipping: 'inverse' in new ClippingAttachment('inverse-support-probe'),
+  };
+}
+
 window.spineHtmlHarness = {
   unpackProbe,
+  generationProbe,
+  regionGeometryProbe,
   passThroughProbe,
   rotatedCutProbe,
   unpackFailureProbe,

@@ -260,6 +260,26 @@ const CELLS: Cell[] = [
   // (`5eb4ffff`) on top, so this cell is blend and tint at once.
   { name: 'additive blend (hoverboard), canvas2d', page: 'plain', skeleton: 'pro', animation: 'hoverboard', backend: 'canvas2d' },
   { name: 'additive blend (hoverboard), webgl', page: 'plain', skeleton: 'pro', animation: 'hoverboard', backend: 'webgl' },
+  // The deform cell — #53's "done when", and the one pose in this file chosen
+  // for what the *data* carries rather than for a feature of the renderer.
+  //
+  // `hoverboard` is the only animation in spineboy-pro with mesh deform keys,
+  // and it is the section whose JSON key moved: 4.0 writes `deform`, 4.1 and
+  // later write `attachments`, and a reader of one never looks for the other
+  // (see the "an export under any runtime but its own generation's" bullet in
+  // CLAUDE.md). Four timelines on every branch — `front-foot`, `front-shin`,
+  // `hoverboard-board`, `rear-foot` — keyed from t=0 to t=1, so t=0.4 lands
+  // *between* keys on all of them and the vertices are interpolated rather
+  // than replayed. The same pose drives the export's transform-mode bones:
+  // `hoverboard-thruster-front` and `hoverboard-thruster-rear` (the foot tips
+  // `back-foot-tip` / `front-foot-tip` are the other two), written as
+  // `transform: noRotationOrReflection` by 4.0 and 4.1 and as `inherit:` by
+  // 4.2 and 4.3. So on the 4.0 and 4.1 columns this cell is a deformed mesh
+  // posed through bones whose inheritance mode only the matching runtime
+  // reads, diffed against that runtime's own reference. Both backends,
+  // because the mesh raster is where the deformed vertices land.
+  { name: 'mesh deform (hoverboard t=0.4), canvas2d', page: 'plain', skeleton: 'pro', animation: 'hoverboard', time: 0.4, backend: 'canvas2d' },
+  { name: 'mesh deform (hoverboard t=0.4), webgl', page: 'plain', skeleton: 'pro', animation: 'hoverboard', time: 0.4, backend: 'webgl' },
   // Per-slot colour AND per-slot alpha, from the asset rather than from a knob:
   // `shoot` animates `rgba` timelines on the muzzle slots, and at t=0.15 the
   // flash is mid-fade — muzzle-glow around ff400c at partial alpha, the four
@@ -365,6 +385,8 @@ for (const cell of CELLS) {
         // See ROTATED PACKING: this is what the cells used to skip on, and a
         // zero says the atlas in front of them cannot show #49's defect class.
         `rotatedRegions=${referenceShot.info.rotatedRegions}, ` +
+        // Which seam drew, so a column's log says what it actually exercised.
+        `coreShape=${domShot.info.coreShape}, reference=${referenceShot.info.referenceShape}, ` +
         `content ref=${m.contentA} dom=${m.contentB} union=${m.contentUnion}, ` +
         `bad=${m.bad} of ${m.rawBad} raw (${(badRatio * 100).toFixed(3)}% of content, ` +
         `ch>${CHANNEL_TOLERANCE}), maxDelta=${m.maxDelta}, ` +

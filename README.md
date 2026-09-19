@@ -185,13 +185,27 @@ decision stays yours, and `spine-html` draws from either generation:
 | --- | --- |
 | **4.3.x** | ✅ supported |
 | **4.2.x** | ✅ supported |
-| 4.1.x and older | ❌ not supported — and 4.2 is not a stand-in for them, see below |
+| **4.1.x** | ✅ supported — browser/bundler only, see the Node note below |
+| **4.0.x** | ✅ supported — browser/bundler only, see the Node note below |
+| 3.8.x and older | ❌ not supported — no runtime is published under this package name |
 
 *Supported* means one specific thing: a column of this repository's CI runs the
 **whole** test suite on that minor, against **that version's own** example
-exports. `peerDependencies` is that set and nothing wider. Nothing in the API
-above changes with the version — the difference is absorbed internally, in one
-file, chosen once per renderer by looking at the objects spine-core hands over.
+exports, with the pixel oracle drawing the same poses through
+`@esotericsoftware/spine-webgl` of the same generation. `peerDependencies` is
+that set and nothing wider. Nothing in the API above changes with the version —
+the difference is absorbed internally, in one file, chosen once per renderer by
+looking at the objects spine-core hands over.
+
+> **Node note, for 4.1 and 4.0 only.** Those two releases of `spine-core`
+> cannot be imported by plain Node: they ship extensionless relative specifiers
+> in their own `dist/`, and 4.0 also omits `"type": "module"`. Every bundler
+> resolves them (so do CDNs such as esm.sh), which is how a browser consumer
+> meets them, and `spine-html` itself is unaffected — but `import` of either
+> package from a Node process fails, so **SSR and Node-side tooling cannot load
+> them**. It is upstream's defect and not fixable from here. 4.1 has one more:
+> a single extensionless specifier inside its own `.d.ts` makes it fail a
+> `moduleResolution: "nodenext"` typecheck. 4.2 and 4.3 have neither problem.
 
 **Worth knowing, because it is silent.** If you point a 4.3 runtime at older
 data, the bad outcome is not the one that throws. 4.3 reads constraints from a
@@ -204,12 +218,9 @@ corpus of 267 skeletons (88% of them 4.2 exports): 40% failed to parse under
 **0 of 5,704** physics constraints were loaded. If a skeleton renders but goes
 limp, this is why — and installing the matching `spine-core` is the whole fix.
 
-**If your data was exported by 4.1 or 4.0, this package cannot play it
-correctly yet.** Only the matching runtime reads an export correctly, and the
-4.1 and 4.0 runtimes are not supported here (yet — upstream packaging: `Physics`
-is missing from 4.1's root entry, and both ship extensionless module specifiers
-that plain Node cannot resolve). Installing spine-core 4.2 for such data is
-**not** a substitute, and the failure is the quiet kind again. Read off
+**If your data was exported by 4.1 or 4.0, install the matching runtime.**
+Since 0.8.0 both are supported columns, and installing spine-core 4.2 for such
+data is **not** a substitute — the failure is the quiet kind again. Read off
 `SkeletonJson` in each generation:
 
 - 4.0 and 4.1 write a bone's inheritance mode as `transform`
@@ -224,17 +235,24 @@ and 91 of the 4.0 exports carry 1,031 deform timelines between them — all of i
 lost without a message under 4.2, while the file parses, every constraint
 loads, and the rig renders without an error.
 
+Spine's own spineboy export carries both, which is why every CI column checks
+this rather than trusting it: four bones at `noRotationOrReflection` and four
+mesh deform timelines, declared under the key that branch's exporter writes, and
+asserted to have arrived in the parsed `SkeletonData`.
+
 > **Correction.** The README shipped with 0.7.1, and the 0.7.0 release notes,
-> said the opposite — "install spine-core 4.2" for 4.1 / 4.0 data — on the
-> strength of exactly that evidence: every export parsed, all 14,022 constraints loaded, a 60-rig sample
-> rendered cleanly. That evidence was real and the conclusion was wrong,
-> because **parsing without an error says nothing about keys a newer reader no
-> longer looks for.** The same corpus holds 19 Spine 3.8 exports that also parse
-> cleanly under a 4.x runtime — and then pose most of their bones at non-finite
-> transforms (3.8 writes a rotate key as `angle` and a curve as scalars; 4.0
-> reads `value` and an array). The test that would have caught this is a diff
-> of the keys each generation's reader consumes, which is what the list above
-> is.
+> said "install spine-core 4.2" for 4.1 / 4.0 data — on the strength of exactly
+> the evidence that looks conclusive: every export parsed, all 14,022
+> constraints loaded, a 60-rig sample rendered cleanly. That evidence was real
+> and the conclusion was wrong, because **parsing without an error says nothing
+> about keys a newer reader no longer looks for.** The same corpus holds 19
+> Spine 3.8 exports that also parse cleanly under a 4.x runtime — and then pose
+> most of their bones at non-finite transforms (3.8 writes a rotate key as
+> `angle` and a curve as scalars; 4.0 reads `value` and an array). The test that
+> would have caught this is a diff of the keys each generation's reader
+> consumes, which is what the list above is. 0.7.1 corrected the advice to "4.2
+> is not a stand-in, and 4.1 / 4.0 are not supported"; 0.8.0 supports them, so
+> the advice is now simply the rule at the top of this section.
 
 Spine 3.8 and older are out of scope: they are not published under this package
 name.
@@ -609,7 +627,13 @@ example exports, and runs everything. `SPINE_ASSETS_BRANCH=4.2 bun run
 fetch-assets` gets those exports locally, and `SPINE_CORE_MINOR` tells the run
 which minor it is against — anything but the typed one builds without
 `tsc --noEmit`, since the package is typed against one generation and runs on
-several. The visual check is **A/B within one run**:
+several. Two checks in `tests/package.spec.ts` are skipped, with the reason
+printed, where the **installed peer alone** already fails them: importing
+`spine-core` 4.0 in plain Node, and typechecking a consumer of `spine-core` 4.1
+under `nodenext`. Both are the upstream packaging defect described in the
+compatibility section, both are probed rather than keyed on a version, and
+nothing is relaxed in the columns that can run them. The visual check is
+**A/B within one run**:
 no golden snapshots are committed (they rot across platforms/GPUs) — instead
 the same deterministic pose (`?time` + `?timescale=0`) is screenshotted with
 `?backend=canvas2d` and `?backend=webgl` in the same engine and the buffers
@@ -653,18 +677,27 @@ So `tests/oracle.spec.ts` compares against the official runtime. The same
 export, the same frozen pose, the same size, the same atlas page, drawn by
 `@esotericsoftware/spine-webgl` into a canvas whose orthographic camera is
 solved to land world space on exactly the pixels the DOM stage lands it on —
-then both are screenshotted and diffed. Eleven cells: the rigid tier, the mesh
+then both are screenshotted and diffed. Thirteen cells: the rigid tier, the mesh
 tier on both backends, the exporter's own premultiplied page (`spineboy-pma`)
-on all three, a clipping pose, an additive-blend pose, a per-slot rgba/alpha
-pose, and a whole-skeleton tint.
+on all three, a clipping pose, an additive-blend pose, a mesh-deform pose on
+both backends, a per-slot rgba/alpha pose, and a whole-skeleton tint.
 
 It earned its keep on the first run: the rigid tier was drawing every
 90°-packed atlas region 180° round (#49), in every release up to 0.7.0, and no
 comparison of this package against itself could have seen it. Rotated packing is
-held there now — the example exports from the 4.2 branch rotate ten regions
-where the 4.3 branch's rotate none, so the CI column that installs 4.2 is what
-keeps the restore honest, and each cell logs how many regions its atlas rotated
-so a green run on an unrotated one cannot be mistaken for the proof.
+held there now — the example exports rotate 17 regions on the 4.0 and 4.1
+branches and ten on the 4.2 branch where the 4.3 branch's rotate none, so the
+older columns are what keep the restore honest, and each cell logs how many
+regions its atlas rotated so a green run on an unrotated one cannot be mistaken
+for the proof.
+
+The deform cell is the one chosen for what the *data* carries rather than for a
+feature of the renderer: `hoverboard` is the only animation in spineboy-pro with
+mesh deform keys, it is the section whose JSON key moved between 4.0 and 4.1,
+and the pose drives two of the four bones whose inheritance mode moved between
+4.1 and 4.2. On the older columns it is therefore a deformed mesh posed through
+bones only the matching runtime reads, diffed against that runtime's own
+reference.
 
 Two things make it evidence rather than decoration. The camera match is
 **derived** — solved against the DOM mapping, not fitted to a picture — and

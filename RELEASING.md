@@ -84,10 +84,15 @@ Two properties of that configuration are load-bearing in the workflow:
    (`release-please--branches--main--components--spine-html`): **Actions → ci →
    Run workflow**, or `gh workflow run ci.yml --ref <that branch>` (see below
    for why it is not automatic). One dispatch now runs **one column per
-   supported spine-core minor** — the matrix in `ci.yml`, which is what
-   `peerDependencies` is a claim about — and the release needs *every* column
-   green, not just the first to report. The columns do not fail fast, so a
-   single red one is a real result rather than a cancelled run.
+   supported spine-core minor** — four of them since 0.8.0 (4.3, 4.2, 4.1,
+   4.0), the matrix in `ci.yml`, which is what `peerDependencies` is a claim
+   about — and the release needs *every* column green, not just the first to
+   report. The columns do not fail fast, so a single red one is a real result
+   rather than a cancelled run. A column may report **fewer tests** than
+   another and still be green: `tests/package.spec.ts` skips an assertion whose
+   *peer alone* cannot satisfy it (plain-Node import on 4.0, the `nodenext`
+   typecheck on 4.1), with the reason in the run log. A skip anywhere else, or
+   in the 4.3 and 4.2 columns, is not that and should be read.
 4. **Merge it.** That is the cut.
 5. Watch the second `release` run: it tags, releases, and publishes.
 6. Confirm: `npm view spine-html version`, and the npm page shows the

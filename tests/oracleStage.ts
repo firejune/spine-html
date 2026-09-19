@@ -1,13 +1,15 @@
 import {
   AnimationState,
   AnimationStateData,
-  Physics,
   Skeleton,
   type SkeletonData,
   TextureAtlas,
 } from '@esotericsoftware/spine-core';
 import { GLTexture, ManagedWebGLRenderingContext, SceneRenderer } from '@esotericsoftware/spine-webgl';
 
+import { type CoreShape, coreCompatFor } from '../src/coreCompat';
+/** `Physics` is absent from 4.1's and 4.0's root entry — see `posed()` below. */
+import { advanceSkeleton } from '../src/coreOptional';
 import { DomTexture, type RegionImage, SpineHtmlRenderer, unpackRegions } from '../src/index';
 import { loadSkeletonJson } from '../src/loadSkeletonAssets';
 
@@ -135,6 +137,14 @@ export interface OracleStageResult {
   drawCalls: number;
   /** Which spine-webgl generation the reference is running on. */
   referenceShape: 'pre-4.3' | '4.3';
+  /**
+   * Which seam `src/coreCompat.ts` picked for the installed core, detected from
+   * the live objects. Reported so a column cannot pass while drawing through
+   * the wrong shape: the 4.0 column's whole point is that it runs
+   * `pre-sequences`, and a silent fall-back to `sequences` would draw `NaN`
+   * corners — which looks, from a count of slot elements, exactly like success.
+   */
+  coreShape: CoreShape;
   /** The stage the capture covers, so a spec never hard-codes its size. */
   stage: { width: number; height: number };
   /**
@@ -337,6 +347,10 @@ function parseTint(hex: string | null | undefined): { r: number; g: number; b: n
 /**
  * Poses a skeleton. Both sides call this with identical arguments, so any
  * difference in the captures is the renderers' and never the pose's.
+ *
+ * The last line is the core's own generation seam, read the same way the
+ * reference's is — see `src/coreOptional.ts`. Both sides of the oracle go
+ * through it, so the two skeletons are posed by one call either way.
  */
 function posed(data: SkeletonData, options: OracleStageOptions): Skeleton {
   const skeleton = new Skeleton(data);
@@ -347,8 +361,7 @@ function posed(data: SkeletonData, options: OracleStageOptions): Skeleton {
   state.setAnimation(0, options.animation, true);
   state.update(options.time);
   state.apply(skeleton);
-  skeleton.update(options.time);
-  skeleton.updateWorldTransform(Physics.update);
+  advanceSkeleton(skeleton, options.time);
   return skeleton;
 }
 
@@ -473,6 +486,7 @@ export async function oracleStage(options: OracleStageOptions): Promise<OracleSt
   stage.replaceChildren();
 
   const base = {
+    coreShape: coreCompatFor(new Skeleton(built.data)).shape,
     side: options.side,
     pagePma: built.atlas.pages[0]?.pma ?? false,
     pageSize: { width: built.pageImage.naturalWidth, height: built.pageImage.naturalHeight },
